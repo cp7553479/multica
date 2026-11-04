@@ -245,19 +245,8 @@ func TestBuildQuickCreatePromptParentPinning(t *testing.T) {
 	}
 }
 
-// TestBuildPromptSquadLeaderReplyCarveOutIgnoresTriggerAuthor is the MUL-2168
-// regression, retargeted at the surface that still branches on leadership.
-//
-// The bug was a leader posting "LGTM is a pure acknowledgment — no reply
-// needed. Exiting silently." — noise it produced because the per-turn
-// no_action rule only fired for AGENT-triggered comments, so a member's
-// comment bypassed it. That per-turn copy is gone (MUL-6984): the rule itself
-// now lives once, in the Squad Operating Protocol the server appends to
-// Instructions, and handler.TestSquadOperatingProtocolOwnsNoActionRule pins
-// its wording. What the per-turn message still owns is the reply imperative,
-// which must carry the carve-out so it cannot contradict the protocol — and,
-// as here, it must do so whoever wrote the triggering comment.
-func TestBuildPromptSquadLeaderReplyCarveOutIgnoresTriggerAuthor(t *testing.T) {
+// Publication choice is independent of who authored the incoming event.
+func TestBuildPromptPublicationChoiceIgnoresTriggerAuthor(t *testing.T) {
 	t.Parallel()
 
 	for _, authorType := range []string{"member", "agent"} {
@@ -274,8 +263,8 @@ func TestBuildPromptSquadLeaderReplyCarveOutIgnoresTriggerAuthor(t *testing.T) {
 			},
 		}, "claude")
 
-		if !strings.Contains(out, "Unless your outcome is `no_action`, post your reply as a comment") {
-			t.Errorf("%s-triggered leader prompt lost the no_action carve-out\n---\n%s", authorType, out)
+		if !strings.Contains(out, "Choose whether this event needs a public response") {
+			t.Errorf("%s-triggered leader prompt lost explicit publication choice\n---\n%s", authorType, out)
 		}
 		// The rule is stated by the protocol in Instructions, never restated
 		// here — a second hand-maintained copy in the same context window is
@@ -285,9 +274,7 @@ func TestBuildPromptSquadLeaderReplyCarveOutIgnoresTriggerAuthor(t *testing.T) {
 		}
 	}
 
-	// A non-leader gets the unconditional imperative: the carve-out is a
-	// leader-only exception, and offering it to an ordinary agent would licence
-	// a silent exit no `squad activity` call ever records.
+	// Ordinary agents use the same publication choices without leader rules.
 	nonLeader := BuildPrompt(Task{
 		IssueID:               "issue-123",
 		TriggerCommentID:      "comment-456",
@@ -392,9 +379,7 @@ func TestTaskIsSquadLeaderReadsProtocolFields(t *testing.T) {
 // TestBuildPromptProtocolHeadingInInstructionsIsNotALeader is the end-to-end
 // negative regression for MUL-5811: on a current server, a plain agent that
 // happens to document a "## Squad Operating Protocol" section in its own
-// instructions must get the ordinary comment prompt — no squad activity
-// obligation, no silent-exit licence, and the unconditional reply imperative
-// intact.
+// instructions must get the ordinary comment prompt without squad rules.
 func TestBuildPromptProtocolHeadingInInstructionsIsNotALeader(t *testing.T) {
 	t.Parallel()
 
@@ -421,8 +406,8 @@ func TestBuildPromptProtocolHeadingInInstructionsIsNotALeader(t *testing.T) {
 			t.Fatalf("ordinary agent prompt leaked squad-leader rule %q\n---\n%s", banned, out)
 		}
 	}
-	if !strings.Contains(out, "Post your reply as a comment") {
-		t.Fatalf("ordinary agent prompt lost the unconditional reply imperative\n---\n%s", out)
+	if !strings.Contains(out, "Choose whether this event needs a public response") {
+		t.Fatalf("ordinary agent prompt lost explicit publication choice\n---\n%s", out)
 	}
 }
 
@@ -449,8 +434,8 @@ func TestBuildPromptLegacyServerKeepsBriefingBasedLeaderRole(t *testing.T) {
 		},
 	}, "claude")
 
-	if !strings.Contains(out, "Unless your outcome is `no_action`, post your reply as a comment") {
-		t.Fatalf("legacy-server leader prompt lost the leader-only reply carve-out\n---\n%s", out)
+	if !strings.Contains(out, "Choose whether this event needs a public response") {
+		t.Fatalf("leader prompt lost explicit publication choice\n---\n%s", out)
 	}
 }
 
@@ -1597,12 +1582,8 @@ func TestCommentReplyThreadsGrouping(t *testing.T) {
 	})
 }
 
-// TestBuildCommentPromptCrossThreadFansOutReplies is the end-to-end prompt
-// assertion for the screenshot scenario: three separate root comments coalesced
-// into one run must produce a per-thread reply plan (one reply per thread),
-// explicitly overriding the "one comment per run" rule, instead of the single
-// --parent cookbook.
-func TestBuildCommentPromptCrossThreadFansOutReplies(t *testing.T) {
+// Events preserve thread context without imposing one reply per thread.
+func TestBuildCommentPromptPreservesOptionalReplyTargets(t *testing.T) {
 	task := Task{
 		IssueID:               "issue-xthread-2",
 		TriggerCommentID:      "c3",
@@ -1619,8 +1600,8 @@ func TestBuildCommentPromptCrossThreadFansOutReplies(t *testing.T) {
 
 	for _, want := range []string{
 		"3 DISTINCT threads",
-		"Post ONE reply per thread",
-		"OVERRIDES",
+		"Choose which events need a response",
+		"posting once per event or thread is not required",
 		"--parent c1",
 		"--parent c2",
 		"--parent c3",
@@ -1644,11 +1625,9 @@ func TestBuildCommentPromptCrossThreadFansOutReplies(t *testing.T) {
 		t.Errorf("cross-thread prompt must point at the brief's Comment Formatting mechanism, got:\n%s", out)
 	}
 
-	// Chronological ordering (MUL-4348 test-round-2 problem #1): replies must be
-	// posted oldest thread first, the newest (triggering) thread last — so the
-	// coalesced comments c1 (oldest) and c2 come before the trigger c3.
+	// Source targets retain event order without requiring a posting order.
 	if !strings.Contains(out, "OLDEST thread first") {
-		t.Errorf("cross-thread prompt must instruct oldest-first chronological order, got:\n%s", out)
+		t.Errorf("cross-thread prompt must retain oldest-first event order, got:\n%s", out)
 	}
 	posC1 := strings.Index(out, "--parent c1")
 	posC2 := strings.Index(out, "--parent c2")

@@ -594,7 +594,7 @@ func TestProtocolHeadingInInstructionsGetsNoLeaderBrief(t *testing.T) {
 			t.Fatalf("ordinary-agent brief leaked leader-only content %q\n---\n%s", banned, out)
 		}
 	}
-	if !strings.Contains(out, "**Post your final results as a comment — this step is mandatory**") {
+	if !strings.Contains(out, "Choose the explicit action this session needs") {
 		t.Fatalf("ordinary-agent brief lost the unconditional reply obligation\n---\n%s", out)
 	}
 }
@@ -663,47 +663,21 @@ func TestChatOutputDoesNotRequireIssueComment(t *testing.T) {
 	}
 }
 
-// The Output section for issue tasks must forbid mid-run progress
-// comments and require the single final result comment. Guards the
-// MUL-3605 regression where a review agent surfaced its progress
-// narration as the result instead of posting a conclusion. (The
-// pre-existing "Final results MUST be delivered … invisible without it"
-// and "state the outcome, not the process" lines already carry the
-// mandatory-comment and no-process-dump halves.) Chat / quick-create /
-// autopilot kinds keep their own delivery channels and must NOT inherit
-// this rule. Runs both the legacy and slim paths.
-func TestOutputForbidsMidRunProgressComments(t *testing.T) {
-	wantPhrases := []string{
-		"Post exactly ONE comment per run",
-		"Do NOT post progress updates",
-	}
-	issueCtxs := map[string]TaskContextForEnv{
-		"assignment": {IssueID: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"},
-		"comment":    {IssueID: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", TriggerCommentID: "tc-1"},
-	}
-
-	run := func(t *testing.T, label string) {
-		for name, ctx := range issueCtxs {
-			out := buildMetaSkillContent("claude", ctx)
-			for _, want := range wantPhrases {
-				if !strings.Contains(out, want) {
-					t.Errorf("%s/%s brief missing output rule %q\n---\n%s", label, name, want, out)
-				}
+// Issue sessions publish only through explicit actions, independent of turn exit.
+func TestIssueOutputRequiresExplicitPublication(t *testing.T) {
+	for _, ctx := range []TaskContextForEnv{{IssueID: "issue-1"}, {IssueID: "issue-1", TriggerCommentID: "tc-1"}, {IssueID: "issue-1", IsSquadLeader: true}} {
+		out := buildMetaSkillContent("claude", ctx)
+		for _, want := range []string{"a turn does not require a comment", "never posted automatically", "without `--parent`", "multica issue update"} {
+			if !strings.Contains(out, want) {
+				t.Errorf("missing explicit output rule %q: %s", want, out)
 			}
 		}
-		// Chat keeps its own delivery channel; it must not inherit the
-		// issue-task "post a final comment" rules.
-		chat := buildMetaSkillContent("claude", TaskContextForEnv{ChatSessionID: "chat-1"})
-		for _, banned := range wantPhrases {
-			if strings.Contains(chat, banned) {
-				t.Errorf("%s chat brief must not inherit issue output rule %q", label, banned)
+		for _, banned := range []string{"Post exactly ONE comment per run", "Final results MUST be delivered", "always use the trigger comment"} {
+			if strings.Contains(out, banned) {
+				t.Errorf("retained forced delivery %q: %s", banned, out)
 			}
 		}
 	}
-
-	// The `runtime_brief_slim` flag was retired (MUL-4297); there is now a
-	// single brief.
-	run(t, "brief")
 }
 
 // The sub-issue creation rule must reach top-level parents that have no
@@ -1945,7 +1919,7 @@ func TestWriteRuntimeConfigFileAlwaysInsertsFixedManagedSeparator(t *testing.T) 
 	}
 }
 
-// Cross-thread fan-out moved to the per-turn prompt (MUL-5377).
+// Source thread IDs stay available without requiring one reply per thread.
 func TestMultiThreadReplyInstructionsFanOut(t *testing.T) {
 	t.Parallel()
 	out := BuildMultiThreadCommentReplyInstructions("55555555-6666-7777-8888-999999999999", []ThreadReplyTarget{
@@ -1956,8 +1930,8 @@ func TestMultiThreadReplyInstructionsFanOut(t *testing.T) {
 
 	for _, want := range []string{
 		"3 DISTINCT threads",
-		"Post ONE reply per thread",
-		"OVERRIDES",
+		"Choose which events need a response",
+		"posting once per event or thread is not required",
 		"--parent c1", "--parent c2", "--parent c3",
 		"OLDEST thread first",
 		// MUL-5825: the posting mechanism is a pointer at the brief's

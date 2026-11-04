@@ -1,192 +1,131 @@
 package handler
 
 import (
-	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
-	"strings"
 	"testing"
-	"time"
 
 	"github.com/google/uuid"
 	"github.com/multica-ai/multica/server/internal/events"
 	"github.com/multica-ai/multica/server/internal/testutil"
-	"github.com/multica-ai/multica/server/internal/util"
 	"github.com/multica-ai/multica/server/pkg/protocol"
 )
 
-func TestCommentInvocationDeniedNoticePersistsWithoutDisclosure(t *testing.T) {
-	if testHandler == nil {
-		t.Skip("database not available")
-	}
+func TestCommentSessionReceiptsDoNotCreateMentionDisclosureNotices(t *testing.T) {
+	issueID, ownerID, runtimeID := issueSessionCaptureFixture(t)
 	privateID, _, readerID := privateAgentTestFixture(t)
-	allowedID := createHandlerTestAgent(t, "Allowed notice target", nil)
-	squadID := createCommentTriggerPreviewSquad(t, "Denied notice squad", privateID)
 	foreignWorkspace := dbfx.Workspace(t, "Other notice workspace", "notice-"+uuid.NewString())
-	foreignID := dbfx.Agent(t, "Other workspace secret", handlerTestRuntimeID(t), testutil.Cols{"workspace_id": foreignWorkspace})
-	missingID := uuid.NewString()
-	issueID := dbfx.Issue(t, "Persist denied mentions")
-	dbfx.Cleanup(t, `DELETE FROM comment WHERE issue_id = $1`, issueID)
-	dbfx.Cleanup(t, `DELETE FROM agent_task_queue WHERE issue_id = $1`, issueID)
-	content := fmt.Sprintf("[@Private alias](mention://agent/%s) [@Missing alias](mention://agent/%s) [@Foreign alias](mention://agent/%s) [@Team alias](mention://squad/%s) [@Allowed alias](mention://agent/%s)", privateID, missingID, foreignID, squadID, allowedID)
+	foreignID := dbfx.Agent(t, "Other workspace secret", runtimeID, testutil.Cols{"workspace_id": foreignWorkspace})
+	content := fmt.Sprintf("[@Private alias](mention://agent/%s) [@Missing alias](mention://agent/%s) [@Foreign alias](mention://agent/%s)", privateID, uuid.NewString(), foreignID)
 	preview := previewCommentTriggersForTest(t, issueID, map[string]any{"content": content})
-	if len(preview.Blocked) != 4 {
-		t.Fatalf("blocked preview = %+v, want four targets", preview.Blocked)
+	requirePreviewAgents(t, preview, ownerID)
+	if len(preview.Blocked) != 0 {
+		t.Fatalf("preview enumerated text targets: %+v", preview.Blocked)
 	}
-	var count int
-	dbfx.QueryRow(t, `SELECT count(*) FROM comment WHERE issue_id = $1`, issueID).Scan(&count)
-	if count != 0 {
-		t.Fatal("preview wrote a comment")
+	if count := dbfx.Count(t, `SELECT count(*) FROM comment WHERE issue_id=$1`, issueID); count != 0 {
+		t.Fatalf("preview wrote %d comments", count)
 	}
 	h := *testHandler
 	h.Bus = events.New()
-	var notices []CommentResponse
+	var notices int
 	h.Bus.Subscribe(protocol.EventCommentCreated, func(event events.Event) {
 		if payload, ok := event.Payload.(map[string]any); ok {
 			if comment, ok := payload["comment"].(CommentResponse); ok && comment.AuthorType == "system" {
-				notices = append(notices, comment)
+				notices++
 			}
 		}
 	})
 	var posted CommentResponse
 	testutil.Call(t, h.CreateComment, withURLParam(newRequest(http.MethodPost, "/api/issues/"+issueID+"/comments", map[string]any{"content": content}), "id", issueID)).Want(http.StatusCreated).JSON(&posted)
-	if len(posted.TriggerOutcomes) != 5 || findCommentOutcome(t, posted.TriggerOutcomes, allowedID).Status != DispatchQueued {
-		t.Fatalf("partial submission outcomes = %+v", posted.TriggerOutcomes)
+	if len(posted.TriggerOutcomes) != 1 || posted.TriggerOutcomes[0].TargetID != ownerID || posted.TriggerOutcomes[0].Status != DispatchDeferred {
+		t.Fatalf("receipt disclosed or dispatched mention targets: %+v", posted.TriggerOutcomes)
 	}
-	if len(notices) != 1 {
-		t.Fatalf("broadcast system notices = %d, want one for this submission", len(notices))
-	}
-	notice := notices[0]
-	if notice.ParentID == nil || *notice.ParentID != posted.ID || notice.Type != "system" {
-		t.Fatalf("notice is not a system reply to the submitted comment: %+v", notice)
-	}
-	for _, alias := range []string{"Private alias", "Missing alias", "Foreign alias", "Team alias"} {
-		if !strings.Contains(notice.Content, alias) {
-			t.Errorf("notice omitted %q: %s", alias, notice.Content)
-		}
-	}
-	if strings.Count(notice.Content, "Target not found or permission not granted") != 4 {
-		t.Errorf("denied targets do not share the generic reason: %s", notice.Content)
-	}
-	for _, secret := range []string{"private-access-test-agent", "Other workspace secret", "private-agent-owner@multica.test", "Allowed alias"} {
-		if strings.Contains(notice.Content, secret) {
-			t.Errorf("notice exposed an unrelated or private value %q", secret)
-		}
-	}
-	if len(util.ParseMentions(notice.Content)) != 0 {
-		t.Fatalf("notice contains actionable mentions: %s", notice.Content)
-	}
-	dbfx.QueryRow(t, `SELECT count(*) FROM agent_task_queue WHERE issue_id = $1`, issueID).Scan(&count)
-	if count != 1 || countQueuedCommentTriggerTasks(t, issueID, allowedID) != 1 {
-		t.Fatal("denied mentions or the system notice created an extra task")
+	if notices != 0 {
+		t.Fatalf("comment broadcast %d obsolete mention notices", notices)
 	}
 	var comments []CommentResponse
 	testutil.Call(t, h.ListComments, withURLParam(newRequestAs(readerID, http.MethodGet, "/api/issues/"+issueID+"/comments", nil), "id", issueID)).Want(http.StatusOK).JSON(&comments)
-	if len(comments) != 2 || comments[1].ID != notice.ID || comments[1].Content != notice.Content {
-		t.Fatalf("another reader did not receive the saved notice: %+v", comments)
+	if len(comments) != 1 || comments[0].ID != posted.ID || comments[0].Content != content {
+		t.Fatalf("reader received generated disclosures instead of original input: %+v", comments)
 	}
 	var timeline []TimelineEntry
 	testutil.Call(t, h.ListTimeline, withURLParam(newRequestAs(readerID, http.MethodGet, "/api/issues/"+issueID+"/timeline", nil), "id", issueID)).Want(http.StatusOK).JSON(&timeline)
+	found := false
 	for _, entry := range timeline {
-		if entry.ID == notice.ID && entry.Content != nil && *entry.Content == notice.Content {
-			return
+		if entry.ID == posted.ID && entry.Content != nil && *entry.Content == content {
+			found = true
 		}
 	}
-	t.Fatal("saved notice is absent from the timeline")
+	if !found {
+		t.Fatal("original submitted input is absent from the timeline")
+	}
+	if count := dbfx.Count(t, `SELECT count(*) FROM comment WHERE issue_id=$1 AND author_type='system'`, issueID); count != 0 {
+		t.Fatalf("saved %d obsolete mention refusal notices", count)
+	}
+	if count := dbfx.Count(t, `SELECT count(*) FROM agent_task_queue WHERE issue_id=$1 AND agent_id<>$2`, issueID, ownerID); count != 0 {
+		t.Fatalf("mentions or notices started %d unrelated executions", count)
+	}
 }
 
-func TestCommentInvocationDeniedNoticeForAgentEditsKeepsHistory(t *testing.T) {
-	if testHandler == nil {
-		t.Skip("database not available")
-	}
+func TestCommentSessionAgentEditsKeepImmutableInputHistoryWithoutNotices(t *testing.T) {
+	issueID, ownerID, runtimeID := issueSessionCaptureFixture(t)
+	authorID := dbfx.Agent(t, "Agent editing its output", runtimeID)
+	sourceIssue := dbfx.Issue(t, "Author's source task")
+	sourceTaskID := dbfx.Task(t, authorID, testutil.Cols{"issue_id": sourceIssue, "runtime_id": runtimeID, "status": "running", "originator_user_id": testUserID, "accountable_user_id": testUserID})
 	privateID, _, _ := privateAgentTestFixture(t)
-	leaderID := createHandlerTestAgent(t, "Denied handoff leader", nil)
-	issueID := dbfx.Issue(t, "Denied agent handoff", testutil.Cols{"status": "in_progress"})
-	dbfx.Cleanup(t, `DELETE FROM comment WHERE issue_id = $1`, issueID)
-	sourceTaskID := dbfx.Task(t, leaderID, testutil.Cols{"issue_id": issueID, "runtime_id": handlerTestRuntimeID(t), "status": "running", "originator_user_id": testUserID, "accountable_user_id": testUserID})
 	content := fmt.Sprintf("[@Worker alias](mention://agent/%s) take over", privateID)
-	request := func(method, path string, body any) *http.Request {
-		req := newRequest(method, path, body)
-		req.Header.Set("X-Agent-ID", leaderID)
-		req.Header.Set("X-Task-ID", sourceTaskID)
-		return req
+	posted := captureSessionComment(t, issueID, map[string]any{"content": content}, authorID, sourceTaskID)
+	if posted.AuthorType != "agent" || len(posted.TriggerOutcomes) != 1 || posted.TriggerOutcomes[0].TargetID != ownerID {
+		t.Fatalf("agent output lost owner receipt: %+v", posted)
 	}
-	var posted CommentResponse
-	testutil.Call(t, testHandler.CreateComment, withURLParam(request(http.MethodPost, "/api/issues/"+issueID+"/comments", map[string]any{"content": content}), "id", issueID)).Want(http.StatusCreated).JSON(&posted)
-	if posted.AuthorType != "agent" || findCommentOutcome(t, posted.TriggerOutcomes, privateID).Status != DispatchBlocked {
-		t.Fatalf("agent handoff = %+v", posted)
+	for _, text := range []string{content, "Handoff withdrawn", content} {
+		request := withURLParam(newRequest(http.MethodPut, "/api/comments/"+posted.ID, map[string]any{"content": text}), "commentId", posted.ID)
+		request.Header.Set("X-Agent-ID", authorID)
+		request.Header.Set("X-Task-ID", sourceTaskID)
+		request.Header.Set("X-Actor-Source", "task_token")
+		testutil.Call(t, testHandler.UpdateComment, request).Want(http.StatusOK)
 	}
-	var firstNoticeID, firstNotice string
-	dbfx.QueryRow(t, `SELECT id, content FROM comment WHERE parent_id = $1 AND author_type = 'system'`, posted.ID).Scan(&firstNoticeID, &firstNotice)
-	submittedAt, err := time.Parse(time.RFC3339Nano, posted.UpdatedAt)
-	if err != nil {
-		t.Fatal(err)
+	sessions := captureIssueSessions(t, issueID)
+	if len(sessions) != 1 {
+		t.Fatalf("agent edits split the session: %+v", sessions)
 	}
-	if !strings.Contains(firstNotice, submittedAt.UTC().Format("Jan 2, 2006 at 15:04:05 MST")) || strings.Contains(firstNotice, "revision") {
-		t.Fatalf("notice should identify the submission time without internal version details: %s", firstNotice)
+	var inputs []IssueAgentEventResponse
+	for _, event := range sessions[0].Events {
+		if event.SourceID != nil && *event.SourceID == posted.ID {
+			inputs = append(inputs, event)
+		}
 	}
-	edit := func(text string) CommentResponse {
-		var updated CommentResponse
-		testutil.Call(t, testHandler.UpdateComment, withURLParam(request(http.MethodPut, "/api/comments/"+posted.ID, map[string]any{"content": text}), "commentId", posted.ID)).Want(http.StatusOK).JSON(&updated)
-		return updated
+	want := []struct{ kind, text string }{{"comment.created", content}, {"comment.updated", "Handoff withdrawn"}, {"comment.updated", content}}
+	if len(inputs) != len(want) {
+		t.Fatalf("edit history = %+v, want three immutable inputs", inputs)
 	}
-	edit(content)
-	edit("Handoff withdrawn")
-	updated := edit(content)
-	var notices []CommentResponse
-	_, notices = listComments(t, issueID, "?thread="+posted.ID)
-	if len(notices) != 3 || notices[1].ID != firstNoticeID || notices[1].Content != firstNotice {
-		t.Fatalf("edits changed the old receipt or created an extra receipt: %+v", notices)
+	for i, event := range inputs {
+		var payload struct {
+			Content string `json:"content"`
+		}
+		if err := json.Unmarshal(event.Payload, &payload); err != nil {
+			t.Fatal(err)
+		}
+		if event.Kind != want[i].kind || payload.Content != want[i].text || event.ActorType != "agent" || event.ActorID == nil || *event.ActorID != authorID {
+			t.Fatalf("input %d changed history or authority: %+v payload=%q", i, event, payload.Content)
+		}
+		if i > 0 && (event.SourceRevision <= inputs[i-1].SourceRevision || event.Sequence <= inputs[i-1].Sequence) {
+			t.Fatalf("edit input order did not advance: %+v", inputs)
+		}
 	}
-	editedAt, err := time.Parse(time.RFC3339Nano, updated.UpdatedAt)
-	if err != nil {
-		t.Fatal(err)
+	if count := dbfx.Count(t, `SELECT count(*) FROM comment WHERE issue_id=$1`, issueID); count != 1 {
+		t.Fatalf("agent edits created %d comments, want only the edited original", count)
 	}
-	if notices[2].ID == firstNoticeID || !strings.Contains(notices[2].Content, editedAt.UTC().Format("Jan 2, 2006 at 15:04:05 MST")) || strings.Contains(notices[2].Content, "revision") {
-		t.Fatalf("edited-back submission did not get its own historical receipt: %+v", notices[2])
-	}
-	var tasks int
-	dbfx.QueryRow(t, `SELECT count(*) FROM agent_task_queue WHERE issue_id = $1`, issueID).Scan(&tasks)
-	if tasks != 1 {
-		t.Fatalf("handoff or notices created extra runs: %d tasks", tasks)
-	}
-	stored, err := testHandler.Queries.GetComment(context.Background(), parseUUID(firstNoticeID))
-	if err != nil || stored.AuthorType != "system" || stored.Content != firstNotice {
-		t.Fatalf("historical notice changed: %+v, %v", stored, err)
+	if count := dbfx.Count(t, `SELECT count(*) FROM agent_task_queue WHERE issue_id=$1`, issueID); count != 1 {
+		t.Fatalf("agent edits created %d executions, want the single owner execution", count)
 	}
 }
 
-func TestCommentInvocationDeniedNoticeSkipsOtherSubmissions(t *testing.T) {
-	if testHandler == nil {
-		t.Skip("database not available")
-	}
-	privateID, _, _ := privateAgentTestFixture(t)
-	allowedID := createHandlerTestAgent(t, "Successful notice target", nil)
-	for _, tc := range []struct{ name, content string }{
-		{"successful", fmt.Sprintf("[@Allowed](mention://agent/%s) proceed", allowedID)},
-		{"note", fmt.Sprintf("/note [@Private](mention://agent/%s) reference only", privateID)},
-		{"code", fmt.Sprintf("`[@Private](mention://agent/%s)` is an example", privateID)},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			issueID := dbfx.Issue(t, "No permission notice for "+tc.name)
-			dbfx.Cleanup(t, `DELETE FROM comment WHERE issue_id = $1`, issueID)
-			dbfx.Cleanup(t, `DELETE FROM agent_task_queue WHERE issue_id = $1`, issueID)
-			testutil.Call(t, testHandler.CreateComment, withURLParam(newRequest(http.MethodPost, "/api/issues/"+issueID+"/comments", map[string]any{"content": tc.content}), "id", issueID)).Want(http.StatusCreated)
-			var comments int
-			dbfx.QueryRow(t, `SELECT count(*) FROM comment WHERE issue_id = $1`, issueID).Scan(&comments)
-			if comments != 1 {
-				t.Fatalf("submission added a refusal notice: %d comments", comments)
-			}
-		})
-	}
-}
-
-func TestCommentInvocationDeniedNoticeSkipsDeletedParent(t *testing.T) {
-	if testHandler == nil {
-		t.Skip("database not available")
-	}
-	privateID, _, _ := privateAgentTestFixture(t)
-	issueID := dbfx.Issue(t, "Delete before permission notice")
+func TestCommentSessionDeletionDuringPublicationLeavesNoOrphanNotice(t *testing.T) {
+	issueID, ownerID, _ := issueSessionCaptureFixture(t)
+	privateOwner := handlerWorkspaceMember(t, "denied-session-owner")
+	dbfx.Exec(t, `UPDATE agent SET owner_id=$2,permission_mode='private' WHERE id=$1`, ownerID, privateOwner)
 	h := *testHandler
 	h.Bus = events.New()
 	h.Bus.Subscribe(protocol.EventCommentCreated, func(event events.Event) {
@@ -196,19 +135,21 @@ func TestCommentInvocationDeniedNoticeSkipsDeletedParent(t *testing.T) {
 		}
 		comment, ok := payload["comment"].(CommentResponse)
 		if ok && comment.AuthorType == "member" {
-			dbfx.Exec(t, `DELETE FROM comment WHERE id = $1 AND workspace_id = $2`, comment.ID, testWorkspaceID)
+			dbfx.Exec(t, `DELETE FROM comment WHERE id=$1 AND workspace_id=$2`, comment.ID, testWorkspaceID)
 		}
 	})
 	var posted CommentResponse
-	testutil.Call(t, h.CreateComment, withURLParam(newRequest(http.MethodPost, "/api/issues/"+issueID+"/comments", map[string]any{
-		"content": fmt.Sprintf("[@Private](mention://agent/%s)", privateID),
-	}), "id", issueID)).Want(http.StatusCreated).JSON(&posted)
-	if findCommentOutcome(t, posted.TriggerOutcomes, privateID).Status != DispatchBlocked {
-		t.Fatal("notice failure changed the admission result")
+	testutil.Call(t, h.CreateComment, withURLParam(newRequest(http.MethodPost, "/api/issues/"+issueID+"/comments", map[string]any{"content": "Input deleted during publication"}), "id", issueID)).Want(http.StatusCreated).JSON(&posted)
+	if len(posted.TriggerOutcomes) != 1 || posted.TriggerOutcomes[0].TargetID != ownerID || posted.TriggerOutcomes[0].Status != DispatchBlocked || posted.TriggerOutcomes[0].ReasonCode != ReasonInvocationNotAllowed {
+		t.Fatalf("deletion changed the owner permission receipt: %+v", posted.TriggerOutcomes)
 	}
-	var comments int
-	dbfx.QueryRow(t, `SELECT count(*) FROM comment WHERE issue_id = $1`, issueID).Scan(&comments)
-	if comments != 0 {
-		t.Fatalf("notice left an orphan after deletion: %d comments", comments)
+	if count := dbfx.Count(t, `SELECT count(*) FROM comment WHERE issue_id=$1`, issueID); count != 0 {
+		t.Fatalf("deletion left %d comments or orphan notices", count)
+	}
+	if count := dbfx.Count(t, `SELECT count(*) FROM issue_agent_event WHERE source_id=$1 AND kind IN ('comment.created','comment.deleted')`, posted.ID); count != 2 {
+		t.Fatalf("deletion lost immutable source events: %d", count)
+	}
+	if count := dbfx.Count(t, `SELECT count(*) FROM agent_task_queue WHERE issue_id=$1`, issueID); count != 0 {
+		t.Fatalf("refused input started %d executions", count)
 	}
 }

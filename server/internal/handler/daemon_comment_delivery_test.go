@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/multica-ai/multica/server/internal/service"
 	"github.com/multica-ai/multica/server/internal/testutil"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
@@ -154,6 +155,7 @@ func (f *failNthBegin) Begin(ctx context.Context) (pgx.Tx, error) {
 func createCommentDeliveryFixture(t *testing.T, label string) commentDeliveryFixture {
 	t.Helper()
 	ctx := context.Background()
+	// Raw SQL represents a stored comment plan from before issue-session routing.
 	runtimeID := createClaimReclaimRuntime(t, ctx, label+" runtime")
 	agentID, issueID := createClaimReclaimAgentAndIssue(t, ctx, runtimeID, label+" agent")
 
@@ -380,10 +382,20 @@ func testClaimRepairsDeletedTrigger(t *testing.T, deleteTriggerSQL string) {
 	if response.Task != nil {
 		t.Fatalf("stale plan was dispatched instead of repaired: %+v", response.Task)
 	}
-	assertRepairedCommentBatch(t, fixture, fixture.commentID[1], fixture.commentID[:1])
+	var status string
+	dbfx.QueryRow(t, `SELECT status FROM agent_task_queue WHERE id=$1`, fixture.taskID).Scan(&status)
+	if status != "cancelled" {
+		t.Fatalf("stale historical task status=%s, want cancelled", status)
+	}
+	if n := dbfx.Count(t, `SELECT count(*) FROM task_token WHERE task_id=$1`, fixture.taskID); n != 0 {
+		t.Fatalf("stale claim minted %d task token(s)", n)
+	}
+	if n := dbfx.Count(t, `SELECT count(*) FROM agent_task_queue WHERE issue_id=$1 AND agent_id=$2 AND id<>$3 AND trigger_comment_id IS NOT NULL`, fixture.issueID, fixture.agentID, fixture.taskID); n != 0 {
+		t.Fatalf("stale claim rebuilt %d legacy comment task(s)", n)
+	}
 }
 
-func TestUpdateComment_RequeuesSurvivingCoalescedBatch(t *testing.T) {
+func TestUpdateComment_AppendsSessionEventWithoutRebuildingHistoricalBatch(t *testing.T) {
 	if testHandler == nil || testPool == nil {
 		t.Skip("database not available")
 	}
@@ -403,10 +415,11 @@ func TestUpdateComment_RequeuesSurvivingCoalescedBatch(t *testing.T) {
 		t.Fatalf("UpdateComment: got %d: %s", w.Code, w.Body.String())
 	}
 
-	assertRepairedCommentBatch(t, fixture, fixture.commentID[2], fixture.commentID[:2])
+	assertHistoricalCommentBatchUnchanged(t, fixture)
+	assertCommentMutationEventCount(t, fixture, fixture.commentID[2], "comment.updated", 1)
 }
 
-func TestDeleteComment_RequeuesSurvivingCoalescedBatch(t *testing.T) {
+func TestDeleteComment_AppendsSessionEventWithoutRebuildingHistoricalBatch(t *testing.T) {
 	if testHandler == nil || testPool == nil {
 		t.Skip("database not available")
 	}
@@ -424,7 +437,8 @@ func TestDeleteComment_RequeuesSurvivingCoalescedBatch(t *testing.T) {
 		t.Fatalf("DeleteComment: got %d: %s", w.Code, w.Body.String())
 	}
 
-	assertRepairedCommentBatch(t, fixture, fixture.commentID[1], fixture.commentID[:1])
+	assertHistoricalCommentBatchUnchanged(t, fixture)
+	assertCommentMutationEventCount(t, fixture, fixture.commentID[2], "comment.deleted", 1)
 	var deletedCount int
 	if err := testPool.QueryRow(context.Background(), `SELECT count(*) FROM comment WHERE id = $1`, fixture.commentID[2]).Scan(&deletedCount); err != nil {
 		t.Fatalf("check deleted trigger: %v", err)
@@ -434,7 +448,7 @@ func TestDeleteComment_RequeuesSurvivingCoalescedBatch(t *testing.T) {
 	}
 }
 
-func TestUpdateComment_CancelsAndRequeuesWhenEditedInputIsCoalesced(t *testing.T) {
+func TestUpdateComment_HistoricalCoalescedInputBecomesOneSessionEvent(t *testing.T) {
 	if testHandler == nil || testPool == nil {
 		t.Skip("database not available")
 	}
@@ -454,17 +468,18 @@ func TestUpdateComment_CancelsAndRequeuesWhenEditedInputIsCoalesced(t *testing.T
 		t.Fatalf("UpdateComment: got %d: %s", w.Code, w.Body.String())
 	}
 
-	assertRepairedCommentBatch(t, fixture, fixture.commentID[0], fixture.commentID[1:])
+	assertHistoricalCommentBatchUnchanged(t, fixture)
+	assertCommentMutationEventCount(t, fixture, fixture.commentID[0], "comment.updated", 1)
 	original, err := testHandler.Queries.GetAgentTask(context.Background(), parseUUID(fixture.taskID))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !taskToResponse(original, testWorkspaceID).CancelledByCommentChange {
-		t.Fatal("edited input must identify the cancelled run as invalidated by a comment change")
+	if taskToResponse(original, testWorkspaceID).CancelledByCommentChange {
+		t.Fatal("an edit cancelled the historical run instead of becoming a session event")
 	}
 }
 
-func TestDeleteComment_CancelsAndRequeuesWhenDeletedInputIsCoalesced(t *testing.T) {
+func TestDeleteComment_HistoricalCoalescedInputBecomesOneSessionEvent(t *testing.T) {
 	if testHandler == nil || testPool == nil {
 		t.Skip("database not available")
 	}
@@ -482,10 +497,11 @@ func TestDeleteComment_CancelsAndRequeuesWhenDeletedInputIsCoalesced(t *testing.
 		t.Fatalf("DeleteComment: got %d: %s", w.Code, w.Body.String())
 	}
 
-	assertRepairedCommentBatch(t, fixture, fixture.commentID[2], fixture.commentID[1:2])
+	assertHistoricalCommentBatchUnchanged(t, fixture)
+	assertCommentMutationEventCount(t, fixture, fixture.commentID[0], "comment.deleted", 1)
 }
 
-func TestDeleteComment_FailureRestoresCancelledCompleteBatch(t *testing.T) {
+func TestDeleteComment_FailureKeepsHistoricalBatchAndSessionInbox(t *testing.T) {
 	if testHandler == nil || testPool == nil {
 		t.Skip("database not available")
 	}
@@ -512,10 +528,11 @@ func TestDeleteComment_FailureRestoresCancelledCompleteBatch(t *testing.T) {
 	if existing != 1 {
 		t.Fatalf("failed delete unexpectedly removed trigger")
 	}
-	assertRepairedCommentBatch(t, fixture, fixture.commentID[2], fixture.commentID[:2])
+	assertHistoricalCommentBatchUnchanged(t, fixture)
+	assertCommentMutationEventCount(t, fixture, fixture.commentID[2], "comment.deleted", 0)
 }
 
-func TestDeleteComment_ConcurrentNoOpIsReportedAndRestoresCancelledBatch(t *testing.T) {
+func TestDeleteComment_ConcurrentNoOpDoesNotChangeHistoricalBatchOrSessionInbox(t *testing.T) {
 	if testHandler == nil || testPool == nil {
 		t.Skip("database not available")
 	}
@@ -535,40 +552,34 @@ func TestDeleteComment_ConcurrentNoOpIsReportedAndRestoresCancelledBatch(t *test
 		t.Fatalf("DeleteComment no-op: got %d: %s", w.Code, w.Body.String())
 	}
 
-	assertRepairedCommentBatch(t, fixture, fixture.commentID[2], fixture.commentID[:2])
+	assertHistoricalCommentBatchUnchanged(t, fixture)
+	assertCommentMutationEventCount(t, fixture, fixture.commentID[2], "comment.deleted", 0)
 }
 
-func assertRepairedCommentBatch(t *testing.T, fixture commentDeliveryFixture, wantTrigger string, wantCoalesced []string) {
+func assertHistoricalCommentBatchUnchanged(t *testing.T, fixture commentDeliveryFixture) {
 	t.Helper()
 	var originalStatus string
 	if err := testPool.QueryRow(context.Background(), `SELECT status FROM agent_task_queue WHERE id = $1`, fixture.taskID).Scan(&originalStatus); err != nil {
 		t.Fatalf("load original task: %v", err)
 	}
-	if originalStatus != "cancelled" {
-		t.Fatalf("original task status = %s, want cancelled", originalStatus)
+	if originalStatus != "queued" {
+		t.Fatalf("historical task status = %s, want queued", originalStatus)
 	}
+	if delivered := deliveredCommentIDsForTask(t, fixture.taskID); len(delivered) != 0 {
+		t.Fatalf("comment mutation changed the historical receipt: %v", delivered)
+	}
+	if n := dbfx.Count(t, `SELECT count(*) FROM agent_task_queue WHERE issue_id=$1 AND agent_id=$2 AND id<>$3 AND trigger_comment_id IS NOT NULL`, fixture.issueID, fixture.agentID, fixture.taskID); n != 0 {
+		t.Fatalf("comment mutation created %d legacy successor task(s)", n)
+	}
+}
 
-	var trigger string
-	var coalesced, delivered []string
-	if err := testPool.QueryRow(context.Background(), `
-		SELECT trigger_comment_id::text, coalesced_comment_ids::text[], delivered_comment_ids::text[]
-		FROM agent_task_queue
-		WHERE issue_id = $1 AND agent_id = $2 AND status = 'queued'
-	`, fixture.issueID, fixture.agentID).Scan(&trigger, &coalesced, &delivered); err != nil {
-		t.Fatalf("load repaired task: %v", err)
+func assertCommentMutationEventCount(t *testing.T, fixture commentDeliveryFixture, commentID, kind string, want int) {
+	t.Helper()
+	if n := dbfx.Count(t, `SELECT count(*) FROM issue_agent_session WHERE issue_id=$1 AND agent_id=$2`, fixture.issueID, fixture.agentID); n != 1 {
+		t.Fatalf("comment mutation has %d logical sessions, want one", n)
 	}
-	if trigger != wantTrigger {
-		t.Fatalf("repaired trigger = %s, want %s", trigger, wantTrigger)
-	}
-	gotCoalesced := append([]string{}, coalesced...)
-	want := append([]string{}, wantCoalesced...)
-	slices.Sort(gotCoalesced)
-	slices.Sort(want)
-	if !slices.Equal(gotCoalesced, want) {
-		t.Fatalf("repaired coalesced ids = %v, want %v", gotCoalesced, want)
-	}
-	if len(delivered) != 0 {
-		t.Fatalf("repaired batch inherited receipt: %v", delivered)
+	if n := dbfx.Count(t, `SELECT count(*) FROM issue_agent_event e JOIN issue_agent_session s ON s.id=e.session_id WHERE s.issue_id=$1 AND s.agent_id=$2 AND e.source_id=$3 AND e.kind=$4`, fixture.issueID, fixture.agentID, commentID, kind); n != want {
+		t.Fatalf("mutation %s created %d event(s), want %d", kind, n, want)
 	}
 }
 
@@ -597,7 +608,7 @@ func TestBuildCoalescedCommentData_SortsEqualTimestampsByID(t *testing.T) {
 	}
 }
 
-func TestClaimTaskByRuntime_PayloadOverflowReceiptsOnlyEmbeddedPrefix(t *testing.T) {
+func TestClaimTaskByRuntime_HistoricalPayloadOverflowNeverSynthesizesFollowup(t *testing.T) {
 	if testHandler == nil || testPool == nil {
 		t.Skip("database not available")
 	}
@@ -625,17 +636,11 @@ func TestClaimTaskByRuntime_PayloadOverflowReceiptsOnlyEmbeddedPrefix(t *testing
 	if w := completeTaskViaHandler(t, fixture.taskID, "done"); w.Code != http.StatusOK {
 		t.Fatalf("complete overflow task: %d %s", w.Code, w.Body.String())
 	}
-	if n := pendingTaskCountForAgentIssue(t, fixture.issueID, fixture.agentID); n != 1 {
-		t.Fatalf("overflow should create one bounded follow-up, got %d", n)
+	if n := dbfx.Count(t, `SELECT count(*) FROM agent_task_queue WHERE issue_id=$1 AND agent_id=$2 AND id<>$3 AND trigger_comment_id IS NOT NULL`, fixture.issueID, fixture.agentID, fixture.taskID); n != 0 {
+		t.Fatalf("historical payload overflow synthesized %d legacy successor task(s)", n)
 	}
-	followupTrigger, _, followupCoalesced := taskTriggerOriginatorCoalesced(t, fixture.issueID, fixture.agentID)
-	covered := append([]string{}, followupCoalesced...)
-	covered = append(covered, followupTrigger)
-	slices.Sort(covered)
-	want := append([]string{}, fixture.commentID[:2]...)
-	slices.Sort(want)
-	if !slices.Equal(covered, want) {
-		t.Fatalf("overflow follow-up coverage = %v, want omitted suffix %v", covered, want)
+	if n := dbfx.Count(t, `SELECT count(*) FROM comment WHERE id=ANY($1::uuid[])`, fixture.commentID); n != len(fixture.commentID) {
+		t.Fatalf("bounded payload removed source comments: got %d, want %d", n, len(fixture.commentID))
 	}
 }
 
@@ -729,7 +734,7 @@ func TestCreateRetryTask_PreservesCommentPlanAndResetsReceipt(t *testing.T) {
 	}
 }
 
-func TestRerunIssue_PreservesSourceCommentPlanAndResetsReceipt(t *testing.T) {
+func TestRerunIssue_RejectsHistoricalCommentPlanWithoutChangingReceipt(t *testing.T) {
 	if testHandler == nil || testPool == nil {
 		t.Skip("database not available")
 	}
@@ -772,25 +777,18 @@ func TestRerunIssue_PreservesSourceCommentPlanAndResetsReceipt(t *testing.T) {
 	})
 
 	rerun, err := testHandler.TaskService.RerunIssue(ctx, util.MustParseUUID(issueID), util.MustParseUUID(sourceID), pgtype.UUID{}, pgtype.UUID{}, false, nil)
-	if err != nil {
-		t.Fatalf("RerunIssue: %v", err)
+	if !errors.Is(err, service.ErrIssueSessionRerunRequiresEvent) || rerun != nil {
+		t.Fatalf("historical comment plan rerun=%v err=%v, want explicit session-event rejection", rerun, err)
 	}
-	if got := uuidToString(rerun.TriggerCommentID); got != commentIDs[2] {
-		t.Fatalf("rerun trigger = %s, want %s", got, commentIDs[2])
+	if got := deliveredCommentIDsForTask(t, sourceID); len(got) != len(commentIDs) {
+		t.Fatalf("rejected rerun changed historical receipt: %v", got)
 	}
-	gotCoalesced := uuidsToStrings(rerun.CoalescedCommentIds)
-	wantCoalesced := append([]string{}, commentIDs[:2]...)
-	slices.Sort(gotCoalesced)
-	slices.Sort(wantCoalesced)
-	if !slices.Equal(gotCoalesced, wantCoalesced) {
-		t.Fatalf("rerun coalesced ids = %v, want %v", gotCoalesced, wantCoalesced)
-	}
-	if len(rerun.DeliveredCommentIds) != 0 {
-		t.Fatalf("manual rerun inherited receipt: %v", uuidsToStrings(rerun.DeliveredCommentIds))
+	if n := dbfx.Count(t, `SELECT count(*) FROM agent_task_queue WHERE issue_id=$1 AND agent_id=$2 AND id<>$3`, issueID, agentID, sourceID); n != 0 {
+		t.Fatalf("rejected rerun created %d replacement task(s)", n)
 	}
 }
 
-func TestRerunIssue_PromotesNewestSurvivorAfterSourceTriggerDeleted(t *testing.T) {
+func TestRerunIssue_DeletedHistoricalTriggerDoesNotPromoteAnotherComment(t *testing.T) {
 	if testHandler == nil || testPool == nil {
 		t.Skip("database not available")
 	}
@@ -819,20 +817,11 @@ func testRerunPromotesSurvivorAfterTriggerDeleted(t *testing.T, deleteTriggerSQL
 	}
 
 	rerun, err := testHandler.TaskService.RerunIssue(ctx, parseUUID(fixture.issueID), parseUUID(fixture.taskID), pgtype.UUID{}, pgtype.UUID{}, false, nil)
-	if err != nil {
-		t.Fatalf("RerunIssue: %v", err)
+	if !errors.Is(err, service.ErrIssueSessionRerunRequiresEvent) || rerun != nil {
+		t.Fatalf("deleted historical trigger rerun=%v err=%v, want explicit session-event rejection", rerun, err)
 	}
-	if got := uuidToString(rerun.TriggerCommentID); got != fixture.commentID[1] {
-		t.Fatalf("rerun promoted trigger = %s, want newest survivor %s", got, fixture.commentID[1])
-	}
-	if got := uuidsToStrings(rerun.CoalescedCommentIds); !slices.Equal(got, []string{fixture.commentID[0]}) {
-		t.Fatalf("rerun survivor plan = %v, want [%s]", got, fixture.commentID[0])
-	}
-	if len(rerun.DeliveredCommentIds) != 0 {
-		t.Fatalf("rerun inherited delivery receipt: %v", uuidsToStrings(rerun.DeliveredCommentIds))
-	}
-	if got := uuidToString(rerun.OriginatorUserID); got != testUserID {
-		t.Fatalf("rerun originator = %s, want promoted comment author %s", got, testUserID)
+	if n := dbfx.Count(t, `SELECT count(*) FROM agent_task_queue WHERE issue_id=$1 AND agent_id=$2 AND id<>$3`, fixture.issueID, fixture.agentID, fixture.taskID); n != 0 {
+		t.Fatalf("deleted historical trigger promoted a survivor into %d replacement task(s)", n)
 	}
 }
 

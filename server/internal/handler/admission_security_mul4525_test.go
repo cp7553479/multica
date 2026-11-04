@@ -215,13 +215,15 @@ func TestRerunIssue_PrivateHistoricalAgent(t *testing.T) {
 	}
 	origID := util.UUIDToString(orig.ID)
 
-	// Reassign the issue to a SECOND agent that testUserID CAN invoke (a
-	// workspace-invocable public_to agent). Now the issue's CURRENT assignee and
+	// Reassign the issue to a squad whose leader testUserID can invoke. This
+	// keeps this a historical auxiliary execution; an Agent-owned session
+	// continues through its inbox. The issue's current leader and
 	// the source task's HISTORICAL agent differ: if the rerun wrongly validated
 	// the current assignee, testUserID would be allowed — so the 403 below proves
 	// the gate is keyed on the historical private agent named by task_id.
 	currentAgentID := createHandlerTestAgent(t, "RerunCurrentAssignee", []byte("[]"))
-	if _, err := testPool.Exec(ctx, `UPDATE issue SET assignee_id = $1 WHERE id = $2`, currentAgentID, issueID); err != nil {
+	currentSquadID := dbfx.Squad(t, "historical rerun current squad", currentAgentID)
+	if _, err := testPool.Exec(ctx, `UPDATE issue SET assignee_type='squad',assignee_id = $1 WHERE id = $2`, currentSquadID, issueID); err != nil {
 		t.Fatalf("reassign issue to second agent: %v", err)
 	}
 

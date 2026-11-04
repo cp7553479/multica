@@ -2,13 +2,13 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
-	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
@@ -44,8 +44,8 @@ func TestIssueWakeupExpiryValidation(t *testing.T) {
 }
 
 // A deadline that passes without a subscribed event ends the rule. With
-// on_timeout=wake the target runs once with the timeout as its trigger fact;
-// the rule reads as timed out, not as turned off, so that run stays claimable.
+// on_timeout=wake the timeout enters the target's inbox once. The rule reads
+// as timed out, not as turned off, so its transferred event stays claimable.
 func TestIssueWakeupTimeoutWakesOnceAndEnds(t *testing.T) {
 	f, s, issue, agent := wakeFixture(t)
 	ctx := context.Background()
@@ -54,8 +54,8 @@ func TestIssueWakeupTimeoutWakesOnceAndEnds(t *testing.T) {
 		t.Fatalf("expiry not stored: %+v", w)
 	}
 	wakeDispatch(t, s, w)
-	if n := f.Count(t, "SELECT count(*) FROM agent_task_queue WHERE context->>'wakeup_id'=$1", util.UUIDToString(w.ID)); n != 0 {
-		t.Fatal("dispatched before the deadline")
+	if events := wakeupInbox(t, f, w.ID); len(events) != 0 {
+		t.Fatal("transferred before the deadline")
 	}
 	f.Exec(t, "UPDATE issue_wakeup SET expires_at=now()-interval '1 second' WHERE id=$1", w.ID)
 	ready, err := f.q.ListDueWakeups(ctx, db.ListDueWakeupsParams{WorkspaceIds: []pgtype.UUID{parseTestUUID(t, f.WorkspaceID)}, SkipIds: []pgtype.UUID{}, RowLimit: 100})
@@ -71,12 +71,16 @@ func TestIssueWakeupTimeoutWakesOnceAndEnds(t *testing.T) {
 	}
 	wakeDispatch(t, s, w)
 	wakeDispatch(t, s, w)
-	var note string
-	if err = f.Pool.QueryRow(ctx, "SELECT handoff_note FROM agent_task_queue WHERE context->>'wakeup_id'=$1", util.UUIDToString(w.ID)).Scan(&note); err != nil {
-		t.Fatal(err)
+	events := wakeupInbox(t, f, w.ID)
+	if len(events) != 1 || events[0].Status != "pending" || events[0].DeliveredAt.Valid {
+		t.Fatalf("timeout inbox must contain one undelivered event: %+v", events)
 	}
-	if !strings.Contains(note, "wakeup.timeout") {
-		t.Fatalf("timeout fact missing from the prompt: %s", note)
+	var payload wakeupSessionPayload
+	if err = json.Unmarshal(events[0].Payload, &payload); err != nil || !strings.Contains(payload.Note, "wakeup.timeout") {
+		t.Fatalf("timeout fact missing from the event: %s (%v)", events[0].Payload, err)
+	}
+	if n := f.Count(t, "SELECT count(*) FROM issue_wakeup_receipt WHERE wakeup_id=$1 AND processed_at IS NOT NULL", w.ID); n != 1 {
+		t.Fatalf("durably transferred receipts = %d, want 1", n)
 	}
 	got, _ := f.q.GetIssueWakeup(ctx, db.GetIssueWakeupParams{ID: w.ID, WorkspaceID: w.WorkspaceID})
 	if got.Enabled || !got.TimedOutAt.Valid || got.DisabledAt.Valid {
@@ -89,7 +93,9 @@ func TestIssueWakeupTimeoutWakesOnceAndEnds(t *testing.T) {
 	}
 
 	// Enabling again restarts the relative wait from now.
-	f.Exec(t, "UPDATE agent_task_queue SET status='completed',completed_at=now() WHERE context->>'wakeup_id'=$1", util.UUIDToString(w.ID))
+	task := wakeupSessionTask(t, f, issue, agent)
+	wakeupAckEvents(t, s, task, wakeupClaimEvents(t, f, s, task, 32))
+	wakeupFinishExecution(t, f, s, task, "completed")
 	again, err := s.Enable(ctx, issue, parseTestUUID(t, f.UserID), pgtype.UUID{}, w.ID, WakeupEnableInput{Revision: got.Revision, Rearm: true})
 	if err != nil {
 		t.Fatal(err)
@@ -113,8 +119,8 @@ func TestIssueWakeupTimeoutEndsQuietly(t *testing.T) {
 			w := wakeCreate(t, f, s, issue, in)
 			f.Exec(t, "UPDATE issue_wakeup SET expires_at=now()-interval '1 second' WHERE id=$1", w.ID)
 			wakeDispatch(t, s, w)
-			if n := f.Count(t, "SELECT count(*) FROM agent_task_queue WHERE context->>'wakeup_id'=$1", util.UUIDToString(w.ID)); n != 0 {
-				t.Fatal("on_timeout=end must not start a run")
+			if events := wakeupInbox(t, f, w.ID); len(events) != 0 {
+				t.Fatal("on_timeout=end must not transfer an event")
 			}
 			got, _ := f.q.GetIssueWakeup(ctx, db.GetIssueWakeupParams{ID: w.ID, WorkspaceID: w.WorkspaceID})
 			if got.Enabled || !got.TimedOutAt.Valid || got.NextFireAt.Valid {

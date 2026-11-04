@@ -417,9 +417,9 @@ func TestChildDone_SquadPrivateLeader_AgentActorWakesLeader(t *testing.T) {
 	}
 }
 
-// TestComment_SquadPrivateLeader_AgentActorAllowed verifies that an agent
-// actor CAN explicitly trigger the private leader via a squad mention.
-func TestComment_SquadPrivateLeader_AgentActorAllowed(t *testing.T) {
+// An agent acting for the private leader's owner may assign work explicitly.
+// A squad mention remains a comment and cannot acquire that execution role.
+func TestAgentCanExplicitlyAssignThePrivateLeaderUsingItsSourceHuman(t *testing.T) {
 	if testHandler == nil || testPool == nil {
 		t.Skip("database not available")
 	}
@@ -443,8 +443,8 @@ func TestComment_SquadPrivateLeader_AgentActorAllowed(t *testing.T) {
 	// Create issue assigned to the squad.
 	var issueID string
 	if err := testPool.QueryRow(ctx, `
-		INSERT INTO issue (workspace_id, creator_type, creator_id, title, assignee_type, assignee_id)
-		VALUES ($1, 'member', $2, 'private leader agent actor test', 'squad', $3)
+		INSERT INTO issue (workspace_id, creator_type, creator_id, title, status, assignee_type, assignee_id)
+		VALUES ($1, 'member', $2, 'private leader agent actor test', 'todo', 'squad', $3)
 		RETURNING id
 	`, testWorkspaceID, testUserID, squadID).Scan(&issueID); err != nil {
 		t.Fatalf("create issue: %v", err)
@@ -457,8 +457,7 @@ func TestComment_SquadPrivateLeader_AgentActorAllowed(t *testing.T) {
 
 	// Create a task for the other agent whose top-of-chain originator is the
 	// private leader's OWNER. Under MUL-3963 A2A is judged by that originator,
-	// so the agent-actor squad mention resolves to the owner and may invoke
-	// the private leader.
+	// so an explicit assignment can invoke the private leader.
 	var taskID string
 	if err := testPool.QueryRow(ctx, `
 		INSERT INTO agent_task_queue (agent_id, runtime_id, status, priority, issue_id, originator_user_id, accountable_user_id)
@@ -484,17 +483,27 @@ func TestComment_SquadPrivateLeader_AgentActorAllowed(t *testing.T) {
 		t.Fatalf("CreateComment: expected 201, got %d: %s", w.Code, w.Body.String())
 	}
 
-	// The private leader SHOULD have a queued task — the agent-actor mention's
-	// top-of-chain originator is the leader's owner, so A2A-by-originator
-	// admits it (MUL-3963).
-	var count int
-	if err := testPool.QueryRow(ctx,
-		`SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2 AND status = 'queued'`,
-		issueID, agentID,
-	).Scan(&count); err != nil {
-		t.Fatalf("count tasks: %v", err)
+	var comment CommentResponse
+	if err := json.NewDecoder(w.Body).Decode(&comment); err != nil {
+		t.Fatal(err)
 	}
-	if count == 0 {
-		t.Fatalf("private leader got 0 queued tasks; want >=1 (A2A originator is the leader owner)")
+	if comment.SourceTaskID == nil || *comment.SourceTaskID != taskID || len(comment.TriggerOutcomes) != 0 {
+		t.Fatalf("squad mention lost its authoring task or selected a run: %+v", comment)
 	}
+	if n := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id=$1 AND agent_id=$2", issueID, agentID); n != 0 {
+		t.Fatalf("squad mention started %d private leader tasks", n)
+	}
+	captureSessionUpdateIssue(t, issueID, map[string]any{"assignee_type": "agent", "assignee_id": agentID}, otherAgentID, taskID)
+	sessions := captureIssueSessions(t, issueID)
+	if len(sessions) != 1 || sessions[0].AgentID != agentID || sessions[0].ActiveTaskID == nil || len(sessions[0].Events) != 1 || sessions[0].Events[0].Kind != "assigned" {
+		t.Fatalf("explicit private assignment did not create its owner session: %+v", sessions)
+	}
+	task, err := testHandler.Queries.GetAgentTask(ctx, parseUUID(*sessions[0].ActiveTaskID))
+	if err != nil || uuidToString(task.OriginatorUserID) != ownerID || uuidToString(task.AgentID) != agentID {
+		t.Fatalf("private assignment lost its allowed source human: %+v, %v", task, err)
+	}
+	if n := dbfx.Count(t, "SELECT count(*) FROM issue_agent_event WHERE session_id=$1 AND source_task_id=$2 AND originator_user_id=$3", sessions[0].ID, taskID, ownerID); n != 1 {
+		t.Fatalf("private assignment borrowed another actor's authority: %d matching events", n)
+	}
+
 }

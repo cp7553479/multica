@@ -28,9 +28,10 @@ func TestIssueWakeupMemberFilterPreservesOnceUntilMatchingComment(t *testing.T) 
 	}
 	f.Exec(t, `INSERT INTO comment(issue_id,workspace_id,author_type,author_id,content,type) VALUES($1,$2,'member',$3,'requested reply','comment')`, issue, f.WorkspaceID, other)
 	wakeDispatch(t, s, w)
-	if got := f.Count(t, "SELECT count(*) FROM agent_task_queue WHERE context->>'wakeup_id'=$1", util.UUIDToString(w.ID)); got != 1 {
-		t.Fatalf("matching comment did not enqueue: %d", got)
+	if events := wakeupInbox(t, f, w.ID); len(events) != 1 || events[0].Status != "pending" {
+		t.Fatalf("matching comment did not enter the inbox once: %+v", events)
 	}
+	wakeupSessionTask(t, f, issue, agent)
 	current, err = f.q.GetIssueWakeup(context.Background(), db.GetIssueWakeupParams{ID: w.ID, WorkspaceID: parseTestUUID(t, f.WorkspaceID)})
 	if err != nil || current.Enabled {
 		t.Fatal("one-shot did not finish")
@@ -165,8 +166,12 @@ func TestIssueWakeupLegacyMutationAgentFilterNormalizes(t *testing.T) {
 	}
 	f.Exec(t, `INSERT INTO comment(issue_id,workspace_id,author_type,author_id,content,type) VALUES($1,$2,'agent',$3,'agent reply','comment')`, issue, f.WorkspaceID, agent)
 	wakeDispatch(t, s, w)
-	if f.Count(t, "SELECT count(*) FROM agent_task_queue WHERE context->>'wakeup_id'=$1", util.UUIDToString(w.ID)) != 1 {
-		t.Fatal("legacy alias did not wake on agent comment")
+	if events := wakeupInbox(t, f, w.ID); len(events) != 1 || events[0].Status != "pending" {
+		t.Fatalf("legacy filter alias did not transfer the requested agent comment: %+v", events)
+	}
+	task := wakeupSessionTask(t, f, issue, agent)
+	if claimed := wakeupClaimEvents(t, f, s, task, 1); len(claimed) != 1 {
+		t.Fatalf("explicit agent actor filter did not remain deliverable: %+v", claimed)
 	}
 	// Existing clients can still combine task and mutation types in one rule.
 	in := WakeupInput{AgentID: agent, Kind: "event", EventTypes: []string{"task.completed", "comment.created"}, FilterAgentID: agent, Instruction: "wait"}

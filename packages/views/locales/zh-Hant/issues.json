@@ -30,8 +30,6 @@
     "steer_waiting": "等待 {{name}} 讀取",
     "steer_read": "{{name}} 已讀取",
     "steer_not_received": "{{name}} 未收到 · {{reason}}",
-    "steer_resend": "作為新一輪傳送",
-    "steer_resend_failed": "沒能作為新一輪傳送。",
     "steer_step": "{{name}} 插話",
     "steer_step_read": "已讀取"
   },
@@ -680,17 +678,11 @@
     "trigger_source_mention_squad_leader": "小隊",
     "trigger_source_unknown": "將觸發",
     "trigger_skipped_label": "已跳過",
-    "trigger_wont_trigger": "本次不會開始",
-    "trigger_none_will_trigger": "都不會開始",
-    "all_members_notice": "成員廣播 · @all 不會啟動 AI 代理",
+    "all_members_notice": "成員廣播",
     "trigger_reason_mention_squad_leader": "被 @ 小隊的隊長。",
     "trigger_reason_unknown": "將由這條評論開始。",
-    "trigger_will_start": "傳送後開始",
     "trigger_will_start_count_other": "傳送後 {{count}} 個 AI 代理開始工作",
-    "trigger_starts_now": "立即開始。",
-    "trigger_starts_when_online": "當前離線，上線後開始。",
     "trigger_click_to_skip": "點選本次跳過。",
-    "trigger_click_to_manage": "點選為每個 AI 代理選擇這條訊息的處理方式。",
     "trigger_click_to_restore": "本次不會開始，點選恢復。",
     "trigger_preview_title": "接收方",
     "trigger_chip_aria": "{{name}} 觸發狀態：{{state}}",
@@ -708,21 +700,7 @@
       "resolve_failed": "標記已解決失敗",
       "unresolve_failed": "重新開啟失敗"
     },
-    "recipient_steer": "插話到當前執行",
-    "recipient_steer_desc": "{{name}} 會在當前步驟結束後讀到，並繼續完成原任務。僅支援文字。",
-    "recipient_after_run": "本輪結束後開始",
-    "recipient_after_run_desc": "不打斷當前執行，結束後作為新一輪處理。",
-    "recipient_restart": "停止並重新開始",
-    "recipient_restart_desc": "立即停止當前執行，按這條訊息從頭開始。",
-    "recipient_join": "開始時一併處理",
-    "recipient_join_desc": "{{name}} 的執行還在排隊，開始時會連同這條訊息一起處理。",
-    "recipient_state_running": "正在執行",
-    "recipient_state_starting": "正在啟動",
-    "recipient_state_queued": "排隊中",
-    "recipient_count_other": "{{count}} 個 AI 代理會收到",
-    "steer_attachment_notice": "插話只支援文字，帶附件的訊息會在本輪結束後處理。",
-    "restart_send": "停止併傳送",
-    "restart_failed": "沒能停止當前執行，訊息還沒有傳送。"
+    "session_recipient": "傳送到 {{name}} 的對話"
   },
   "reply": {
     "placeholder": "回覆...",
@@ -1795,5 +1773,37 @@
       "empty_title": "還沒有儲存的檢視",
       "empty_description": "在任務列表裡調好篩選和顯示方式，然後另存為檢視。"
     }
+  },
+  "agent_sessions": {
+    "title": "AI 代理對話",
+    "idle": "閒置",
+    "working": "工作中",
+    "blocked": "已封鎖",
+    "paused": "已暫停",
+    "closed": "已關閉",
+    "unknown": "未知狀態",
+    "pending": "待傳送",
+    "delivering": "傳送中",
+    "delivered": "已送達",
+    "failed": "失敗",
+    "ignored": "已忽略",
+    "event": "事件 {{sequence}}",
+    "retry": "重試",
+    "retry_event": "重試事件 {{sequence}}",
+    "load_failed": "無法載入對話傳送狀態。",
+    "retry_failed": "無法重試此事件。",
+    "unsupported": "此執行階段不支援在執行中接收訊息。",
+    "blocked_hint": "傳送受阻，請檢查 AI 代理執行階段。",
+    "truncated_other": "顯示對話歷史中的 {{count}} 個事件。",
+    "invocation_not_allowed": "你沒有傳送訊息給此 AI 代理的權限。",
+    "delivery_unconfirmed": "無法確認傳送結果，重試前請檢查對話。",
+    "provider_rejected": "AI 代理拒絕了此訊息。",
+    "turn_ended": "執行在訊息送達前結束。",
+    "detached": "已重新分配／停用",
+    "resume_unavailable": "此對話無法恢復。請先恢復原執行階段和對話資料，再重試。",
+    "retry_original_session": "可重試此事件，重新檢查並恢復原對話。"
+  },
+  "delivery_receipts": {
+    "delivered_to": "已送達 {{name}}"
   }
 }

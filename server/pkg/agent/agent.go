@@ -24,6 +24,12 @@ type Backend interface {
 
 // ExecOptions configures a single execution.
 type ExecOptions struct {
+	// StrictSessionResume refuses to replace a persistent conversation with a new one.
+	StrictSessionResume bool
+	// PersistSession must succeed when the provider first establishes its real
+	// session identity, before accepting additional input or releasing a launch
+	// boundary. A failure stops execution; it must never open a replacement.
+	PersistSession func(context.Context, string) error
 	// EnableTaskSupplement installs provider hooks only for runs whose daemon/server
 	// capability handshake enabled additional messages.
 	EnableTaskSupplement bool

@@ -376,72 +376,6 @@ SELECT
 WHERE lock_task_owner_rows($1, $3, $2)
 RETURNING *;
 
--- name: CreateDeferredChannelIssueTask :one
--- Fenced against workspace teardown: lock_task_owner_rows (migration 284)
--- locks the owners' workspace rows in the writer's own transaction and returns
--- false once they are gone, so this statement writes no row instead of stranding
--- a task in a workspace that has just been deleted (MUL-5999).
--- Channel /issue media resolves after issue creation. Persist the assigned
--- issue task up front for crash safety, but keep it inert until attachment
--- binding settles or the fire_at fallback is promoted by the normal sweeper.
-INSERT INTO agent_task_queue (
-    agent_id, runtime_id, issue_id, status, priority, trigger_comment_id,
-    coalesced_comment_ids, trigger_summary, force_fresh_session, is_leader_task, handoff_note,
-    squad_id, context, originator_user_id, accountable_user_id, runtime_mcp_overlay, runtime_connected_apps,
-    originator_source, delegated_from_task_id, rule_version_id, rerun_of_task_id,
-    trigger_evidence_kind, trigger_evidence_ref_id, fire_at,
-    workflow_step, id
-)
-SELECT
-    $1, $2, $3, 'deferred', $4, sqlc.narg(trigger_comment_id),
-    COALESCE(sqlc.narg(coalesced_comment_ids)::uuid[], '{}'),
-    sqlc.narg(trigger_summary),
-    COALESCE(sqlc.narg('force_fresh_session')::boolean, FALSE),
-    COALESCE(sqlc.narg('is_leader_task')::boolean, FALSE),
-    sqlc.narg(handoff_note),
-    sqlc.narg(squad_id),
-    jsonb_strip_nulls(jsonb_build_object(
-        'head_sha', NULLIF(COALESCE(sqlc.narg('head_sha')::text, ''), ''),
-        'channel_issue_media_pending', TRUE
-    )),
-    sqlc.narg(originator_user_id),
-    sqlc.narg(accountable_user_id),
-    sqlc.narg(runtime_mcp_overlay),
-    sqlc.narg(runtime_connected_apps),
-    sqlc.narg(originator_source),
-    sqlc.narg(delegated_from_task_id),
-    sqlc.narg(rule_version_id),
-    sqlc.narg(rerun_of_task_id),
-    sqlc.narg(trigger_evidence_kind),
-    sqlc.narg(trigger_evidence_ref_id),
-    @fire_at,
-    -- The issue's status as this task is queued: the workflow step it works on (MUL-7420).
-    (SELECT i.status FROM issue i WHERE i.id = $3),
-    COALESCE(sqlc.narg('id')::uuid, gen_random_uuid())
-WHERE lock_task_owner_rows($1, $3, $2)
-RETURNING *;
-
--- name: PromoteDeferredChannelIssueTask :one
--- Early promotion is idempotent at the service layer: a task already promoted
--- by the fire_at sweeper no longer matches and is treated as settled.
-UPDATE agent_task_queue
-SET status = 'queued', fire_at = NULL
-WHERE id = $1 AND issue_id IS NOT NULL AND status = 'deferred'
-RETURNING *;
-
--- name: SetDeferredChannelIssueTaskRuntimeOverlay :execrows
--- The issue and its inert media-gated task commit atomically before the optional
--- external overlay is built. Only hydrate the untouched original plan: a comment
--- merge may already have replaced the trigger, attribution, and matching overlay.
-UPDATE agent_task_queue
-SET runtime_mcp_overlay = sqlc.narg(runtime_mcp_overlay),
-    runtime_connected_apps = sqlc.narg(runtime_connected_apps)
-WHERE id = @id
-  AND status = 'deferred'
-  AND context->>'channel_issue_media_pending' = 'true'
-  AND trigger_comment_id IS NULL
-  AND originator_user_id IS NOT DISTINCT FROM sqlc.narg(expected_originator_user_id)::uuid;
-
 -- name: CreateQuickCreateTask :one
 -- Fenced against workspace teardown: lock_task_owner_rows (migration 284)
 -- locks the owners' workspace rows in the writer's own transaction and returns
@@ -2128,16 +2062,6 @@ WHERE issue_id = $1 AND agent_id = $2
     OR (status = 'deferred' AND context->>'channel_issue_media_pending' = 'true')
   )
   AND comment_thread_id IS NOT DISTINCT FROM comment_thread_root_id(sqlc.narg('thread_comment_id')::uuid);
-
--- name: GetLatestTaskRoleForIssueAndAgent :one
--- Returns the role markers from the agent's most recent task on this issue.
--- Used by the squad-leader self-trigger guard to tell apart leader tasks,
--- same-squad worker tasks, and generic agent tasks such as direct mentions or
--- thread-parent replies.
-SELECT is_leader_task, squad_id FROM agent_task_queue
-WHERE issue_id = $1 AND agent_id = $2
-ORDER BY created_at DESC
-LIMIT 1;
 
 -- name: ListPendingTasksByRuntime :many
 SELECT * FROM agent_task_queue

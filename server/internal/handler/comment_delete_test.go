@@ -3,6 +3,7 @@ package handler
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"mime/multipart"
 	"net/http"
@@ -221,87 +222,102 @@ func TestDeleteCommentPrunesTombstonesLeftWithoutReplies(t *testing.T) {
 	}
 }
 
-// A tombstone carries no input: it must not count as a new comment for the
-// claim hint, nor be replayed by completion reconciliation.
-func TestCommentTombstoneIsNotTriggerInput(t *testing.T) {
+// The inbox keeps the original input and a separate deletion event. A
+// tombstone must not become an empty comment or create another execution.
+func TestCommentTombstoneIsDeliveredAsDeletionEvent(t *testing.T) {
 	if testHandler == nil || testPool == nil {
 		t.Skip("database not available")
 	}
-	ctx := context.Background()
-	issueID := dbfx.Issue(t, "tombstone is not input")
-	since := time.Now().Add(-time.Minute)
-	root := dbfx.Comment(t, issueID, "please look at this")
-	dbfx.Comment(t, issueID, "a reply keeps the root", testutil.Cols{"parent_id": root})
-
-	countSince := func() int64 {
-		t.Helper()
-		n, err := testHandler.Queries.CountNewCommentsSince(ctx, db.CountNewCommentsSinceParams{
-			IssueID:     parseUUID(issueID),
-			WorkspaceID: parseUUID(testWorkspaceID),
-			Since:       pgtype.Timestamptz{Time: since, Valid: true},
-			// Neither id may be NULL: the query compares against both.
-			AnchorID: parseUUID("00000000-0000-0000-0000-000000000001"),
-			AuthorID: parseUUID(testUserID),
-		})
-		if err != nil {
-			t.Fatalf("CountNewCommentsSince: %v", err)
-		}
-		return n
-	}
-	if got := countSince(); got != 2 {
-		t.Fatalf("new comments before delete = %d, want 2", got)
+	issueID, ownerID, _ := issueSessionCaptureFixture(t)
+	root := captureSessionComment(t, issueID, map[string]any{"content": "please look at this"}, "", "")
+	captureSessionComment(t, issueID, map[string]any{"content": "a reply keeps the root", "parent_id": root.ID}, "", "")
+	before := captureIssueSessions(t, issueID)
+	if len(before) != 1 || len(before[0].Events) != 3 || before[0].ActiveTaskID == nil {
+		t.Fatalf("session before delete = %+v, want three inputs and one execution", before)
 	}
 
-	if _, err := testHandler.deleteComment(ctx, parseUUID(root), parseUUID(testWorkspaceID)); err != nil {
-		t.Fatalf("deleteComment: %v", err)
+	rec := newCommentEventRecorder()
+	rec.delete(t, root.ID).Want(http.StatusNoContent)
+	after := captureIssueSessions(t, issueID)
+	if len(after) != 1 || after[0].ID != before[0].ID || after[0].AgentID != ownerID || len(after[0].Events) != 4 {
+		t.Fatalf("session after delete = %+v, want one deletion appended to the same owner", after)
 	}
-	if got := countSince(); got != 1 {
-		t.Fatalf("new comments after delete = %d, want the tombstone excluded", got)
+	if after[0].ActiveTaskID == nil || *after[0].ActiveTaskID != *before[0].ActiveTaskID {
+		t.Fatalf("deletion replaced the execution: before=%+v after=%+v", before[0], after[0])
 	}
-	reconcilable, err := testHandler.Queries.ListReconcilableCommentsForIssueSince(ctx, db.ListReconcilableCommentsForIssueSinceParams{
-		IssueID:           parseUUID(issueID),
-		PlannedCommentIds: []pgtype.UUID{parseUUID(root)},
-		Since:             pgtype.Timestamptz{Time: since, Valid: true},
-	})
-	if err != nil {
-		t.Fatalf("ListReconcilableCommentsForIssueSince: %v", err)
+	created, deleted := after[0].Events[1], after[0].Events[3]
+	if created.Kind != "comment.created" || created.SourceID == nil || *created.SourceID != root.ID {
+		t.Fatalf("original input changed after deletion: %+v", created)
 	}
-	for _, comment := range reconcilable {
-		if comment.ID == parseUUID(root) {
-			t.Fatal("completion reconciliation would replay the tombstone")
-		}
+	if deleted.Kind != "comment.deleted" || deleted.SourceID == nil || *deleted.SourceID != root.ID || deleted.Sequence != created.Sequence+2 || deleted.ActorType != "member" || deleted.ActorID == nil || *deleted.ActorID != testUserID {
+		t.Fatalf("deletion event = %+v, want an ordered member-authored deletion of the root", deleted)
+	}
+	var originalPayload, deletionPayload map[string]json.RawMessage
+	if err := json.Unmarshal(created.Payload, &originalPayload); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(deleted.Payload, &deletionPayload); err != nil {
+		t.Fatal(err)
+	}
+	if string(originalPayload["content"]) != `"please look at this"` || string(deletionPayload["content"]) != "null" {
+		t.Fatalf("captured content: original=%s deletion=%s", created.Payload, deleted.Payload)
+	}
+	rec.delete(t, root.ID).Want(http.StatusNotFound)
+	if events := captureIssueSessions(t, issueID)[0].Events; len(events) != len(after[0].Events) {
+		t.Fatalf("repeated deletion appended another event: %+v", events)
+	}
+	if n := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id=$1", issueID); n != 1 {
+		t.Fatalf("deletion created %d executions, want the existing one", n)
 	}
 }
 
-// A reply under a deleted agent comment continues the thread: it wakes neither
-// the deleted comment's author nor, as a fallback, the issue assignee. The web
-// reply box posts under the thread root, so this is every later reply once an
-// agent-authored root with replies is deleted.
-func TestReplyUnderDeletedAgentCommentWakesNoOne(t *testing.T) {
+// Reply placement stays in the comment tree; delivery belongs to the issue's
+// owner even when the parent is a deleted comment by a different agent.
+func TestReplyUnderDeletedAgentCommentEntersOwnerSession(t *testing.T) {
 	if testHandler == nil || testPool == nil {
 		t.Skip("database not available")
 	}
-	ctx := context.Background()
-	authorID := createHandlerTestAgent(t, "Deleted Comment Author", nil)
-	assigneeID := createHandlerTestAgent(t, "Issue Assignee", nil)
-	issueID := dbfx.Issue(t, "reply under deleted agent comment", testutil.Cols{
-		"assignee_type": "agent", "assignee_id": assigneeID,
+	issueID, ownerID, runtimeID := issueSessionCaptureFixture(t)
+	authorID := dbfx.Agent(t, "Deleted comment author", runtimeID)
+	authorTaskID := dbfx.Task(t, authorID, testutil.Cols{
+		"issue_id": issueID, "runtime_id": runtimeID, "status": "running", "started_at": testutil.Raw("now()"),
+		"originator_user_id": testUserID, "accountable_user_id": testUserID,
 	})
-	root := dbfx.Comment(t, issueID, "I am handling this", testutil.Cols{"author_type": "agent", "author_id": authorID})
-	dbfx.Comment(t, issueID, "earlier reply", testutil.Cols{"parent_id": root})
-	if _, err := testHandler.deleteComment(ctx, parseUUID(root), parseUUID(testWorkspaceID)); err != nil {
-		t.Fatalf("deleteComment: %v", err)
+	root := captureSessionComment(t, issueID, map[string]any{"content": "I am handling this"}, authorID, authorTaskID)
+	captureSessionComment(t, issueID, map[string]any{"content": "earlier reply", "parent_id": root.ID}, "", "")
+	newCommentEventRecorder().delete(t, root.ID).Want(http.StatusNoContent)
+	before := captureIssueSessions(t, issueID)
+	if len(before) != 1 || before[0].ActiveTaskID == nil {
+		t.Fatalf("session before reply = %+v, want the owner's existing execution", before)
 	}
 
-	body := map[string]any{"content": "please follow up", "parent_id": root}
-	requirePreviewAgents(t, previewCommentTriggersForTest(t, issueID, body))
-	postCommentForTriggerPreviewTest(t, issueID, body)
-	tasks, err := testHandler.Queries.ListTasksByIssue(ctx, parseUUID(issueID))
-	if err != nil {
-		t.Fatal(err)
+	body := map[string]any{"content": "please follow up", "parent_id": root.ID}
+	var preview CommentTriggerPreviewResponse
+	req := withURLParam(newRequest(http.MethodPost, "/api/issues/"+issueID+"/comments/preview", body), "id", issueID)
+	testutil.Call(t, testHandler.PreviewCommentTriggers, req).Want(http.StatusOK).JSON(&preview)
+	if len(preview.Agents) != 1 || preview.Agents[0].ID != ownerID || len(preview.Blocked) != 0 {
+		t.Fatalf("reply preview = %+v, want only the issue owner", preview)
 	}
-	if len(tasks) != 0 {
-		t.Fatalf("reply under a deleted comment started %d runs, want none: %+v", len(tasks), tasks)
+	reply := captureSessionComment(t, issueID, body, "", "")
+	if reply.ParentID == nil || *reply.ParentID != root.ID || len(reply.TriggerOutcomes) != 1 || reply.TriggerOutcomes[0].TargetID != ownerID {
+		t.Fatalf("reply was redirected away from its tree or owner: %+v", reply)
+	}
+	after := captureIssueSessions(t, issueID)
+	if len(after) != 1 || after[0].ID != before[0].ID || after[0].AgentID != ownerID || len(after[0].Events) != len(before[0].Events)+1 {
+		t.Fatalf("reply did not enter the same owner inbox: %+v", after)
+	}
+	event := after[0].Events[len(after[0].Events)-1]
+	if event.Kind != "comment.created" || event.SourceID == nil || *event.SourceID != reply.ID || event.Sequence != before[0].Events[len(before[0].Events)-1].Sequence+1 {
+		t.Fatalf("reply event = %+v, want the next owner input", event)
+	}
+	if after[0].ActiveTaskID == nil || *after[0].ActiveTaskID != *before[0].ActiveTaskID {
+		t.Fatalf("reply replaced the owner's execution: before=%+v after=%+v", before[0], after[0])
+	}
+	if n := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id=$1 AND agent_id=$2", issueID, authorID); n != 1 {
+		t.Fatalf("reply created another execution for the deleted comment author: %d", n)
+	}
+	if n := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id=$1 AND agent_id=$2", issueID, ownerID); n != 1 {
+		t.Fatalf("reply created %d owner executions, want the existing one", n)
 	}
 }
 

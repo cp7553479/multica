@@ -168,13 +168,27 @@ describe("RunConfirmModal", () => {
     expect(mockToast.error).not.toHaveBeenCalled();
   });
 
-  it("'暂不开始' sends suppress_run alongside the assignee change", async () => {
-    render(<RunConfirmModal onClose={vi.fn()} data={single} />);
+  for (const mode of ["assign", "promote"] as const) {
+    for (const assigneeType of ["agent", undefined] as const) {
+      it(`${mode} with ${assigneeType ?? "unspecified"} owner does not offer run suppression`, () => {
+        render(
+          <RunConfirmModal
+            onClose={vi.fn()}
+            data={{ ...(mode === "promote" ? promote : single), assigneeType }}
+          />,
+        );
+        expect(screen.queryByRole("button", { name: "Don't start yet" })).not.toBeInTheDocument();
+      });
+    }
+  }
+
+  it("squad assignment can suppress its run alongside the assignee change", async () => {
+    render(<RunConfirmModal onClose={vi.fn()} data={{ ...single, assigneeType: "squad" }} />);
     fireEvent.click(screen.getByText("Don't start yet"));
     await waitFor(() => expect(mockUpdate).toHaveBeenCalledTimes(1));
     expect(mockUpdate).toHaveBeenCalledWith({
       id: "issue-1",
-      assignee_type: "agent",
+      assignee_type: "squad",
       assignee_id: "agent-1",
       suppress_run: true,
     });
@@ -193,10 +207,8 @@ describe("RunConfirmModal", () => {
     });
   });
 
-  it("promote's 'don't start yet' still moves the issue, without the run", async () => {
-    // The status change is the point; suppress_run is the only difference. This
-    // is the one way to leave backlog WITHOUT waking the agent.
-    render(<RunConfirmModal onClose={vi.fn()} data={promote} />);
+  it("squad promotion can still move the issue without starting its run", async () => {
+    render(<RunConfirmModal onClose={vi.fn()} data={{ ...promote, assigneeType: "squad" }} />);
     fireEvent.click(screen.getByText("Don't start yet"));
     await waitFor(() => expect(mockUpdate).toHaveBeenCalledTimes(1));
     expect(mockUpdate).toHaveBeenCalledWith({
@@ -253,7 +265,7 @@ describe("RunConfirmModal", () => {
     // Chromium fires no click for ⌘/Ctrl+Enter on a focused button, so without
     // the dialog handling it there the chord is simply dead. The dialog focuses
     // its first tabbable child, which is now a footer button.
-    render(<RunConfirmModal onClose={vi.fn()} data={single} />);
+    render(<RunConfirmModal onClose={vi.fn()} data={{ ...single, assigneeType: "squad" }} />);
     fireEvent.keyDown(screen.getByText("Don't start yet"), { key: "Enter", metaKey: true });
     await waitFor(() => expect(mockUpdate).toHaveBeenCalledTimes(1));
     // The primary action, not the button the caret happened to sit on.
@@ -264,7 +276,7 @@ describe("RunConfirmModal", () => {
     // A bare Enter DOES activate a focused button, so confirming here as well
     // would double-write — and on "Don't start yet" the two would disagree.
     useShortcutStore.setState({ overrides: { send: createShortcutChord("Enter") } });
-    render(<RunConfirmModal onClose={vi.fn()} data={single} />);
+    render(<RunConfirmModal onClose={vi.fn()} data={{ ...single, assigneeType: "squad" }} />);
     fireEvent.keyDown(screen.getByText("Don't start yet"), { key: "Enter" });
     fireEvent.keyDown(confirmButton(), { key: "Enter" });
     expect(mockUpdate).not.toHaveBeenCalled();
@@ -333,7 +345,12 @@ describe("RunConfirmModal", () => {
         render(
           <RunConfirmModal
             onClose={onClose}
-            data={{ ...single, issueIds: ["i1", "i2"], onApplied }}
+            data={{
+              ...single,
+              assigneeType: button === "Don't start yet" ? "squad" : "agent",
+              issueIds: ["i1", "i2"],
+              onApplied,
+            }}
           />,
         );
         fireEvent.click(screen.getByRole("button", { name: button }));

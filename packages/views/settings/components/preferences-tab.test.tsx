@@ -336,7 +336,7 @@ describe("PreferencesTab — Comments & chat", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     userRef.current = null;
-    useCommentComposerStore.setState({ runningAgentReply: "steer", sticky: true });
+    useCommentComposerStore.setState({ sticky: true });
     chatState.floatingChatEnabled = true;
   });
 
@@ -344,19 +344,9 @@ describe("PreferencesTab — Comments & chat", () => {
     cleanup();
   });
 
-  it("defaults to adding the reply to the current run and saves starting after it", async () => {
-    const user = userEvent.setup();
+  it("does not offer a per-run reply routing preference", () => {
     render(<PreferencesTab />, { wrapper: I18nWrapper });
-
-    const select = screen.getByRole("combobox", { name: "When replying to a running agent" });
-    expect(select).toHaveTextContent("Add to current run");
-
-    await user.click(select);
-    await user.click(await screen.findByRole("option", { name: "Start after this run" }));
-
-    expect(useCommentComposerStore.getState().runningAgentReply).toBe("after_run");
-    expect(select).toHaveTextContent("Start after this run");
-    expect(mockToastSuccess).not.toHaveBeenCalled();
+    expect(screen.queryByRole("combobox", { name: "When replying to a running agent" })).not.toBeInTheDocument();
   });
 
   it("toggles the sticky comment bar and the floating chat silently", async () => {

@@ -2267,65 +2267,27 @@ func TestPrepareWithRepoContextOpencode(t *testing.T) {
 }
 
 // TestInjectRuntimeConfigRequiresExplicitCommentPost ensures the injected
-// workflow makes "post a comment with results" an explicit, unmissable step in
-// both the assignment- and comment-triggered branches, plus hard-warns in the
-// Output section that terminal/log text is not user-visible. Agents were
-// silently finishing tasks without ever posting their result to the issue; see
-// MUL-1124. Covering this in a test prevents the guidance from decaying back
-// into a nested clause again.
-func TestInjectRuntimeConfigRequiresExplicitCommentPost(t *testing.T) {
-	t.Parallel()
-
-	assignmentCtx := TaskContextForEnv{IssueID: "issue-1"}
-	commentCtx := TaskContextForEnv{IssueID: "issue-1", TriggerCommentID: "comment-1"}
-
-	for _, tc := range []struct {
-		name string
-		ctx  TaskContextForEnv
-	}{
-		{"assignment-triggered", assignmentCtx},
-		{"comment-triggered", commentCtx},
-	} {
-		tc := tc
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			dir := t.TempDir()
-			if _, err := InjectRuntimeConfig(dir, "claude", tc.ctx); err != nil {
-				t.Fatalf("InjectRuntimeConfig failed: %v", err)
+// Runtime briefs expose explicit issue actions without requiring publication.
+func TestInjectRuntimeConfigOffersExplicitIssueActions(t *testing.T) {
+	for _, ctx := range []TaskContextForEnv{{IssueID: "issue-1"}, {IssueID: "issue-1", TriggerCommentID: "comment-1"}} {
+		dir := t.TempDir()
+		if _, err := InjectRuntimeConfig(dir, "claude", ctx); err != nil {
+			t.Fatal(err)
+		}
+		data, err := os.ReadFile(filepath.Join(dir, "CLAUDE.md"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, want := range []string{"Choose the explicit action this session needs", "publish a top-level comment", "reply to a specific comment", "multica issue update", "never posted automatically"} {
+			if !strings.Contains(string(data), want) {
+				t.Errorf("brief missing %q", want)
 			}
-			data, err := os.ReadFile(filepath.Join(dir, "CLAUDE.md"))
-			if err != nil {
-				t.Fatalf("read CLAUDE.md: %v", err)
+		}
+		for _, banned := range []string{"Post exactly ONE comment per run", "Final results MUST be delivered"} {
+			if strings.Contains(string(data), banned) {
+				t.Errorf("brief retains %q", banned)
 			}
-			s := string(data)
-
-			// The workflow must contain an explicit `multica issue comment add`
-			// invocation for this issue — not just a prose mention of posting.
-			mustContain := []string{
-				// MUL-5442 cross-channel dedup: the brief states the loop shape; the
-				// ready-to-run commands with real ids live in the per-turn message.
-				// Pin the command NAME and the flag mnemonics, not full templates.
-				"post it with `multica issue comment add` using",
-				"mandatory",
-			}
-			for _, want := range mustContain {
-				if !strings.Contains(s, want) {
-					t.Errorf("%s: CLAUDE.md missing %q\n---\n%s", tc.name, want, s)
-				}
-			}
-
-			// The Output section must carry a hard warning that terminal/log
-			// output is not user-visible. This is the second line of defense
-			// in case the agent skips past the workflow steps.
-			for _, want := range []string{
-				"Final results MUST be delivered via `multica issue comment add`",
-				"does NOT see your terminal output",
-			} {
-				if !strings.Contains(s, want) {
-					t.Errorf("%s: Output warning missing %q", tc.name, want)
-				}
-			}
-		})
+		}
 	}
 }
 
@@ -2456,7 +2418,7 @@ func TestInjectRuntimeConfigLinuxCommentFormattingEmphasizesFile(t *testing.T) {
 				"never use `--content-stdin` HEREDOCs alongside other flags",
 				"#4182",
 				"never `/tmp` or shared paths",
-				"Keep the same `--parent` value",
+				"Set `--parent` only when deliberately replying",
 				"rm ./reply.md",
 				"do not rely on `\\n` escapes",
 			} {
@@ -5377,47 +5339,20 @@ func TestInjectRuntimeConfigMentionLoopHardening(t *testing.T) {
 		return string(data)
 	}
 
-	t.Run("mentions-section-lists-loop-protocol", func(t *testing.T) {
+	t.Run("mentions-do-not-dispatch-agent-sessions", func(t *testing.T) {
 		t.Parallel()
 		s := readClaudeMD(t, assignmentCtx)
-		// MUL-6417: the section is fact-anchored, no prescriptive default.
-		// Pin each fact that invalidates a false reason to mention — losing
-		// any one of them re-opens the incident class it closed.
-		for _, want := range []string{
-			"side-effecting actions",
-			"enqueues a new run for that agent",
-			// Notifying FOLLOWERS is a false need: delivery already happens.
-			// Scoped to followers on purpose — for a non-follower, a mention
-			// IS how they find out (Elon's review catch on #7245).
-			"followers of the issue already see your comment",
-			"completion notifications are platform-owned",
-			// The one real function, with its scope.
-			"pulls someone into work they are not doing yet",
-			// The reference fact (MUL-6528): @-as-attribution ("per @X's
-			// decision") read as a way to write a name and dispatched the
-			// agent being credited.
-			"prose about them, not work for them",
-			"so a reference stays plain text",
-			// The courtesy-loop fact (the incident class behind #1581/#6453).
-			"whose only possible reply is another courtesy",
-			// The asymmetry that breaks ambiguous cases toward not mentioning.
-			"a missed mention costs one follow-up ask, a stray one costs a run",
-			"Silence ends conversations",
-		} {
+		for _, want := range []string{"notifies a human", "does not start an agent run", "current assigned agent session", "explicitly assign an issue", "mention alone does not delegate work", "own comments and edits do not wake your own session"} {
 			if !strings.Contains(s, want) {
-				t.Errorf("Mentions section missing %q\n---\n%s", want, s)
+				t.Errorf("Mentions section missing %q", want)
 			}
 		}
-		// Neither the bare prescription (MUL-6417) nor the overreach that
-		// replaced it may come back: "never how someone finds out" was false
-		// for non-followers and suppressed legitimate human escalation.
-		for _, banned := range []string{"Default: NO mention", "never how someone finds out"} {
+		for _, banned := range []string{"enqueues a new run for that agent", "link form dispatches whoever it names"} {
 			if strings.Contains(s, banned) {
-				t.Errorf("Mentions section carries retired wording %q\n---\n%s", banned, s)
+				t.Errorf("Mentions section retained comment dispatch %q", banned)
 			}
 		}
 	})
-
 	t.Run("closing-line-no-longer-says-always-mention", func(t *testing.T) {
 		t.Parallel()
 		s := readClaudeMD(t, assignmentCtx)
@@ -5428,27 +5363,12 @@ func TestInjectRuntimeConfigMentionLoopHardening(t *testing.T) {
 		}
 	})
 
-	t.Run("workflow-reply-is-unconditional-and-no-signoff-mention", func(t *testing.T) {
+	t.Run("workflow-keeps-explicit-publication-choice", func(t *testing.T) {
 		t.Parallel()
 		s := readClaudeMD(t, commentTriggerCtx)
-		// MUL-5442 owner decision (2026-08-06): the generic no-reply rule is
-		// retired. It never carried the loop prevention — agent comments
-		// trigger nothing without an explicit @mention (the sole implicit
-		// wake is the squad-leader path), so the mention discipline pinned in
-		// the Mentions subtest above is the real defense. Ordinary agents are
-		// back on the unconditional one-comment-per-run contract; recorded
-		// silence via `no_action` remains squad-leader-only. Retired pins,
-		// replaced by the negative guards below so the apparatus cannot creep
-		// back: "Decide whether a reply is warranted", "produced actual
-		// work", "pure acknowledgment / thanks / sign-off", "do NOT reply",
-		// "Silence is a valid and preferred way".
-		// MUL-6417 merged the reply-mode block into the shared steps: the
-		// unconditional one-comment contract now lives in step 4, and the
-		// mention-after-work bullet is gone with the block (the discipline
-		// itself stays in `## Mentions`, pinned by the Mentions subtest).
 		for _, want := range []string{
-			"**Post your final results as a comment — this step is mandatory**",
-			"whose only possible reply is another courtesy",
+			"Choose the explicit action this session needs",
+			"No comment is required merely because a turn ended",
 		} {
 			if !strings.Contains(s, want) {
 				t.Errorf("comment-triggered CLAUDE.md missing %q", want)
@@ -5478,76 +5398,24 @@ func TestInjectRuntimeConfigMentionLoopHardening(t *testing.T) {
 	})
 }
 
-// TestInjectRuntimeConfigSquadLeaderCommentTriggeredNoAction verifies that
-// when IsSquadLeader is true and the task is comment-triggered, the generated
-// CLAUDE.md explicitly forbids posting comments that merely announce no_action.
-// This is the fix for MUL-2168 — squad leaders were posting "Exiting silently"
-// comments because the comment-triggered path lacked the prohibition.
-func TestInjectRuntimeConfigSquadLeaderCommentTriggeredNoAction(t *testing.T) {
-	t.Parallel()
-
+// A leader processing comment events has no turn-completion publication rule.
+func TestInjectRuntimeConfigSquadLeaderDoesNotForceComments(t *testing.T) {
 	dir := t.TempDir()
-	ctx := TaskContextForEnv{
-		IssueID:          "issue-1",
-		TriggerCommentID: "comment-1",
-		IsSquadLeader:    true,
-	}
-	if _, err := InjectRuntimeConfig(dir, "claude", ctx); err != nil {
-		t.Fatalf("InjectRuntimeConfig failed: %v", err)
+	if _, err := InjectRuntimeConfig(dir, "claude", TaskContextForEnv{IssueID: "issue-1", TriggerCommentID: "comment-1", IsSquadLeader: true}); err != nil {
+		t.Fatal(err)
 	}
 	data, err := os.ReadFile(filepath.Join(dir, "CLAUDE.md"))
 	if err != nil {
-		t.Fatalf("read CLAUDE.md: %v", err)
+		t.Fatal(err)
 	}
-	s := string(data)
-
-	// Both delivery imperatives — workflow step 4 and ## Output — must carry
-	// the carve-out, so that no later bullet can contradict the no_action exit
-	// (MUL-5442 #6493 review). They carry the EXCEPTION, not the rule: the
-	// rule itself is stated once, by the Squad Operating Protocol the server
-	// appends to Instructions, and both sites point there (MUL-6984).
-	for _, want := range []string{
-		"unless your outcome is `no_action`",
-		"see the no_action rule in your Squad Operating Protocol",
-		"which your Squad Operating Protocol states in full",
-	} {
-		if !strings.Contains(s, want) {
-			t.Errorf("squad leader comment-triggered CLAUDE.md missing %q", want)
+	out := string(data)
+	if !strings.Contains(out, "a turn does not require a comment") {
+		t.Fatal("leader brief must preserve publication choice")
+	}
+	for _, banned := range []string{"Post exactly ONE comment per run", "Final results MUST be delivered", "DO NOT post a comment announcing no_action"} {
+		if strings.Contains(out, banned) {
+			t.Errorf("brief retained publication obligation %q", banned)
 		}
-	}
-	// The unconditional ordinary-agent imperative must not coexist with the
-	// carve-out variant.
-	if strings.Contains(s, "**Post your final results as a comment — this step is mandatory**") {
-		t.Errorf("squad leader CLAUDE.md still carries the unconditional delivery step")
-	}
-	// And neither site may restate the rule's mechanics — that is what drifted
-	// when four copies of it existed.
-	for _, banned := range []string{
-		"DO NOT post a comment announcing no_action",
-		"you MUST exit without posting any comment",
-	} {
-		if strings.Contains(s, banned) {
-			t.Errorf("squad leader CLAUDE.md restates the protocol-owned no_action rule: %q", banned)
-		}
-	}
-
-	// Non-squad-leader should NOT have the squad leader rule in comment-triggered path.
-	dir2 := t.TempDir()
-	ctx2 := TaskContextForEnv{
-		IssueID:          "issue-1",
-		TriggerCommentID: "comment-1",
-		IsSquadLeader:    false,
-	}
-	if _, err := InjectRuntimeConfig(dir2, "claude", ctx2); err != nil {
-		t.Fatalf("InjectRuntimeConfig failed: %v", err)
-	}
-	data2, err := os.ReadFile(filepath.Join(dir2, "CLAUDE.md"))
-	if err != nil {
-		t.Fatalf("read CLAUDE.md: %v", err)
-	}
-	s2 := string(data2)
-	if strings.Contains(s2, "unless your outcome is `no_action`") {
-		t.Errorf("non-squad-leader CLAUDE.md should NOT contain the leader no_action carve-out")
 	}
 }
 

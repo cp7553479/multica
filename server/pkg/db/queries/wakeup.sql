@@ -10,7 +10,7 @@ SELECT w.id,w.workspace_id,w.issue_id,w.agent_id,w.created_by,w.source_task_id,w
  (CASE WHEN EXISTS(SELECT 1 FROM agent_task_queue ft JOIN agent fa ON fa.id=ft.agent_id AND fa.workspace_id=w.workspace_id
   WHERE ft.id=w.filter_task_id AND ft.issue_id=w.issue_id AND fa.id=ANY(@agent_ids::uuid[])) THEN w.filter_task_id END)::uuid AS filter_task_id,
  w.interval_seconds,w.cron_expression,w.timezone,w.next_fire_at,w.enabled,w.disabled_at,w.revision,
- w.last_task_id,w.last_error,w.created_at,w.updated_at,a.name AS agent_name,source.name AS filter_agent_name,t.status AS last_task_status,
+ latest_task.task_id AS last_task_id,w.last_error,w.created_at,w.updated_at,a.name AS agent_name,source.name AS filter_agent_name,t.status AS last_task_status,
  w.expires_at,w.expiry_seconds,w.on_timeout,w.timed_out_at,
  w.condition,w.max_fires,w.fire_count,w.paused_reason,
  (w.source_task_id IS NOT NULL)::bool AS created_by_agent,creator.name AS created_by_name,
@@ -23,7 +23,13 @@ LEFT JOIN agent actor_agent ON w.filter_actor_type='agent' AND actor_agent.id=w.
 LEFT JOIN member actor_member ON w.filter_actor_type='member' AND actor_member.user_id=w.filter_actor_id AND actor_member.workspace_id=w.workspace_id
 LEFT JOIN "user" actor_user ON actor_user.id=actor_member.user_id
 LEFT JOIN agent source ON source.id=w.filter_agent_id AND source.workspace_id=w.workspace_id AND source.id=ANY(@agent_ids::uuid[])
-LEFT JOIN agent_task_queue t ON t.id=w.last_task_id AND t.issue_id=w.issue_id AND t.agent_id=w.agent_id
+LEFT JOIN LATERAL (
+ SELECT e.delivery_task_id AS task_id FROM issue_agent_event e JOIN issue_agent_session sess ON sess.id=e.session_id
+ WHERE e.kind='wakeup.fired' AND e.payload->>'wakeup_id'=w.id::text AND e.delivery_task_id IS NOT NULL
+ AND sess.issue_id=w.issue_id AND sess.workspace_id=w.workspace_id AND sess.agent_id=w.agent_id
+ ORDER BY e.created_at DESC,e.id DESC LIMIT 1
+) latest_task ON true
+LEFT JOIN agent_task_queue t ON t.id=latest_task.task_id AND t.issue_id=w.issue_id AND t.agent_id=w.agent_id
 WHERE w.workspace_id= @workspace_id AND w.issue_id= @issue_id ORDER BY w.created_at,w.id;
 
 -- name: ListWorkspaceWakeupSummaryRows :many
@@ -60,16 +66,77 @@ SELECT * FROM issue WHERE id= @id FOR NO KEY UPDATE;
 -- name: LockWakeupSourceTask :one
 SELECT * FROM agent_task_queue WHERE id= @id AND issue_id= @issue_id FOR UPDATE NOWAIT;
 -- name: CancelUnstartedWakeupTasks :many
-UPDATE agent_task_queue SET status='cancelled',completed_at=now(),error='Wakeup disabled or updated'
-WHERE context->>'wakeup_id'= @wakeup_id::text AND status IN ('queued','deferred') AND started_at IS NULL RETURNING *;
+-- Withdraw inputs that have not reached a provider. A session consumer with
+-- other inputs keeps them. An unclaimed consumer is replaced if its inbox is
+-- empty or its next input belongs to a different authorizing principal.
+WITH locked_tasks AS MATERIALIZED (
+ SELECT t.id FROM agent_task_queue t JOIN issue_agent_session s ON s.active_task_id=t.id
+ WHERE EXISTS (SELECT 1 FROM issue_agent_event e WHERE e.session_id=s.id
+   AND e.kind='wakeup.fired' AND e.payload->>'wakeup_id'= @wakeup_id::text AND e.status IN ('pending','failed'))
+ ORDER BY t.id FOR UPDATE OF t
+), locked_sessions AS MATERIALIZED (
+ SELECT s.id FROM issue_agent_session s
+ WHERE (s.active_task_id IS NULL OR s.active_task_id IN (SELECT id FROM locked_tasks))
+ AND EXISTS (SELECT 1 FROM issue_agent_event e WHERE e.session_id=s.id
+   AND e.kind='wakeup.fired' AND e.payload->>'wakeup_id'= @wakeup_id::text AND e.status IN ('pending','failed'))
+ ORDER BY s.id FOR UPDATE OF s
+), withdrawn AS (
+ UPDATE issue_agent_event SET status='ignored',failure_reason='wakeup_withdrawn',updated_at=now()
+ WHERE kind='wakeup.fired' AND payload->>'wakeup_id'= @wakeup_id::text
+   AND session_id IN (SELECT id FROM locked_sessions)
+   AND status IN ('pending','failed') RETURNING id,session_id
+), cancelled AS (
+ UPDATE agent_task_queue t SET status='cancelled',completed_at=now(),error='Wakeup disabled or updated'
+ WHERE t.status IN ('queued','deferred') AND t.started_at IS NULL
+   AND t.context->>'type'='issue_session'
+   AND EXISTS (SELECT 1 FROM issue_agent_session s JOIN withdrawn w ON w.session_id=s.id WHERE s.active_task_id=t.id)
+   AND (NOT EXISTS (SELECT 1 FROM issue_agent_event e
+     WHERE e.session_id::text=t.context->>'issue_agent_session_id' AND e.status IN ('pending','delivering','failed')
+     AND e.id NOT IN (SELECT id FROM withdrawn))
+     OR (SELECT CASE WHEN e.actor_type='member' THEN e.actor_id ELSE e.originator_user_id END
+       FROM issue_agent_event e WHERE e.session_id::text=t.context->>'issue_agent_session_id'
+       AND e.status IN ('pending','delivering','failed') AND e.id NOT IN (SELECT id FROM withdrawn)
+       ORDER BY e.sequence LIMIT 1) IS DISTINCT FROM t.originator_user_id)
+ RETURNING t.*
+), released AS (
+ UPDATE issue_agent_session SET active_task_id=NULL,updated_at=now() WHERE active_task_id IN (SELECT id FROM cancelled)
+)
+SELECT * FROM cancelled;
 -- name: DisableIssueWakeups :exec
 -- Closing wins over every subscription on the issue; reopening does not rearm.
 -- A system rule only rests while its issue is closed and resumes on reopen.
 UPDATE issue_wakeup SET enabled=false,disabled_at=clock_timestamp(),updated_at=clock_timestamp()
 WHERE issue_id= @issue_id AND disabled_at IS NULL AND system_rule IS NULL;
 -- name: CancelUnstartedIssueWakeupTasks :many
-UPDATE agent_task_queue SET status='cancelled',completed_at=now(),error='Issue closed; wakeup disabled'
-WHERE issue_id= @issue_id AND context->>'wakeup_id' IS NOT NULL AND status IN ('queued','deferred') AND started_at IS NULL RETURNING *;
+WITH locked_tasks AS MATERIALIZED (
+ SELECT t.id FROM agent_task_queue t JOIN issue_agent_session s ON s.active_task_id=t.id
+ WHERE s.issue_id= @issue_id ORDER BY t.id FOR UPDATE OF t
+), locked_sessions AS MATERIALIZED (
+ SELECT s.id FROM issue_agent_session s WHERE s.issue_id= @issue_id
+ AND (s.active_task_id IS NULL OR s.active_task_id IN (SELECT id FROM locked_tasks))
+ ORDER BY s.id FOR UPDATE OF s
+), withdrawn AS (
+ UPDATE issue_agent_event e SET status='ignored',failure_reason='issue_closed',updated_at=now()
+ WHERE e.kind='wakeup.fired' AND e.status IN ('pending','failed')
+   AND e.session_id IN (SELECT id FROM locked_sessions)
+ RETURNING e.id,e.session_id
+), cancelled AS (
+ UPDATE agent_task_queue t SET status='cancelled',completed_at=now(),error='Issue closed; wakeup disabled'
+ WHERE t.issue_id= @issue_id AND t.context->>'type'='issue_session'
+   AND t.status IN ('queued','deferred') AND t.started_at IS NULL
+   AND EXISTS (SELECT 1 FROM issue_agent_session s JOIN withdrawn w ON w.session_id=s.id WHERE s.active_task_id=t.id)
+   AND (NOT EXISTS (SELECT 1 FROM issue_agent_event e
+     WHERE e.session_id::text=t.context->>'issue_agent_session_id' AND e.status IN ('pending','delivering','failed')
+     AND e.id NOT IN (SELECT id FROM withdrawn))
+     OR (SELECT CASE WHEN e.actor_type='member' THEN e.actor_id ELSE e.originator_user_id END
+       FROM issue_agent_event e WHERE e.session_id::text=t.context->>'issue_agent_session_id'
+       AND e.status IN ('pending','delivering','failed') AND e.id NOT IN (SELECT id FROM withdrawn)
+       ORDER BY e.sequence LIMIT 1) IS DISTINCT FROM t.originator_user_id)
+ RETURNING t.*
+), released AS (
+ UPDATE issue_agent_session SET active_task_id=NULL,updated_at=now() WHERE active_task_id IN (SELECT id FROM cancelled)
+)
+SELECT * FROM cancelled;
 -- name: ListInputWakeups :many
 -- Scheduler lane 1: rules with unprocessed inputs (subscribed events,
 -- condition hints, "wake now"). Deliberately not filtered by enabled: a once
@@ -96,37 +163,20 @@ WHERE (sqlc.narg('workspace_ids')::uuid[] IS NULL OR w.workspace_id = ANY(sqlc.n
   AND NOT (w.id = ANY(@skip_ids::uuid[]))
 ORDER BY w.updated_at,w.id LIMIT @row_limit;
 -- name: ListPendingWakeupInputGroups :many
--- Scheduler observability over unprocessed inputs, grouped per rule and by
--- whether a run still reserves them. Dispatch deliberately keeps some inputs
--- pending while a run holds them; these flags mirror its checks:
---  reserved:     a claim reserved them for a run that has not started and has
---                not ended (takenReceipts). A run that ended without starting
---                releases them, and one that started has them consumed on the
---                next dispatch, so both are backlog.
---  own_claimed:  the rule's own run is claimed (FindPendingWakeupTask).
---  user_waiting: a queued run of the rule's agent, run as its creator, will
---                take them along (hasWaitingRun). Platform rules wait for the
---                issue's current target instead; the caller resolves that.
--- Oldest groups first, one page at a time: the caller pages with the last
--- group's (oldest, wakeup_id, reserved) until a short page, so no group is
--- left unread however many there are.
+-- Rule receipts wait only for transactional transfer to the session inbox.
+-- Provider delivery is observed on issue_agent_event, never by holding receipts
+-- behind a queued or claimed execution.
 WITH groups AS (
- SELECT w.id AS wakeup_id, w.issue_id, (w.system_rule IS NOT NULL)::bool AS system_rule,
-  (r.task_id IS NOT NULL AND EXISTS (SELECT 1 FROM agent_task_queue t WHERE t.id=r.task_id
-    AND t.started_at IS NULL AND t.status NOT IN ('running','completed','failed','cancelled')))::bool AS reserved,
-  EXISTS (SELECT 1 FROM agent_task_queue t WHERE t.context->>'wakeup_id'=w.id::text AND t.status='dispatched')::bool AS own_claimed,
-  (w.system_rule IS NULL AND EXISTS (SELECT 1 FROM agent_task_queue t WHERE t.issue_id=w.issue_id AND t.status='queued'
-    AND t.agent_id=w.agent_id AND t.originator_user_id=w.created_by))::bool AS user_waiting,
-  min(r.created_at)::timestamptz AS oldest, count(*)::int AS inputs
+ SELECT w.id AS wakeup_id,min(r.created_at)::timestamptz AS oldest
  FROM issue_wakeup_receipt r JOIN issue_wakeup w ON w.id=r.wakeup_id
  WHERE r.processed_at IS NULL
-  AND (sqlc.narg('workspace_ids')::uuid[] IS NULL OR w.workspace_id = ANY(sqlc.narg('workspace_ids')::uuid[]))
- GROUP BY 1,2,3,4,5,6
+ AND (sqlc.narg('workspace_ids')::uuid[] IS NULL OR w.workspace_id=ANY(sqlc.narg('workspace_ids')::uuid[]))
+ GROUP BY 1
 )
-SELECT g.wakeup_id, g.issue_id, g.system_rule, g.reserved, g.own_claimed, g.user_waiting, g.oldest, g.inputs FROM groups g
+SELECT g.wakeup_id,g.oldest FROM groups g
 WHERE sqlc.narg('after_oldest')::timestamptz IS NULL
-   OR (g.oldest, g.wakeup_id, g.reserved) > (sqlc.narg('after_oldest')::timestamptz, @after_wakeup_id::uuid, @after_reserved::bool)
-ORDER BY g.oldest, g.wakeup_id, g.reserved LIMIT @page_size;
+ OR (g.oldest,g.wakeup_id)>(sqlc.narg('after_oldest')::timestamptz,@after_wakeup_id::uuid)
+ORDER BY g.oldest,g.wakeup_id LIMIT @page_size;
 -- name: ListPendingWakeupReceipts :many
 SELECT * FROM issue_wakeup_receipt WHERE wakeup_id= @wakeup_id AND revision= @revision AND processed_at IS NULL ORDER BY created_at,id LIMIT 100 FOR UPDATE;
 
@@ -150,75 +200,9 @@ UPDATE issue_wakeup_receipt SET task_id=sqlc.narg(task_id),processed_at=now() WH
 UPDATE issue_wakeup_receipt SET processed_at=now() WHERE wakeup_id= @id AND processed_at IS NULL;
 -- name: AdvanceIssueWakeup :exec
 UPDATE issue_wakeup SET enabled= @enabled,next_fire_at=sqlc.narg(next_fire_at),last_task_id=COALESCE(sqlc.narg(last_task_id),last_task_id),last_error=sqlc.narg(last_error),updated_at=clock_timestamp() WHERE id= @id;
--- name: FindPendingWakeupTask :one
-SELECT * FROM agent_task_queue WHERE context->>'wakeup_id'= @wakeup_id::text AND status IN ('queued','dispatched') ORDER BY created_at LIMIT 1 FOR UPDATE;
-
--- name: CreateWakeupTask :one
--- Fenced against workspace teardown: lock_task_owner_rows (migration 284)
--- locks the owners' workspace rows in the writer's own transaction and returns
--- false once they are gone, so this statement writes no row instead of stranding
--- a task in a workspace that has just been deleted (MUL-5999).
--- head_sha stamps the commit under review into the task's context JSONB so the
--- reviewer-loop dedup (HasPendingTaskForIssueAndAgent) can tell a pending run
--- against an OLD head apart from a fresh request against a NEW head (TEN-356).
--- Empty/absent head_sha leaves context NULL, preserving pre-TEN-356 behavior for
--- issues with no linked PR. Issue-linked tasks never hit quick-create context
--- parsing (parseQuickCreateContext short-circuits on IssueID.Valid), so this
--- key rides harmlessly alongside.
--- id is minted by the application as a UUIDv7 (pkg/dbid) so consecutive
--- enqueues cluster in a narrow contiguous primary-key range instead of
--- scattering across the B-tree. On a table with existing v4 ids, that range
--- is not necessarily the tree's right edge.
--- COALESCE keeps the column's gen_random_uuid() default reachable, so a caller
--- that passes no id still inserts — it just gets a random v4, exactly as before.
--- The same pattern is used by every INSERT listed in pkg/dbid's write table.
-INSERT INTO agent_task_queue (
-    agent_id, runtime_id, issue_id, status, priority, trigger_comment_id,
-    coalesced_comment_ids, trigger_summary, force_fresh_session, is_leader_task, handoff_note,
-    squad_id, context, originator_user_id, accountable_user_id, runtime_mcp_overlay, runtime_connected_apps,
-    originator_source, delegated_from_task_id, rule_version_id, rerun_of_task_id, trigger_evidence_kind, trigger_evidence_ref_id,
-    workflow_step, id
-)
-SELECT
-    $1, $2, $3, 'queued', $4, sqlc.narg(trigger_comment_id),
-    COALESCE(sqlc.narg(coalesced_comment_ids)::uuid[], '{}'),
-    sqlc.narg(trigger_summary),
-    COALESCE(sqlc.narg('force_fresh_session')::boolean, FALSE),
-    COALESCE(sqlc.narg('is_leader_task')::boolean, FALSE),
-    sqlc.narg(handoff_note),
-    sqlc.narg(squad_id),
-    CASE
-        WHEN COALESCE(sqlc.narg('head_sha')::text, '') <> ''
-        THEN jsonb_build_object('head_sha', sqlc.narg('head_sha')::text)
-        ELSE '{}'::jsonb
-    END || @wakeup_context::jsonb,
-    sqlc.narg(originator_user_id),
-    sqlc.narg(accountable_user_id),
-    sqlc.narg(runtime_mcp_overlay),
-    sqlc.narg(runtime_connected_apps),
-    sqlc.narg(originator_source),
-    sqlc.narg(delegated_from_task_id),
-    sqlc.narg(rule_version_id),
-    sqlc.narg(rerun_of_task_id),
-    sqlc.narg(trigger_evidence_kind),
-    sqlc.narg(trigger_evidence_ref_id),
-    -- The workflow step this run works on (MUL-7420). A wakeup continues the
-    -- run that registered it, so it keeps that run's step: a status change it
-    -- makes after someone else moved the issue is refused like the run's own
-    -- would be. A wakeup a member registered starts from the issue's status.
-    COALESCE(
-        (SELECT s.workflow_step FROM agent_task_queue s WHERE s.id = sqlc.narg(delegated_from_task_id) AND s.issue_id = $3),
-        (SELECT i.status FROM issue i WHERE i.id = $3)
-    ),
-    COALESCE(sqlc.narg('id')::uuid, gen_random_uuid())
-WHERE lock_task_owner_rows($1, $3, $2)
-RETURNING *;
-
 -- name: LocklessWakeup :one
 SELECT * FROM issue_wakeup WHERE id= @id;
 
--- name: ReplaceWakeupEvidence :one
-UPDATE agent_task_queue SET handoff_note=sqlc.narg(handoff_note), context=COALESCE(context,'{}'::jsonb) || jsonb_build_object('wakeup_evidence', @wakeup_evidence::jsonb) WHERE id= @id AND status='queued' RETURNING *;
 -- name: NoteWakeupFailure :exec
 UPDATE issue_wakeup SET last_error=sqlc.narg(last_error),updated_at=clock_timestamp() WHERE id= @id;
 -- name: TouchWakeupDispatch :exec
@@ -247,23 +231,28 @@ UPDATE issue_wakeup SET enabled=false,next_fire_at=NULL,paused_reason= @paused_r
 UPDATE issue_wakeup SET fire_count=fire_count+1 WHERE id= @id;
 
 -- name: CountRecentWakeupTasks :one
-SELECT count(*) FROM agent_task_queue WHERE context->>'wakeup_id'= @wakeup_id::text AND issue_id= @issue_id AND created_at> @since;
+SELECT count(*) FROM issue_agent_event e JOIN issue_agent_session s ON s.id=e.session_id
+WHERE e.kind='wakeup.fired' AND e.payload->>'wakeup_id'= @wakeup_id::text
+ AND s.issue_id= @issue_id AND e.created_at> @since;
 
 -- name: ListWakeupChains :many
 -- Rules whose runs produced the source events, including rules further up
 -- each run's own trigger chain.
-SELECT id,COALESCE(context->>'wakeup_id','')::text AS wakeup_id,COALESCE(context->'wakeup_chain','[]'::jsonb)::jsonb AS chain
-FROM agent_task_queue WHERE id=ANY(@ids::uuid[]);
+SELECT e.delivery_task_id AS id, COALESCE(e.payload->>'wakeup_id','')::text AS wakeup_id,
+ COALESCE(e.payload->'wakeup_chain','[]'::jsonb)::jsonb AS chain
+FROM issue_agent_event e WHERE e.kind='wakeup.fired' AND e.delivery_task_id=ANY(@ids::uuid[]);
 
 -- name: ListWakeupRuns :many
 -- The rule's latest runs with what triggered each one, a check-in note when
 -- the run ended silently, and whether it left a comment.
 SELECT t.id,t.status,t.created_at,t.started_at,t.completed_at,
- COALESCE(t.context->'wakeup_checkin'->>'note','')::text AS checkin_note,
- COALESCE((SELECT array_agg(DISTINCT f->>'event_type') FROM jsonb_array_elements(CASE WHEN jsonb_typeof(t.context->'wakeup_evidence'->'facts')='array' THEN t.context->'wakeup_evidence'->'facts' ELSE '[]'::jsonb END) f),'{}')::text[] AS triggers,
+ COALESCE(t.context->'wakeup_checkins'->(sqlc.arg(wakeup_id)::text)->>'note','')::text AS checkin_note,
+ COALESCE((SELECT array_agg(DISTINCT f->>'event_type') FROM issue_agent_event e CROSS JOIN LATERAL jsonb_array_elements(COALESCE(e.payload->'wakeup_evidence'->'facts','[]'::jsonb)) f WHERE e.delivery_task_id=t.id AND e.kind='wakeup.fired' AND e.payload->>'wakeup_id'= @wakeup_id::text),'{}')::text[] AS triggers,
  EXISTS(SELECT 1 FROM comment c WHERE c.issue_id=t.issue_id AND c.source_task_id=t.id)::bool AS commented
-FROM agent_task_queue t WHERE t.context->>'wakeup_id'= @wakeup_id::text AND t.issue_id= @issue_id
+FROM agent_task_queue t WHERE t.issue_id= @issue_id AND EXISTS (
+ SELECT 1 FROM issue_agent_event e WHERE e.delivery_task_id=t.id AND e.kind='wakeup.fired' AND e.payload->>'wakeup_id'= @wakeup_id::text)
 ORDER BY t.created_at DESC,t.id DESC LIMIT 10;
+
 
 -- name: DeleteIssueWakeupReceipts :exec
 DELETE FROM issue_wakeup_receipt WHERE wakeup_id= @id;
@@ -281,42 +270,16 @@ WHERE w.workspace_id= @workspace_id AND NOT w.enabled AND w.paused_reason IN ('l
  AND NOT EXISTS(SELECT 1 FROM issue_status s WHERE s.workspace_id=i.workspace_id AND s.key=i.status AND s.category IN ('done','closed'))
 ORDER BY w.updated_at DESC LIMIT 200;
 
--- name: FindWaitingIssueRun :one
--- A run of the agent on the issue that has not been claimed and runs as this
--- person. A rule that fires meanwhile keeps its inputs for that run instead
--- of queuing another.
-SELECT id FROM agent_task_queue WHERE issue_id= @issue_id AND agent_id= @agent_id AND status='queued'
- AND originator_user_id= @originator_user_id::uuid ORDER BY created_at,id LIMIT 1;
-
--- name: ListWaitingWakeups :many
--- Rules on the issue with inputs a run of this agent can take along: the
--- agent's own rules and the platform's. Read without locks; each one is
--- locked and checked again before it joins.
-SELECT w.id FROM issue_wakeup w
-WHERE w.issue_id= @issue_id AND (w.agent_id= @agent_id OR w.system_rule IS NOT NULL) AND w.disabled_at IS NULL
- AND EXISTS(SELECT 1 FROM issue_wakeup_receipt r WHERE r.wakeup_id=w.id AND r.revision=w.revision AND r.processed_at IS NULL
-  AND (w.condition IS NULL OR r.event_type IN ('condition.met','wakeup.timeout','wakeup.manual')))
-ORDER BY w.created_at,w.id;
-
--- name: TryLockIssueWakeup :one
--- A rule another writer holds is skipped; it keeps its inputs.
-SELECT * FROM issue_wakeup WHERE id= @id FOR UPDATE SKIP LOCKED;
-
--- name: ReserveWakeupReceipts :exec
--- A run being claimed takes these inputs along. They stay pending: they count
--- as handled once that run starts, and go back to the rule if it never does.
-UPDATE issue_wakeup_receipt SET task_id= @task_id WHERE id=ANY(@ids::uuid[]) AND processed_at IS NULL;
-
--- name: ReleaseWakeupReceipts :exec
-UPDATE issue_wakeup_receipt SET task_id=NULL WHERE id=ANY(@ids::uuid[]) AND processed_at IS NULL;
-
--- name: SetClaimedTaskContext :one
--- Only the claim being answered may change its task's context.
-UPDATE agent_task_queue SET context= @context::jsonb
-WHERE id= @id AND status='dispatched' AND dispatched_at= @dispatched_at RETURNING *;
-
 -- name: CountActiveIssueRunsOfAgent :one
 -- How many of these runs are the agent's own runs on this issue that have
 -- not finished: the run that made a change still knows about it.
 SELECT count(*) FROM agent_task_queue WHERE id=ANY(@ids::uuid[]) AND agent_id= @agent_id AND issue_id= @issue_id
  AND status IN ('dispatched','running','waiting_local_directory');
+
+-- name: HasReceivedIssueWakeupInput :one
+SELECT EXISTS (
+ SELECT 1 FROM issue_agent_event e JOIN issue_agent_session s ON s.id=e.session_id
+ WHERE e.delivery_task_id= @task_id AND e.kind='wakeup.fired'
+ AND e.status IN ('delivering','delivered') AND e.payload->>'wakeup_id'= @wakeup_id::text
+ AND s.issue_id= @issue_id AND s.agent_id= @agent_id
+);

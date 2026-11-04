@@ -68,6 +68,8 @@ const (
 	// It is persisted when this exact task enters running; absence always means
 	// unsupported so mixed server/daemon versions fail closed.
 	DaemonCapabilityTaskSupplementV1 = "task-supplement-v1"
+	// Issue-session inboxes are durable and never fall back to comment-triggered runs.
+	DaemonCapabilityIssueSessionEventsV1 = "issue-session-events-v1"
 	// DaemonCapabilityPiProcessCleanupV1 promises that this Pi/omp run joins
 	// descendant cleanup and explicitly confirms its cancellation outcome.
 	// Persist only at start; old daemons must retain their cancellation contract.

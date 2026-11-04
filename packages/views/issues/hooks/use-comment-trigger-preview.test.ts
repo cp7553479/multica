@@ -278,7 +278,6 @@ describe("useCommentTriggerPreview", () => {
       agents: [],
       blocked: [],
       hasAllMembersMention: false,
-      isCurrent: true,
     });
     expect(previewCommentTriggers).not.toHaveBeenCalled();
   });
@@ -298,7 +297,6 @@ describe("useCommentTriggerPreview", () => {
       agents: [],
       blocked: [],
       hasAllMembersMention: true,
-      isCurrent: true,
     });
     expect(previewCommentTriggers).not.toHaveBeenCalled();
   });

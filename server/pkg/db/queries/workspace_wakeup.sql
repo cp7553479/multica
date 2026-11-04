@@ -1,6 +1,21 @@
 -- name: ListWorkspaceWakeups :one
 -- Counts, filter choices, and page share one snapshot and the same access scope.
-WITH base AS MATERIALIZED (
+WITH rule_runs AS MATERIALIZED (
+ -- A consumer can receive several firings of one rule. Count its execution
+ -- once, using the actual delivery relationship rather than scheduling context.
+ SELECT w.id AS wakeup_id,t.id AS task_id
+ FROM issue_wakeup w
+ JOIN issue_agent_session sess ON sess.workspace_id=w.workspace_id AND sess.issue_id=w.issue_id
+ JOIN issue_agent_event e ON e.session_id=sess.id AND e.kind='wakeup.fired'
+  AND e.payload->>'wakeup_id'=w.id::text
+ JOIN agent_task_queue t ON t.id=e.delivery_task_id AND t.issue_id=sess.issue_id AND t.agent_id=sess.agent_id
+ WHERE w.workspace_id= @workspace_id AND (w.system_rule IS NOT NULL OR sess.agent_id=w.agent_id)
+ UNION
+ -- Historical executions remain readable after the routing cutover.
+ SELECT w.id,t.id FROM issue_wakeup w JOIN agent_task_queue t ON t.issue_id=w.issue_id
+  AND t.context->>'wakeup_id'=w.id::text AND (w.system_rule IS NOT NULL OR t.agent_id=w.agent_id)
+ WHERE w.workspace_id= @workspace_id
+), base AS MATERIALIZED (
  SELECT w.id,w.issue_id,i.title AS issue_title,ws.issue_prefix||'-'||i.number AS issue_identifier,
   w.agent_id,a.name AS agent_name,w.kind,w.mode,w.event_types,w.filter_actor_type,
  (CASE WHEN actor_agent.id IS NOT NULL OR actor_member.user_id IS NOT NULL THEN w.filter_actor_id END)::uuid AS filter_actor_id,
@@ -10,7 +25,9 @@ WITH base AS MATERIALIZED (
   CASE WHEN EXISTS(SELECT 1 FROM agent_task_queue ft JOIN agent fa ON fa.id=ft.agent_id AND fa.workspace_id=w.workspace_id
    WHERE ft.id=w.filter_task_id AND ft.issue_id=w.issue_id AND fa.id=ANY(@agent_ids::uuid[])) THEN w.filter_task_id END AS filter_task_id,
   w.interval_seconds,w.cron_expression,w.timezone,
-  w.next_fire_at,w.enabled,w.revision,w.disabled_at,w.last_task_id,w.last_error,w.created_at,
+  w.next_fire_at,w.enabled,w.revision,w.disabled_at,
+  (SELECT t.id FROM rule_runs rr JOIN agent_task_queue t ON t.id=rr.task_id WHERE rr.wakeup_id=w.id ORDER BY t.created_at DESC,t.id DESC LIMIT 1) AS last_task_id,
+  w.last_error,w.created_at,
   w.expires_at,w.expiry_seconds,w.on_timeout,w.timed_out_at,
   w.condition,w.max_fires,w.fire_count,w.paused_reason,
   (w.source_task_id IS NOT NULL) AS created_by_agent,creator.name AS created_by_name,
@@ -32,8 +49,8 @@ LEFT JOIN "user" actor_user ON actor_user.id=actor_member.user_id
  LEFT JOIN agent_task_queue creator_task ON creator_task.id=w.source_task_id
  LEFT JOIN agent creator_agent ON creator_agent.id=creator_task.agent_id AND creator_agent.workspace_id=w.workspace_id AND creator_agent.id=ANY(@agent_ids::uuid[])
  LEFT JOIN LATERAL (
-  SELECT count(*) AS active_runs FROM agent_task_queue t
-  WHERE t.context->>'wakeup_id'=w.id::text AND t.issue_id=w.issue_id AND t.agent_id=w.agent_id
+  SELECT count(DISTINCT t.id) AS active_runs FROM rule_runs rr JOIN agent_task_queue t ON t.id=rr.task_id
+  WHERE rr.wakeup_id=w.id AND t.issue_id=w.issue_id AND t.agent_id=w.agent_id
    AND t.status IN ('queued','deferred','dispatched','running','waiting_local_directory')
  ) r ON true
  WHERE w.workspace_id= @workspace_id AND w.system_rule IS NULL
@@ -45,7 +62,9 @@ LEFT JOIN "user" actor_user ON actor_user.id=actor_member.user_id
   COALESCE(ta.id,leader.id),COALESCE(ta.name,leader.name,''),w.kind,w.mode,w.event_types,NULL::text,
   NULL::uuid,''::text,NULL::uuid,NULL::text,NULL::uuid,
   NULL::bigint,NULL::text,w.timezone,
-  NULL::timestamptz,w.enabled,w.revision,w.disabled_at,w.last_task_id,w.last_error,w.created_at,
+  NULL::timestamptz,w.enabled,w.revision,w.disabled_at,
+  (SELECT t.id FROM rule_runs rr JOIN agent_task_queue t ON t.id=rr.task_id WHERE rr.wakeup_id=w.id ORDER BY t.created_at DESC,t.id DESC LIMIT 1),
+  w.last_error,w.created_at,
   NULL::timestamptz,NULL::bigint,NULL::text,NULL::timestamptz,
   w.condition,w.max_fires,w.fire_count,w.paused_reason,
   false,NULL::text,
@@ -70,8 +89,8 @@ LEFT JOIN "user" actor_user ON actor_user.id=actor_member.user_id
      AND ci.stage=agg.stage AND NOT (ci.status IN ('done','cancelled') OR EXISTS(SELECT 1 FROM issue_status cs WHERE cs.workspace_id=ci.workspace_id AND cs.key=ci.status AND cs.category IN ('done','closed')))) ELSE agg.open_count END)::int AS remaining
  ) ch
  LEFT JOIN LATERAL (
-  SELECT count(*) AS active_runs FROM agent_task_queue t
-  WHERE t.context->>'wakeup_id'=w.id::text AND t.issue_id=w.issue_id
+  SELECT count(DISTINCT t.id) AS active_runs FROM rule_runs rr JOIN agent_task_queue t ON t.id=rr.task_id
+  WHERE rr.wakeup_id=w.id AND t.issue_id=w.issue_id
    AND t.status IN ('queued','deferred','dispatched','running','waiting_local_directory')
  ) sr ON true
  WHERE w.workspace_id= @workspace_id AND w.system_rule IS NOT NULL AND agg.open_count>0
@@ -92,8 +111,8 @@ LEFT JOIN "user" actor_user ON actor_user.id=actor_member.user_id
  SELECT * FROM filtered ORDER BY created_at DESC,id DESC LIMIT @page_limit::int OFFSET @page_offset::int
 ), details AS (
  SELECT p.*,r.status AS last_task_status,
-  (SELECT count(*) FROM agent_task_queue t7 WHERE t7.context->>'wakeup_id'=p.id::text AND t7.issue_id=p.issue_id
-    AND t7.created_at>now()-interval '7 days')::int AS runs_7d,
+  (SELECT count(DISTINCT rr.task_id) FROM rule_runs rr JOIN agent_task_queue t7 ON t7.id=rr.task_id
+    WHERE rr.wakeup_id=p.id AND t7.issue_id=p.issue_id AND t7.created_at>now()-interval '7 days')::int AS runs_7d,
   CASE WHEN r.id IS NOT NULL THEN jsonb_build_object(
    'id',r.id,'agent_id',r.agent_id,'runtime_id',r.runtime_id,'issue_id',r.issue_id,'wakeup_id',p.id,
    'status',r.status,'priority',r.priority,'created_at',r.created_at,'started_at',r.started_at,
@@ -103,12 +122,12 @@ LEFT JOIN "user" actor_user ON actor_user.id=actor_member.user_id
  LEFT JOIN LATERAL (
   SELECT candidate.* FROM (
    (SELECT t.id,t.agent_id,t.runtime_id,t.issue_id,t.status,t.priority,t.created_at,t.started_at,t.dispatched_at,t.completed_at,1 AS active
-    FROM agent_task_queue t WHERE t.context->>'wakeup_id'=p.id::text AND t.issue_id=p.issue_id AND (p.source='system' OR t.agent_id=p.agent_id)
+    FROM rule_runs rr JOIN agent_task_queue t ON t.id=rr.task_id WHERE rr.wakeup_id=p.id AND t.issue_id=p.issue_id AND (p.source='system' OR t.agent_id=p.agent_id)
      AND t.status IN ('queued','deferred','dispatched','running','waiting_local_directory')
     ORDER BY (t.status IN ('running','waiting_local_directory','dispatched')) DESC,t.created_at DESC,t.id DESC LIMIT 1)
    UNION ALL
    (SELECT t.id,t.agent_id,t.runtime_id,t.issue_id,t.status,t.priority,t.created_at,t.started_at,t.dispatched_at,t.completed_at,0 AS active
-    FROM agent_task_queue t WHERE t.context->>'wakeup_id'=p.id::text AND t.issue_id=p.issue_id AND (p.source='system' OR t.agent_id=p.agent_id)
+    FROM rule_runs rr JOIN agent_task_queue t ON t.id=rr.task_id WHERE rr.wakeup_id=p.id AND t.issue_id=p.issue_id AND (p.source='system' OR t.agent_id=p.agent_id)
      AND t.status NOT IN ('queued','deferred','dispatched','running','waiting_local_directory')
     ORDER BY t.created_at DESC,t.id DESC LIMIT 1)
   ) candidate ORDER BY active DESC LIMIT 1

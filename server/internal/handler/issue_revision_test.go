@@ -430,7 +430,7 @@ func TestConcurrentRevisionWritesHaveExactlyOneWinner(t *testing.T) {
 	}
 }
 
-func TestConcurrentCommentRevisionConflictCancelsTaskBatchOnce(t *testing.T) {
+func TestConcurrentCommentRevisionConflictAppendsSessionEventOnce(t *testing.T) {
 	if testHandler == nil || testPool == nil {
 		t.Skip("database not available")
 	}
@@ -483,21 +483,31 @@ func TestConcurrentCommentRevisionConflictCancelsTaskBatchOnce(t *testing.T) {
 	if err := testPool.QueryRow(ctx, `SELECT status FROM agent_task_queue WHERE id = $1`, fixture.taskID).Scan(&originalStatus); err != nil {
 		t.Fatalf("load original task: %v", err)
 	}
-	if originalStatus != "cancelled" {
-		t.Fatalf("original task status = %q, want cancelled", originalStatus)
+	if originalStatus != "queued" {
+		t.Fatalf("historical task status = %q, want unchanged queued status", originalStatus)
 	}
-	if got := len(cancelEvents); got != 1 {
-		t.Fatalf("task cancellation events = %d, want exactly one winning edit side effect", got)
+	if got := len(cancelEvents); got != 0 {
+		t.Fatalf("comment edit emitted %d obsolete task cancellation event(s)", got)
 	}
 	var activeCount int
 	if err := testPool.QueryRow(ctx, `
 		SELECT count(*) FROM agent_task_queue
-		WHERE issue_id = $1 AND status IN ('queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred')
+		WHERE issue_id = $1 AND trigger_comment_id IS NOT NULL
+		  AND status IN ('queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred')
 	`, fixture.issueID).Scan(&activeCount); err != nil {
 		t.Fatalf("count active replacement tasks: %v", err)
 	}
 	if activeCount != 1 {
-		t.Fatalf("active replacement tasks = %d, want one batch from the winning edit", activeCount)
+		t.Fatalf("active historical tasks = %d, want the unchanged stored batch", activeCount)
+	}
+	var winningContent string
+	var revision int64
+	dbfx.QueryRow(t, `SELECT content,revision FROM comment WHERE id=$1`, fixture.commentID[2]).Scan(&winningContent, &revision)
+	if revision != 2 {
+		t.Fatalf("concurrent edits advanced comment revision to %d, want 2", revision)
+	}
+	if n := dbfx.Count(t, `SELECT count(*) FROM issue_agent_event e JOIN issue_agent_session s ON s.id=e.session_id WHERE s.issue_id=$1 AND s.agent_id=$2 AND e.source_id=$3 AND e.kind='comment.updated' AND e.source_revision=2 AND e.payload->>'content'=$4 AND e.actor_type='member' AND e.actor_id=$5`, fixture.issueID, fixture.agentID, fixture.commentID[2], winningContent, testUserID); n != 1 {
+		t.Fatalf("winning CAS edit produced %d matching session input(s), want one", n)
 	}
 }
 

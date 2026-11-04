@@ -482,8 +482,13 @@ func TestStatusChangeHandsOffOnDefaultProject(t *testing.T) {
 	back := dbfx.Issue(t, "explicit note", testutil.Cols{"project_id": projectID, "status": "todo"})
 	updateIssueForTest(t, back, map[string]any{"status": "in_progress", "handoff_note": "Only the login flow."}).Want(http.StatusOK)
 	backTasks, _ := testHandler.Queries.ListTasksByIssue(context.Background(), util.MustParseUUID(back))
-	if len(backTasks) != 1 || backTasks[0].HandoffNote.String != "Only the login flow." {
-		t.Fatalf("explicit handoff note was not kept: %+v", backTasks)
+	if len(backTasks) != 1 || !service.IsIssueAgentSessionTask(backTasks[0]) {
+		t.Fatalf("explicit handoff did not wake a persistent session: %+v", backTasks)
+	}
+	var handoffNote string
+	dbfx.QueryRow(t, `SELECT payload->>'handoff_note' FROM issue_agent_event WHERE session_id=$1 ORDER BY sequence DESC LIMIT 1`, service.IssueAgentSessionID(backTasks[0])).Scan(&handoffNote)
+	if handoffNote != "Only the login flow." {
+		t.Fatalf("explicit handoff note in session event = %q", handoffNote)
 	}
 	if !strings.Contains(claimBriefForTest(t, back, backTasks[0]), "Implement it and open a PR.") {
 		t.Fatal("a caller-written note must not cost the run its step brief")
@@ -1051,10 +1056,9 @@ func taskWorkflowStep(t *testing.T, taskID string) string {
 	return *step
 }
 
-// The validation report: an agent handling two adjacent columns moves the
-// issue into the second from its own run. Entering the step is new work, so a
-// run for it is queued although the agent is still running.
-func TestSameAgentNextStepQueuesARun(t *testing.T) {
+// An agent entering its next workflow step receives the new brief as an event
+// in the current conversation, without creating a concurrent execution.
+func TestSameAgentNextStepPushesEventIntoCurrentSession(t *testing.T) {
 	seedTestCatalog(t)
 	agentID := seededReadyAgentID(t)
 	projectID := deliveryProject(t, "Workflow same agent project", agentID)
@@ -1067,14 +1071,91 @@ func TestSameAgentNextStepQueuesARun(t *testing.T) {
 	dbfx.Exec(t, `UPDATE agent_task_queue SET status = 'running', started_at = now() WHERE id = $1`, taskID)
 
 	agentUpdateIssue(t, issueID, agentID, taskID, map[string]any{"status": "in_review"}).Want(http.StatusOK)
-	var queued int
-	dbfx.QueryRow(t, `SELECT count(*) FROM agent_task_queue
-		WHERE issue_id = $1 AND agent_id = $2 AND status = 'queued'`, issueID, agentID).Scan(&queued)
-	if queued != 1 {
-		t.Fatalf("queued runs for the next step = %d, want one", queued)
+	if count := dbfx.Count(t, `SELECT count(*) FROM agent_task_queue WHERE issue_id=$1 AND agent_id=$2`, issueID, agentID); count != 1 {
+		t.Fatalf("workflow transition created %d executions, want the current one", count)
 	}
-	if brief := claimBriefForTest(t, issueID, db.AgentTaskQueue{AgentID: util.MustParseUUID(agentID)}); !strings.Contains(brief, "Review your own PR.") {
-		t.Fatalf("the next step's run would not read its instructions:\n%s", brief)
+	var state, status, previous, brief string
+	var handoff bool
+	dbfx.QueryRow(t, `SELECT status,payload->>'status',payload->>'prev_status',
+		(payload->>'workflow_handoff')::boolean,payload->>'workflow_brief'
+		FROM issue_agent_event WHERE session_id=(SELECT id FROM issue_agent_session WHERE issue_id=$1 AND agent_id=$2)
+		ORDER BY sequence DESC LIMIT 1`, issueID, agentID).Scan(&state, &status, &previous, &handoff, &brief)
+	if state != "pending" || status != "in_review" || previous != "in_progress" || !handoff || !strings.Contains(brief, "Review your own PR.") {
+		t.Fatalf("next workflow event = state %q status %q previous %q handoff %v brief %q", state, status, previous, handoff, brief)
+	}
+	if step := taskWorkflowStep(t, taskID); step != "in_review" {
+		t.Fatalf("same execution's workflow authority = %q, want in_review", step)
+	}
+}
+
+func TestMemberHandoffAdvancesBusySessionAuthorityOnlyAfterCurrentEventAck(t *testing.T) {
+	for _, burst := range []bool{false, true} {
+		t.Run(fmt.Sprintf("burst=%v", burst), func(t *testing.T) {
+			seedTestCatalog(t)
+			agentID := seededReadyAgentID(t)
+			projectID := deliveryProject(t, "Workflow acknowledged handoff project", agentID)
+			setColumnHandoff(t, projectID, "in_review", handToAgent(agentID, "Review the new stage.")).Want(http.StatusOK)
+			if burst {
+				setColumnHandoff(t, projectID, "blocked", handToAgent(agentID, "Handle the latest blocked stage.")).Want(http.StatusOK)
+			}
+			issueID := dbfx.Issue(t, "member handoff during active session", testutil.Cols{"project_id": projectID, "status": "todo"})
+			updateIssueForTest(t, issueID, map[string]any{"status": "in_progress"}).Want(http.StatusOK)
+			tasks, err := testHandler.Queries.ListTasksByIssue(t.Context(), parseUUID(issueID))
+			if err != nil || len(tasks) != 1 {
+				t.Fatalf("initial session task=%+v error=%v", tasks, err)
+			}
+			task := tasks[0]
+			taskID := uuidToString(task.ID)
+			dbfx.Exec(t, `UPDATE agent_task_queue SET status='running',started_at=now() WHERE id=$1`, task.ID)
+			initial, err := testHandler.TaskService.ClaimIssueAgentEvents(t.Context(), task.ID, 32)
+			if err != nil || len(initial) != 1 {
+				t.Fatalf("initial workflow inbox=%+v error=%v", initial, err)
+			}
+			if err := testHandler.TaskService.AckIssueAgentEvent(t.Context(), task.ID, initial[0].ID, true, ""); err != nil {
+				t.Fatal(err)
+			}
+			updateIssueForTest(t, issueID, map[string]any{"status": "in_review"}).Want(http.StatusOK)
+			if burst {
+				updateIssueForTest(t, issueID, map[string]any{"status": "blocked"}).Want(http.StatusOK)
+			}
+			agentUpdateIssue(t, issueID, agentID, taskID, map[string]any{"status": "done"}).Want(http.StatusConflict)
+			batch, err := testHandler.TaskService.ClaimIssueAgentEvents(t.Context(), task.ID, 32)
+			want := 1
+			if burst {
+				want = 2
+			}
+			if err != nil || len(batch) != want {
+				t.Fatalf("member handoff inbox=%+v error=%v", batch, err)
+			}
+			if err := testHandler.TaskService.AckIssueAgentEvent(t.Context(), task.ID, batch[0].ID, true, ""); err != nil {
+				t.Fatal(err)
+			}
+			if burst {
+				if step := taskWorkflowStep(t, taskID); step != "in_progress" {
+					t.Fatalf("outdated handoff advanced authority to %q", step)
+				}
+				agentUpdateIssue(t, issueID, agentID, taskID, map[string]any{"status": "done"}).Want(http.StatusConflict)
+				if err := testHandler.TaskService.AckIssueAgentEvent(t.Context(), task.ID, batch[1].ID, true, ""); err != nil {
+					t.Fatal(err)
+				}
+			}
+			wantStep := "in_review"
+			if burst {
+				wantStep = "blocked"
+			}
+			if step := taskWorkflowStep(t, taskID); step != wantStep {
+				t.Fatalf("acknowledged current handoff authority=%q want %q", step, wantStep)
+			}
+			agentUpdateIssue(t, issueID, agentID, taskID, map[string]any{"status": "done"}).Want(http.StatusOK)
+			if count := dbfx.Count(t, `SELECT count(*) FROM agent_task_queue WHERE issue_id=$1`, issueID); count != 1 {
+				t.Fatalf("busy handoff created %d executions", count)
+			}
+			var ownStatus string
+			dbfx.QueryRow(t, `SELECT status FROM issue_agent_event WHERE session_id=$1 ORDER BY sequence DESC LIMIT 1`, service.IssueAgentSessionID(task)).Scan(&ownStatus)
+			if ownStatus != "ignored" {
+				t.Fatalf("ordinary own done update woke session: event state=%s", ownStatus)
+			}
+		})
 	}
 }
 
@@ -1204,12 +1285,11 @@ func TestWorkflowSwitchIntoDoneEndsWakeups(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { testPool.Exec(context.Background(), `DELETE FROM issue_wakeup WHERE issue_id = $1`, issueID) })
-	var runtimeID string
-	dbfx.QueryRow(t, `SELECT runtime_id::text FROM agent WHERE id = $1`, agentID).Scan(&runtimeID)
-	pending := dbfx.Task(t, agentID, testutil.Cols{
-		"issue_id": issueID, "runtime_id": runtimeID, "status": "queued",
-		"context": testutil.Raw("jsonb_build_object('wakeup_id', '" + uuidToString(wakeup.ID) + "')"),
-	})
+	if err := svc.Trigger(context.Background(), parseUUID(issueID), wakeup.ID, parseUUID(testUserID)); err != nil {
+		t.Fatal(err)
+	}
+	var pending string
+	dbfx.QueryRow(t, `SELECT active_task_id FROM issue_agent_session WHERE issue_id=$1 AND agent_id=$2`, issueID, agentID).Scan(&pending)
 
 	wf := createTestWorkflow(t, "Wakeup switch "+workflowTestSuffix())
 	setProjectWorkflow(t, projectID, map[string]any{
@@ -1344,11 +1424,18 @@ func TestBatchDescriptionUpdatePreservesWorkflowHandoff(t *testing.T) {
 		"project_id": projectID, "status": "in_progress", "assignee_type": "agent", "assignee_id": sourceAgent,
 	})
 	testutil.Call(t, testHandler.BatchUpdateIssues, workflowRequest(http.MethodPost, "/api/issues/batch", map[string]any{
-		"issue_ids": []string{issueID}, "updates": map[string]any{"status": "in_review", "description": "Batch updated description."},
+		"issue_ids": []string{issueID}, "updates": map[string]any{"status": "in_review", "description": "Batch updated description.", "handoff_note": "Review only the saved result."},
 	})).Want(http.StatusOK)
 	_, kind, id := issueStatusAndAssignee(t, issueID)
 	if kind != "agent" || id != targetAgent || taskCountFor(t, issueID, targetAgent) != 1 || taskCountFor(t, issueID, sourceAgent) != 0 {
 		t.Fatalf("batch saved assignee = %s/%s; want target agent %s and one target-agent-only run", kind, id, targetAgent)
+	}
+	var note, brief string
+	dbfx.QueryRow(t, `SELECT payload->>'handoff_note',payload->>'workflow_brief' FROM issue_agent_event
+		WHERE session_id=(SELECT id FROM issue_agent_session WHERE issue_id=$1 AND agent_id=$2)
+		ORDER BY sequence DESC LIMIT 1`, issueID, targetAgent).Scan(&note, &brief)
+	if note != "Review only the saved result." || !strings.Contains(brief, "Process the saved description.") {
+		t.Fatalf("batch handoff event lost its note or workflow brief: note %q brief %q", note, brief)
 	}
 }
 

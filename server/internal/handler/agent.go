@@ -462,6 +462,9 @@ type AgentTaskResponse struct {
 	CreatedAt          string                   `json:"created_at"`
 	PriorSessionID     string                   `json:"prior_session_id,omitempty"` // session ID from a previous task on same issue
 	PriorWorkDir       string                   `json:"prior_work_dir,omitempty"`   // work_dir from a previous task on same issue
+
+	IssueAgentSessionID string                    `json:"issue_agent_session_id,omitempty"`
+	IssueSessionEvents  []IssueAgentEventResponse `json:"issue_session_events,omitempty"`
 	// ModelOverride snapshots the agent's persistent OpenClaw model override at
 	// claim time. Later config edits affect subsequent claims, not this payload.
 	// Mirrors internal/daemon/types.go with the same JSON name; empty for other
@@ -914,6 +917,7 @@ func taskToResponse(t db.AgentTaskQueue, workspaceID string) AgentTaskResponse {
 		RuntimeID:              uuidToString(t.RuntimeID),
 		IssueID:                uuidToString(t.IssueID),
 		WorkspaceID:            workspaceID,
+		IssueAgentSessionID:    uuidToString(service.IssueAgentSessionID(t)),
 		Status:                 t.Status,
 		Priority:               t.Priority,
 		DispatchedAt:           timestampToPtr(t.DispatchedAt),
@@ -935,7 +939,6 @@ func taskToResponse(t db.AgentTaskQueue, workspaceID string) AgentTaskResponse {
 		HandoffNote:            handoffNote,
 		WakeupID:               wakeupContext.ID,
 		WakeupSystemRule:       wakeupContext.SystemRule,
-		WakeupJoined:           service.JoinedWakeupNotes(t.Context),
 		WorkDir:                workDir,
 		RelativeWorkDir:        relativeWorkDir(workDir, workspaceID, uuidToString(t.ID)),
 		DurableWorkDir:         durableWorkDir,

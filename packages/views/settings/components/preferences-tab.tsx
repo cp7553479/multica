@@ -30,7 +30,6 @@ import { useAuthStore } from "@multica/core/auth";
 import { useChatStore } from "@multica/core/chat";
 import {
   useCommentComposerStore,
-  type RunningAgentReply,
 } from "@multica/core/issues/stores";
 import {
   useIssueOpeningStore,
@@ -94,7 +93,6 @@ export function PreferencesTab() {
       >
         <SettingsCard>
           <StickyCommentBarRow />
-          <RunningAgentReplyRow />
           <FloatingChatRow />
         </SettingsCard>
       </SettingsSection>
@@ -200,50 +198,6 @@ function StickyCommentBarRow() {
         onCheckedChange={() => toggleSticky()}
         aria-label={t(($) => $.preferences.sticky_comment_bar.title)}
       />
-    </SettingsRow>
-  );
-}
-
-function RunningAgentReplyRow() {
-  const { t } = useT("settings");
-  const value = useCommentComposerStore((s) => s.runningAgentReply);
-  const setValue = useCommentComposerStore((s) => s.setRunningAgentReply);
-  const options: { value: RunningAgentReply; label: string }[] = [
-    { value: "steer", label: t(($) => $.preferences.running_agent_reply.steer) },
-    { value: "after_run", label: t(($) => $.preferences.running_agent_reply.after_run) },
-  ];
-
-  return (
-    <SettingsRow
-      anchor="running-agent-reply"
-      label={t(($) => $.preferences.running_agent_reply.title)}
-      description={t(($) => $.preferences.running_agent_reply.hint)}
-      size="select"
-    >
-      <Select
-        items={options}
-        value={value}
-        onValueChange={(next) => {
-          if (next && next !== value) setValue(next as RunningAgentReply);
-        }}
-      >
-        <SelectTrigger
-          size="sm"
-          className="w-full"
-          aria-label={t(($) => $.preferences.running_agent_reply.title)}
-        >
-          <SelectValue>
-            {options.find((option) => option.value === value)?.label}
-          </SelectValue>
-        </SelectTrigger>
-        <SelectContent align="end">
-          {options.map((option) => (
-            <SelectItem key={option.value} value={option.value}>
-              {option.label}
-            </SelectItem>
-          ))}
-        </SelectContent>
-      </Select>
     </SettingsRow>
   );
 }

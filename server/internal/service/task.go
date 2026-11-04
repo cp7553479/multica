@@ -43,13 +43,17 @@ type TaskService struct {
 	// at startup, so DO_NOT_TRACK stops collection, not just delivery.
 	RecordMemberActivity bool
 
-	Queries   *db.Queries
-	TxStarter TxStarter
-	Hub       *realtime.Hub
-	Bus       *events.Bus
-	Analytics analytics.Client
-	Metrics   *obsmetrics.BusinessMetrics
-	Wakeup    TaskWakeupNotifier
+	Queries               *db.Queries
+	TxStarter             TxStarter
+	Hub                   *realtime.Hub
+	Bus                   *events.Bus
+	Analytics             analytics.Client
+	Metrics               *obsmetrics.BusinessMetrics
+	Wakeup                TaskWakeupNotifier
+	IssueSessionCanInvoke func(context.Context, db.Agent, db.IssueAgentEvent) bool
+	IssueSessionWakeup    interface {
+		NotifyTaskSupplementAvailable(runtimeID, taskID string)
+	}
 	// PRSnapshotsEnabled reports whether the server can refresh GitHub check snapshots.
 	PRSnapshotsEnabled bool
 	// Entitlements supplies Cloud's workspace-scoped issue-count instruction.
@@ -157,32 +161,6 @@ func truncateForSummary(s string, maxRunes int) string {
 		return string(rs)
 	}
 	return string(rs[:maxRunes]) + "…"
-}
-
-// maxSynthesizedFallbackCommentRunes bounds the completion-fallback comment that
-// CompleteTask synthesizes from a task's final output when the agent left no
-// comment of its own during the run. A real final assistant message is at most
-// a few thousand words; anything larger is a runaway raw-stream dump — every
-// streamed text delta concatenated together plus a literal `tool call` line per
-// tool_use event — which some runtimes/providers emit as the task's Output on
-// long, tool-heavy runs. Such a dump (observed at 190–264 KB) must never be
-// posted, even partially, to the issue thread (GH #5455).
-const maxSynthesizedFallbackCommentRunes = 8000
-
-const oversizedFallbackCommentNotice = "This task completed, but its output was too large to post safely. The raw output was not posted. Review the task in this issue's Execution log."
-
-// truncateFallbackCommentBody bounds a synthesized completion-fallback comment
-// body. Unlike truncateForSummary (which flattens newlines for a one-line row
-// snapshot), it preserves genuine final messages below the cap verbatim. Output
-// above the cap is untrusted: the reported failure mode puts process narration
-// and tool traces at the head, so retaining any excerpt can expose execution
-// details and still discard the final answer. Replace the entire body with a
-// fixed notice instead. Callers pass the already-redacted body.
-func truncateFallbackCommentBody(body string, maxRunes int) string {
-	if utf8.RuneCountInString(body) <= maxRunes {
-		return body
-	}
-	return oversizedFallbackCommentNotice
 }
 
 const (
@@ -337,26 +315,6 @@ func NewTaskService(q *db.Queries, tx TxStarter, hub *realtime.Hub, bus *events.
 		wakeup = wakeups[0]
 	}
 	return &TaskService{Queries: q, TxStarter: tx, Hub: hub, Bus: bus, Wakeup: wakeup}
-}
-
-var trivialDoneMarkers = []string{
-	"done",
-	"готово",
-	"готова",
-	"сделано",
-	"完成",
-	"完了",
-}
-
-func isTrivialDoneOutput(output string) bool {
-	normalized := strings.TrimSpace(strings.ToLower(output))
-	normalized = strings.Trim(normalized, ".!！。… ")
-	for _, marker := range trivialDoneMarkers {
-		if normalized == marker {
-			return true
-		}
-	}
-	return false
 }
 
 func (s *TaskService) captureTaskQueued(ctx context.Context, task db.AgentTaskQueue) {
@@ -1156,65 +1114,7 @@ func (s *TaskService) EnqueueTaskForIssue(ctx context.Context, issue db.Issue, t
 	if len(triggerCommentID) > 0 {
 		commentID = triggerCommentID[0]
 	}
-	return s.enqueueIssueTask(ctx, issue, commentID, false, "", pgtype.UUID{}, pgtype.UUID{}, pgtype.Timestamptz{}, OriginDerived)
-}
-
-// EnqueueDeferredChannelIssueTask persists the assigned task for a media-backed
-// channel /issue turn without making it claimable yet. The fireAt deadline is a
-// crash-safe fallback; the channel router promotes the task as soon as the
-// detached attachment transaction settles.
-func (s *TaskService) EnqueueDeferredChannelIssueTask(ctx context.Context, issue db.Issue, fireAt time.Time) (db.AgentTaskQueue, error) {
-	task, err := s.enqueueIssueTask(ctx, issue, pgtype.UUID{}, false, "", pgtype.UUID{}, pgtype.UUID{}, pgtype.Timestamptz{Time: fireAt, Valid: true}, OriginDerived)
-	if err != nil {
-		return db.AgentTaskQueue{}, err
-	}
-	// The task is durable but not claimable yet. Wake once without a task ID so
-	// the daemon refreshes its deferred schedule without treating it as ready.
-	s.notifyRuntimeMayHaveWork(task.RuntimeID, "")
-	return task, nil
-}
-
-// createDeferredChannelIssueTaskWithQueries inserts the inert media-gated task
-// through the caller's query handle. IssueService passes its transaction-bound
-// Queries so the issue and task become visible atomically. Composio is
-// intentionally absent from the transaction-scoped service: the task cannot be
-// claimed while deferred, so the optional external overlay is hydrated after
-// commit without holding database locks across a network call.
-func (s *TaskService) createDeferredChannelIssueTaskWithQueries(ctx context.Context, q *db.Queries, issue db.Issue, fireAt time.Time) (db.AgentTaskQueue, error) {
-	txService := &TaskService{Queries: q}
-	return txService.enqueueIssueTask(ctx, issue, pgtype.UUID{}, false, "", pgtype.UUID{}, pgtype.UUID{}, pgtype.Timestamptz{Time: fireAt, Valid: true}, OriginDerived)
-}
-
-// hydrateDeferredChannelIssueTaskOverlay fills the optional Composio overlay
-// after the issue+task transaction commits. The conditional update refuses to
-// overwrite a comment merge that won the post-commit race and already
-// re-attributed the task (with its own matching overlay).
-func (s *TaskService) hydrateDeferredChannelIssueTaskOverlay(ctx context.Context, task db.AgentTaskQueue) error {
-	if s == nil || s.Queries == nil || s.Composio == nil || !featureflags.ComposioMCPAppsEnabled(ctx, s.FeatureFlags) {
-		return nil
-	}
-	agent, err := s.Queries.GetAgent(ctx, task.AgentID)
-	if err != nil {
-		return fmt.Errorf("load agent for deferred channel issue task overlay: %w", err)
-	}
-	overlay := s.buildRuntimeMCPOverlay(ctx, task.OriginatorUserID, agent)
-	if len(overlay.Overlay) == 0 {
-		return nil
-	}
-	updated, err := s.Queries.SetDeferredChannelIssueTaskRuntimeOverlay(ctx, db.SetDeferredChannelIssueTaskRuntimeOverlayParams{
-		ID:                       task.ID,
-		RuntimeMcpOverlay:        overlay.Overlay,
-		RuntimeConnectedApps:     overlay.ConnectedApps,
-		ExpectedOriginatorUserID: task.OriginatorUserID,
-	})
-	if err != nil {
-		return fmt.Errorf("set deferred channel issue task overlay: %w", err)
-	}
-	if updated == 0 {
-		slog.Debug("deferred channel issue task overlay skipped: task plan changed",
-			"task_id", util.UUIDToString(task.ID))
-	}
-	return nil
+	return s.enqueueIssueTask(ctx, issue, commentID, false, "", pgtype.UUID{}, pgtype.UUID{}, OriginDerived)
 }
 
 // EnqueueTaskForIssueByActor is the assign/promote variant of
@@ -1222,15 +1122,7 @@ func (s *TaskService) hydrateDeferredChannelIssueTaskOverlay(ctx context.Context
 // assign/promote and becomes the accountable human for the run (MUL-4302 §4);
 // invalid when the caller has no member actor.
 func (s *TaskService) EnqueueTaskForIssueByActor(ctx context.Context, issue db.Issue, actorUserID pgtype.UUID) (db.AgentTaskQueue, error) {
-	return s.enqueueIssueTask(ctx, issue, pgtype.UUID{}, false, "", actorUserID, pgtype.UUID{}, pgtype.Timestamptz{}, OriginDerived)
-}
-
-// EnqueueTaskForIssueWithHandoff is the backward-compatible assign/promote
-// variant used when an installed client still sends handoff_note. The note is
-// persisted on the task so both old and current daemons can render it in the
-// run's opening prompt. Empty text behaves like EnqueueTaskForIssueByActor.
-func (s *TaskService) EnqueueTaskForIssueWithHandoff(ctx context.Context, issue db.Issue, handoffNote string, actorUserID pgtype.UUID) (db.AgentTaskQueue, error) {
-	return s.enqueueIssueTask(ctx, issue, pgtype.UUID{}, false, handoffNote, actorUserID, pgtype.UUID{}, pgtype.Timestamptz{}, OriginDerived)
+	return s.enqueueIssueTask(ctx, issue, pgtype.UUID{}, false, "", actorUserID, pgtype.UUID{}, OriginDerived)
 }
 
 // enqueueIssueTask is the shared implementation behind EnqueueTaskForIssue
@@ -1278,11 +1170,11 @@ func (s *TaskService) ResolveIssueReviewSHAParam(ctx context.Context, issueID pg
 	return headShaText(s.ResolveIssueReviewSHA(ctx, issueID))
 }
 
-func (s *TaskService) enqueueIssueTask(ctx context.Context, issue db.Issue, triggerCommentID pgtype.UUID, forceFreshSession bool, handoffNote string, actorUserID pgtype.UUID, rerunOfTaskID pgtype.UUID, fireAt pgtype.Timestamptz, origin RunOrigin) (db.AgentTaskQueue, error) {
-	return s.enqueueIssueTaskWithCommentPlan(ctx, issue, triggerCommentID, nil, forceFreshSession, handoffNote, actorUserID, rerunOfTaskID, fireAt, origin, false)
+func (s *TaskService) enqueueIssueTask(ctx context.Context, issue db.Issue, triggerCommentID pgtype.UUID, forceFreshSession bool, handoffNote string, actorUserID pgtype.UUID, rerunOfTaskID pgtype.UUID, origin RunOrigin) (db.AgentTaskQueue, error) {
+	return s.enqueueIssueTaskWithCommentPlan(ctx, issue, triggerCommentID, nil, forceFreshSession, handoffNote, actorUserID, rerunOfTaskID, origin, false)
 }
 
-func (s *TaskService) enqueueIssueTaskWithCommentPlan(ctx context.Context, issue db.Issue, triggerCommentID pgtype.UUID, coalescedCommentIDs []pgtype.UUID, forceFreshSession bool, handoffNote string, actorUserID pgtype.UUID, rerunOfTaskID pgtype.UUID, fireAt pgtype.Timestamptz, origin RunOrigin, freshRerun bool) (db.AgentTaskQueue, error) {
+func (s *TaskService) enqueueIssueTaskWithCommentPlan(ctx context.Context, issue db.Issue, triggerCommentID pgtype.UUID, coalescedCommentIDs []pgtype.UUID, forceFreshSession bool, handoffNote string, actorUserID pgtype.UUID, rerunOfTaskID pgtype.UUID, origin RunOrigin, freshRerun bool) (db.AgentTaskQueue, error) {
 	if !issue.AssigneeID.Valid {
 		slog.Error("task enqueue failed", "issue_id", util.UUIDToString(issue.ID), "error", "issue has no assignee")
 		return db.AgentTaskQueue{}, fmt.Errorf("issue has no assignee")
@@ -1347,37 +1239,7 @@ func (s *TaskService) enqueueIssueTaskWithCommentPlan(ctx context.Context, issue
 		// from a later request against a new HEAD (TEN-356).
 		HeadSha: headShaText(s.ResolveIssueReviewSHA(ctx, issue.ID)),
 	}
-	var task db.AgentTaskQueue
-	if fireAt.Valid {
-		task, err = s.Queries.CreateDeferredChannelIssueTask(ctx, db.CreateDeferredChannelIssueTaskParams{
-			ID:                   dbid.NewV7(),
-			AgentID:              createParams.AgentID,
-			RuntimeID:            createParams.RuntimeID,
-			IssueID:              createParams.IssueID,
-			Priority:             createParams.Priority,
-			TriggerCommentID:     createParams.TriggerCommentID,
-			CoalescedCommentIds:  createParams.CoalescedCommentIds,
-			TriggerSummary:       createParams.TriggerSummary,
-			ForceFreshSession:    createParams.ForceFreshSession,
-			IsLeaderTask:         createParams.IsLeaderTask,
-			HandoffNote:          createParams.HandoffNote,
-			SquadID:              createParams.SquadID,
-			HeadSha:              createParams.HeadSha,
-			OriginatorUserID:     createParams.OriginatorUserID,
-			AccountableUserID:    createParams.AccountableUserID,
-			RuntimeMcpOverlay:    createParams.RuntimeMcpOverlay,
-			RuntimeConnectedApps: createParams.RuntimeConnectedApps,
-			OriginatorSource:     createParams.OriginatorSource,
-			DelegatedFromTaskID:  createParams.DelegatedFromTaskID,
-			RuleVersionID:        createParams.RuleVersionID,
-			RerunOfTaskID:        createParams.RerunOfTaskID,
-			TriggerEvidenceKind:  createParams.TriggerEvidenceKind,
-			TriggerEvidenceRefID: createParams.TriggerEvidenceRefID,
-			FireAt:               fireAt,
-		})
-	} else {
-		task, err = s.Queries.CreateAgentTask(ctx, createParams)
-	}
+	task, err := s.Queries.CreateAgentTask(ctx, createParams)
 	if err != nil {
 		// A concurrent enqueue for the same (issue, agent) won the race and the
 		// unique index rejected this insert. That is benign — a sibling run
@@ -1400,9 +1262,6 @@ func (s *TaskService) enqueueIssueTaskWithCommentPlan(ctx context.Context, issue
 		"force_fresh_session", forceFreshSession,
 	)
 	s.RecordHumanDelegation(ctx, attr)
-	if fireAt.Valid {
-		return task, nil
-	}
 	// Order matters: broadcast first, notify daemon second. notifyTaskAvailable
 	// kicks an in-process channel that the daemon picks up over HTTP and
 	// claims; the claim path then emits its own task:dispatch. Doing the
@@ -1451,8 +1310,8 @@ func (s *TaskService) EnqueueTaskForSquadLeaderByActor(ctx context.Context, issu
 	return s.enqueueMentionTask(ctx, issue, leaderID, pgtype.UUID{}, true, squadID, false, "", actorUserID, pgtype.UUID{}, OriginDerived)
 }
 
-// EnqueueTaskForSquadLeaderWithHandoff is the squad equivalent of
-// EnqueueTaskForIssueWithHandoff.
+// EnqueueTaskForSquadLeaderWithHandoff carries the assignment note into the
+// leader's opening prompt.
 func (s *TaskService) EnqueueTaskForSquadLeaderWithHandoff(ctx context.Context, issue db.Issue, leaderID pgtype.UUID, squadID pgtype.UUID, handoffNote string, actorUserID pgtype.UUID) (db.AgentTaskQueue, error) {
 	return s.enqueueMentionTask(ctx, issue, leaderID, pgtype.UUID{}, true, squadID, false, handoffNote, actorUserID, pgtype.UUID{}, OriginDerived)
 }
@@ -2313,27 +2172,6 @@ func (s *TaskService) PromoteChannelChatTasksIfMediaReady(ctx context.Context, s
 		s.broadcastTaskEvent(ctx, protocol.EventTaskQueued, task)
 		s.NotifyTaskEnqueued(ctx, task)
 	}
-	return nil
-}
-
-// PromoteDeferredChannelIssueTask makes a media-gated /issue task claimable.
-// ErrNoRows means the deadline sweeper already promoted it (or the task was
-// cancelled), so this is idempotent across the two promotion paths.
-func (s *TaskService) PromoteDeferredChannelIssueTask(ctx context.Context, taskID pgtype.UUID) error {
-	task, err := s.Queries.PromoteDeferredChannelIssueTask(ctx, taskID)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("promote deferred channel issue task: %w", err)
-	}
-	slog.Info("channel media-ready issue task promoted",
-		"task_id", util.UUIDToString(task.ID),
-		"issue_id", util.UUIDToString(task.IssueID),
-		"agent_id", util.UUIDToString(task.AgentID),
-	)
-	s.broadcastTaskEvent(ctx, protocol.EventTaskQueued, task)
-	s.NotifyTaskEnqueued(ctx, task)
 	return nil
 }
 
@@ -3779,6 +3617,9 @@ func (s *TaskService) claimTask(ctx context.Context, agentID, runtimeID pgtype.U
 // every enqueue (notifyTaskAvailable), so a queued task becomes
 // claimable on the next call rather than waiting for the TTL.
 func (s *TaskService) ClaimTaskForRuntime(ctx context.Context, runtimeID pgtype.UUID) (*db.AgentTaskQueue, error) {
+	if _, err := s.WakeIssueAgentSessionsForRuntime(ctx, runtimeID, 32); err != nil {
+		return nil, fmt.Errorf("wake issue sessions: %w", err)
+	}
 	start := time.Now()
 	var (
 		outcome          = "no_task"
@@ -4115,6 +3956,11 @@ func (s *TaskService) ClaimTasksForRuntimes(ctx context.Context, runtimeIDs []pg
 		}
 		seen[key] = struct{}{}
 		uniqueIDs = append(uniqueIDs, rid)
+	}
+	for _, runtimeID := range uniqueIDs {
+		if _, err := s.WakeIssueAgentSessionsForRuntime(ctx, runtimeID, 32); err != nil {
+			return nil, fmt.Errorf("wake issue sessions: %w", err)
+		}
 	}
 
 	claimed := make([]db.AgentTaskQueue, 0, maxTasks)
@@ -4760,55 +4606,8 @@ func (s *TaskService) CompleteTaskWithTransition(ctx context.Context, taskID pgt
 	slog.Info("task completed", "task_id", util.UUIDToString(task.ID), "issue_id", util.UUIDToString(task.IssueID))
 	s.captureTaskCompleted(ctx, task)
 
-	// Invariant: every completed issue task must have at least one agent
-	// comment on the issue, so the user always sees something when a run
-	// ends. If the agent posted a comment during execution (result, progress
-	// ping, or CLI reply), HasAgentCommentedSince returns true and we skip.
-	// Otherwise, synthesize one from the final output. For comment-triggered
-	// tasks, TriggerCommentID threads the fallback under the original comment;
-	// for assignment-triggered tasks it is NULL and the fallback is top-level.
-	// Chat tasks have no IssueID and are handled separately below.
-	if task.IssueID.Valid {
-		suppressNoActionComment, err := HasSquadLeaderNoActionEvaluationForTask(ctx, s.Queries, task)
-		if err != nil {
-			slog.Warn("checking squad leader no_action evaluation failed",
-				"task_id", util.UUIDToString(task.ID),
-				"issue_id", util.UUIDToString(task.IssueID),
-				"agent_id", util.UUIDToString(task.AgentID),
-				"error", err,
-			)
-		}
-		agentCommented, _ := s.Queries.HasAgentCommentedSince(ctx, db.HasAgentCommentedSinceParams{
-			IssueID:  task.IssueID,
-			AuthorID: task.AgentID,
-			Since:    task.StartedAt,
-		})
-		// A scheduled wakeup check that found nothing new ends with a check-in
-		// instead of a comment (see IssueWakeupService.CheckIn).
-		if !suppressNoActionComment && !agentCommented && !HasWakeupCheckin(task) {
-			var payload protocol.TaskCompletedPayload
-			if err := json.Unmarshal(result, &payload); err == nil {
-				if payload.Output != "" {
-					// An agent that emitted its whole answer as one escaped blob gets
-					// its literal `\n` decoded; formatted output is stored verbatim.
-					// See util.DecodeEscapedAgentOutput for the exact contract.
-					body := util.DecodeEscapedAgentOutput(payload.Output)
-					if task.TriggerCommentID.Valid && isTrivialDoneOutput(body) {
-						slog.Warn("suppressing trivial comment-trigger fallback output",
-							"task_id", util.UUIDToString(task.ID),
-							"issue_id", util.UUIDToString(task.IssueID),
-							"agent_id", util.UUIDToString(task.AgentID),
-						)
-					} else {
-						// Redact first, then bound: a runaway raw-stream Output (GH #5455)
-						// must never reach the issue thread, even as a clipped excerpt.
-						content := truncateFallbackCommentBody(redact.Text(body), maxSynthesizedFallbackCommentRunes)
-						s.createAgentComment(ctx, task.IssueID, task.AgentID, content, "comment", task.TriggerCommentID, task.ID)
-					}
-				}
-			}
-		}
-	}
+	// Issue output stays in the run transcript. Publishing a comment or changing
+	// the issue is an explicit agent tool action, independent of turn completion.
 
 	// Quick-create tasks: locate the issue the agent just created and push
 	// an inbox confirmation to the requester. The agent has no issue / chat
@@ -4849,6 +4648,7 @@ func (s *TaskService) CompleteTaskWithTransition(ctx context.Context, taskID pgt
 
 	// Broadcast
 	s.broadcastTaskEvent(ctx, protocol.EventTaskCompleted, task)
+	s.wakeCompletedIssueAgentSession(ctx, task)
 
 	return &task, true, nil
 }
@@ -5438,7 +5238,7 @@ func (s *TaskService) FailTaskWithTransition(ctx context.Context, taskID pgtype.
 	// daemon hiccup. Delegated failures keep this existing failed-issue comment
 	// in addition to the coordinator recovery signal, preserving visibility on
 	// both sides of a cross-issue handoff.
-	if errMsg != "" && task.IssueID.Valid && retried == nil {
+	if errMsg != "" && task.IssueID.Valid && retried == nil && !IsIssueAgentSessionTask(task) {
 		s.createAgentComment(ctx, task.IssueID, task.AgentID, redact.Text(errMsg), "system", task.TriggerCommentID, task.ID)
 	}
 
@@ -5631,6 +5431,7 @@ func ResumeUnsafeFailure(failureReason, errorText string) bool {
 // never what the workspace wants.
 func retryEligible(failureReason string, t db.AgentTaskQueue) bool {
 	return retryableReasons[failureReason] &&
+		!IsIssueAgentSessionTask(t) &&
 		t.Attempt < retryAttemptCeiling(failureReason, t.MaxAttempts) &&
 		!t.AutopilotRunID.Valid &&
 		!IsTriageTask(t) &&
@@ -5854,8 +5655,8 @@ func transferPendingSourceContextToRetry(ctx context.Context, q *db.Queries, par
 	return err
 }
 
-// RerunIssue creates a fresh queued task for an agent on the issue. Used by
-// the manual rerun endpoint.
+// RerunIssue repeats an auxiliary or squad execution. Agent-assigned issues and
+// persistent session executions continue through the session event inbox.
 //
 // Target agent resolution:
 //   - sourceTaskID Valid: rerun the agent that ran that task (and reuse its
@@ -5892,6 +5693,8 @@ func transferPendingSourceContextToRetry(ctx context.Context, q *db.Queries, par
 // current operator may not invoke the resolved target agent. The handler maps it
 // to a structured 403 (no task was cancelled or created).
 var ErrRerunInvokeNotAllowed = errors.New("rerun: operator not allowed to invoke target agent")
+
+var ErrIssueSessionRerunRequiresEvent = errors.New("persistent issue sessions must be resumed through their event inbox; retry an event or add a new comment")
 
 // IsFreshRerun reports whether a manual rerun explicitly discards continuity.
 // The source lineage stays intact for attribution and execution history.
@@ -5941,6 +5744,7 @@ func (s *TaskService) RerunIssue(ctx context.Context, issueID pgtype.UUID, sourc
 		isLeader            bool
 		squadID             pgtype.UUID
 		coalescedCommentIDs []pgtype.UUID
+		sourceIsSession     bool
 	)
 	if sourceTaskID.Valid {
 		sourceTask, err := s.Queries.GetAgentTask(ctx, sourceTaskID)
@@ -5961,6 +5765,7 @@ func (s *TaskService) RerunIssue(ctx context.Context, issueID pgtype.UUID, sourc
 		if IsTriageTask(sourceTask) {
 			return nil, ErrRerunSourceIsTriage
 		}
+		sourceIsSession = IsIssueAgentSessionTask(sourceTask)
 		agentID = sourceTask.AgentID
 		isLeader = sourceTask.IsLeaderTask
 		// Carry the source task's squad provenance so a rerun of a leader
@@ -6025,6 +5830,10 @@ func (s *TaskService) RerunIssue(ctx context.Context, issueID pgtype.UUID, sourc
 		if !canInvoke(targetAgent) {
 			return nil, ErrRerunInvokeNotAllowed
 		}
+	}
+
+	if sourceIsSession || issue.AssigneeType.String == "agent" {
+		return nil, ErrIssueSessionRerunRequiresEvent
 	}
 
 	// Clear only the tasks that have not begun executing. Those are the rows the
@@ -6183,7 +5992,7 @@ func (s *TaskService) promoteNewestSurvivingComment(ctx context.Context, ids []p
 func (s *TaskService) enqueueRerunTask(ctx context.Context, issue db.Issue, agentID pgtype.UUID, triggerCommentID pgtype.UUID, coalescedCommentIDs []pgtype.UUID, isLeader bool, squadID pgtype.UUID, actorUserID pgtype.UUID, rerunOfTaskID pgtype.UUID, origin RunOrigin, fresh bool) (db.AgentTaskQueue, error) {
 	if issue.AssigneeType.String == "agent" && issue.AssigneeID.Valid &&
 		util.UUIDToString(issue.AssigneeID) == util.UUIDToString(agentID) {
-		return s.enqueueIssueTaskWithCommentPlan(ctx, issue, triggerCommentID, coalescedCommentIDs, true, "", actorUserID, rerunOfTaskID, pgtype.Timestamptz{}, origin, fresh)
+		return s.enqueueIssueTaskWithCommentPlan(ctx, issue, triggerCommentID, coalescedCommentIDs, true, "", actorUserID, rerunOfTaskID, origin, fresh)
 	}
 	return s.enqueueMentionTaskWithCommentPlan(ctx, issue, agentID, triggerCommentID, coalescedCommentIDs, isLeader, squadID, true, "", actorUserID, rerunOfTaskID, origin, fresh)
 }
@@ -6316,7 +6125,7 @@ func (s *TaskService) HandleFailedTasks(ctx context.Context, tasks []db.AgentTas
 			}
 			// Same terminal-failure comment FailTaskWithTransition posts, so
 			// swept tasks are not silent on their issue.
-			if t.IssueID.Valid && t.Error.String != "" {
+			if t.IssueID.Valid && t.Error.String != "" && !IsIssueAgentSessionTask(t) {
 				s.createAgentComment(ctx, t.IssueID, t.AgentID, redact.Text(t.Error.String), "system", t.TriggerCommentID, t.ID)
 			}
 		}
@@ -6343,7 +6152,7 @@ func (s *TaskService) HandleFailedTasks(ctx context.Context, tasks []db.AgentTas
 				// projects a nonterminal custom key onto a built-in, so this is
 				// a key comparison on purpose. (MUL-6243, MUL-7240)
 				effectiveStatus := issuestatus.Effective(ctx, s.Queries, issue.WorkspaceID, issue.Status)
-				if effectiveStatus == "in_progress" && !processedIssues[issueKey] && !retriedIssues[issueKey] {
+				if !IsIssueAgentSessionTask(t) && effectiveStatus == "in_progress" && !processedIssues[issueKey] && !retriedIssues[issueKey] {
 					processedIssues[issueKey] = true
 					hasActive, checkErr := s.Queries.HasActiveTaskForIssue(ctx, t.IssueID)
 					if checkErr != nil {
@@ -6414,6 +6223,9 @@ func SettleTerminalTaskState(ctx context.Context, q *db.Queries, tasks ...db.Age
 	taskIDs := make([]pgtype.UUID, 0, len(tasks))
 	for _, task := range tasks {
 		taskIDs = append(taskIDs, task.ID)
+		if err := settleIssueAgentSessionTask(ctx, q, task); err != nil {
+			return fmt.Errorf("settle issue session execution: %w", err)
+		}
 	}
 	if _, err := q.SettleTerminalTaskSupplements(ctx, taskIDs); err != nil {
 		return fmt.Errorf("settle terminal task supplements: %w", err)
@@ -6975,6 +6787,9 @@ func (s *TaskService) dispatchDelegatedFailureRecovery(ctx context.Context, targ
 // delegated terminal; the production terminal paths deliberately retain their
 // legacy raw-error notice alongside the richer coordinator recovery signal.
 func (s *TaskService) recoverDelegatedTaskFailure(ctx context.Context, failed db.AgentTaskQueue) (handled bool, err error) {
+	if IsIssueAgentSessionTask(failed) {
+		return false, nil
+	}
 	target, _, err := s.ensureDelegatedFailureRecoveryComment(ctx, failed.ID)
 	if err != nil || target == nil {
 		return false, err

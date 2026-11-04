@@ -665,10 +665,6 @@ func TestMentionAgent_RejectsCrossWorkspaceAgentUUID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load test issue: %v", err)
 	}
-	comment, err := testHandler.Queries.GetComment(ctx, util.MustParseUUID(commentID))
-	if err != nil {
-		t.Fatalf("load test comment: %v", err)
-	}
 
 	// Count tasks for the foreign agent before. Calling the dispatcher
 	// directly bypasses HTTP-layer concerns and exercises only the
@@ -681,7 +677,7 @@ func TestMentionAgent_RejectsCrossWorkspaceAgentUUID(t *testing.T) {
 		t.Fatalf("count tasks before: %v", err)
 	}
 
-	enqueueMentionedAgentTasksForTest(t, ctx, issue, comment, nil, "member", testUserID)
+	testHandler.commentSessionOutcomes(ctx, issue, "member", testUserID, testUserID)
 
 	var afterCount int
 	if err := testPool.QueryRow(ctx,
@@ -780,7 +776,11 @@ func TestShouldEnqueueOnComment_PrivateAgentGate(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := testHandler.shouldEnqueueAssigneeFallback(ctx, issue, tc.actorType, tc.actorID, commentTriggerComputeOptions{})
+			target, err := testHandler.Queries.GetAgentInWorkspace(ctx, db.GetAgentInWorkspaceParams{ID: issue.AssigneeID, WorkspaceID: issue.WorkspaceID})
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := testHandler.canInvokeAgent(ctx, target, tc.actorType, tc.actorID, "", testWorkspaceID)
 			if got != tc.want {
 				t.Fatalf("%s\n  actor=%s/%s got=%v want=%v",
 					tc.reason, tc.actorType, tc.actorID, got, tc.want)

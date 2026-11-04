@@ -7,6 +7,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/multica-ai/multica/server/internal/events"
+	"github.com/multica-ai/multica/server/internal/testutil"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
@@ -17,11 +18,14 @@ import (
 func rerunQueueFixture(t *testing.T) (svc *TaskService, pool *pgxpool.Pool, creatorID, agentID, issueID, runtimeID string) {
 	t.Helper()
 	pool = newResolveOriginatorPool(t)
-	_, creatorID, agentID, issueID = seedAttributionFixture(t, pool)
+	workspaceID, creatorID, agentID, issueID := seedAttributionFixture(t, pool)
 
 	if err := pool.QueryRow(context.Background(), `SELECT runtime_id::text FROM agent WHERE id = $1`, agentID).Scan(&runtimeID); err != nil {
 		t.Fatalf("read agent runtime: %v", err)
 	}
+	fixture := testutil.New(pool, workspaceID, creatorID)
+	squadID := fixture.Squad(t, "auxiliary rerun squad "+t.Name(), agentID)
+	fixture.Exec(t, `UPDATE issue SET assignee_type='squad',assignee_id=$2 WHERE id=$1`, issueID, squadID)
 	svc = &TaskService{Queries: db.New(pool), TxStarter: pool, Bus: events.New()}
 	return svc, pool, creatorID, agentID, issueID, runtimeID
 }

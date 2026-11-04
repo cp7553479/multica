@@ -85,6 +85,13 @@ In `server/internal/handler/`, distinguish UUID sources before using them in wri
 
 Workspace-scoped queries filter by `workspace_id`; membership gates access and `X-Workspace-ID` selects the workspace. Assignees are polymorphic: interpret `assignee_id` together with `assignee_type`.
 
+Issue inputs use the assigned agent's persistent session inbox. Capture mutations
+transactionally, preserve per-session event order and current invocation rights,
+and keep the logical session separate from provider conversations and execution
+turns. Do not restore per-comment tasks, implicit mention dispatch, automatic
+completion comments, or fresh-session fallback for issue sessions. See
+[the architecture and upgrade contract](docs/engineering/issue-agent-sessions.md).
+
 ## Desktop Rules
 
 - Workspace session routes are tab destinations. Pre-workspace one-shot flows (create workspace, accept invite) use `WindowOverlay` in `apps/desktop/src/renderer/src/stores/window-overlay-store.ts`, not new routes. Stale workspace tabs heal by dropping stale tab groups.

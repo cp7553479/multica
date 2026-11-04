@@ -24,6 +24,7 @@ import {
   type IssueSortParam,
 } from "./queries";
 import { onIssueUpdated, onIssueAuxiliaryRevision } from "./ws-updaters";
+import { fenceIssueAgentDeliveries } from "./agent-deliveries";
 import { inboxKeys, inboxListOptions } from "../inbox/queries";
 import {
   onInboxInvalidate,
@@ -1228,6 +1229,37 @@ describe("comment mutations — owner revision and last activity", () => {
     qc.clear();
   });
 
+  it.each([
+    { responseRevision: 4, currentRevision: 3, expectedContent: "Canonical", expectedRevision: 4 },
+    { responseRevision: 4, currentRevision: 5, expectedContent: "Newer websocket body", expectedRevision: 5 },
+    { responseRevision: undefined, currentRevision: 3, expectedContent: "Canonical", expectedRevision: undefined },
+  ])("keeps canonical comment payload and its version together: %j", async ({ responseRevision, currentRevision, expectedContent, expectedRevision }) => {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    seed(qc);
+    const original = qc.getQueryData<TimelineEntry[]>(issueKeys.timeline(issueId))![0]!;
+    qc.setQueryData(issueKeys.timeline(issueId), [{ ...original, revision: 3 }]);
+    let respond!: () => void;
+    const attachments = [{ id: "canonical-attachment" }];
+    setApiInstance({
+      updateComment: vi.fn(() => new Promise((resolve) => {
+        respond = () => resolve({ id: "comment-1", content: "Canonical", attachments, revision: responseRevision, issue_revision: 2 });
+      })),
+    } as unknown as ApiClient);
+    const { result, unmount } = renderHook(() => useUpdateComment(issueId), { wrapper: createWrapper(qc) });
+    act(() => result.current.mutate({ commentId: "comment-1", content: "Optimistic", attachmentIds: [] }));
+    await waitFor(() => expect(qc.getQueryData<TimelineEntry[]>(issueKeys.timeline(issueId))?.[0]?.content).toBe("Optimistic"));
+    if (currentRevision > 3) {
+      qc.setQueryData(issueKeys.timeline(issueId), [{ ...original, content: "Newer websocket body", revision: currentRevision }]);
+    }
+    await act(async () => respond());
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    const entry = qc.getQueryData<TimelineEntry[]>(issueKeys.timeline(issueId))?.[0];
+    expect(entry?.content).toBe(expectedContent);
+    expect(entry?.revision).toBe(expectedRevision);
+    expect(entry?.attachments).toEqual(currentRevision > 3 ? original.attachments : attachments);
+    unmount(); qc.clear();
+  });
+
   it("invalidates the owner projection after a successful 204 delete", async () => {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     seed(qc);
@@ -1472,6 +1504,7 @@ describe("useCreateComment — sibling caches under a shared key prefix", () => 
         resolved_at: null,
         resolved_by_type: null,
         resolved_by_id: null,
+        revision: 3,
         issue_revision: 7,
       }),
     } as unknown as ApiClient);
@@ -1509,5 +1542,26 @@ describe("useCreateComment — sibling caches under a shared key prefix", () => 
     expect(
       qc.getQueryData<TimelineEntry[]>(issueKeys.timeline(ISSUE_ID))?.map((e) => e.id),
     ).toEqual(["comment-1"]);
+  });
+
+  it("preserves the HTTP-created comment revision so its delivery ACK matches before a timeline reload", async () => {
+    qc.setQueryData<TimelineEntry[]>(issueKeys.timeline(ISSUE_ID), []);
+    const { result, unmount } = renderHook(() => useCreateComment(ISSUE_ID), {
+      wrapper: createWrapper(qc),
+    });
+    await act(async () => result.current.mutateAsync({ content: "hello" }));
+    const entries = qc.getQueryData<TimelineEntry[]>(issueKeys.timeline(ISSUE_ID))!;
+    expect(entries[0]).toMatchObject({ id: "comment-1", content: "hello", revision: 3 });
+    const issue = makeIssue(1, { revision: 7 });
+    const receipt = {
+      event_id: "event", session_id: "session", agent_id: "agent", source_id: "comment-1",
+      source_revision: 3, status: "delivered", delivered_at: "2026-08-19T00:00:01Z",
+    };
+    const deliveries = fenceIssueAgentDeliveries({
+      issue: { source_revision: null, title: issue.title, description: issue.description, status: issue.status, stage: issue.stage, assignee_id: issue.assignee_id, receipts: [] },
+      comments: [{ comment_id: "comment-1", source_revision: 3, receipts: [receipt] }],
+    }, ISSUE_ID, issue, entries);
+    expect(deliveries.comments[0]?.receipts).toEqual([receipt]);
+    unmount();
   });
 });

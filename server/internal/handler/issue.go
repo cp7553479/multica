@@ -3612,9 +3612,8 @@ type UpdateIssueRequest struct {
 	// the issue can be run later via manual run/rerun. Optional; omitted or
 	// false keeps today's behavior. Mirrors comment suppress_agent_ids.
 	SuppressRun bool `json:"suppress_run,omitempty"`
-	// HandoffNote is retained at the API boundary for installed clients that
-	// predate the handoff UI removal. It is consumed only when this write starts
-	// a run and is never stored on the issue itself.
+	// HandoffNote is retained for installed clients. Assigned-agent sessions
+	// receive it in the event captured with this write.
 	HandoffNote string `json:"handoff_note,omitempty"`
 	// StopPreviousAssigneeRuns, when a status change hands the issue off to a
 	// project workflow step's handler, cancels the active runs of the agent or
@@ -4078,6 +4077,7 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 	// The agent this write hands the issue to gets the change as its own run,
 	// not also through its event wakeups.
 	writeCtx := withWakeupHandedTo(r.Context(), h.handedToAgent(r.Context(), prevIssue, params, handoff != nil))
+	writeCtx = h.withIssueSessionHandoff(writeCtx, prevIssue, params, handoff, req.HandoffNote)
 	var issue db.Issue
 	attachmentsChanged := false
 	if req.Description != nil || req.TitleBase != nil || req.DescriptionBase != nil || len(attachmentIDs) > 0 {
@@ -4222,7 +4222,9 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 	if handoff != nil && req.StopPreviousAssigneeRuns {
 		h.stopPreviousAssigneeRuns(r.Context(), prevIssue, issue, actorType, actorID)
 	}
-	if willRun {
+	if issue.AssigneeType.String == "agent" {
+		h.wakeAssignedIssueSession(r.Context(), issue)
+	} else if willRun {
 		h.dispatchIssueRun(r.Context(), issue, trigger, actorType, actorID, handoffNote)
 	}
 
@@ -4339,41 +4341,6 @@ func (h *Handler) shouldEnqueueAgentTask(ctx context.Context, issue db.Issue) bo
 		return false
 	}
 	return h.isAgentAssigneeReady(ctx, issue)
-}
-
-// shouldEnqueueAssigneeFallback returns true when comment routing can fall back
-// to the issue's assigned agent. Fires for any status — comments are
-// conversational and can happen at any stage, including after completion
-// (e.g. follow-up questions on a done issue).
-//
-// Mirrors the private-agent gate that resolveMentionedAgentCommentTriggers applies on the
-// @mention path: once an owner/admin assigns a private agent to an issue, the
-// agent's UUID is "welded" onto the issue and remains visible to every member
-// who can view it. Without this check any of those members could dispatch a new
-// task to the private agent simply by commenting (#3300).
-func (h *Handler) shouldEnqueueAssigneeFallback(ctx context.Context, issue db.Issue, actorType, actorID string, opts commentTriggerComputeOptions) bool {
-	_, hasPending, ok := h.assigneeFallbackAgent(ctx, issue, actorType, actorID, opts)
-	return ok && !hasPending
-}
-
-func (h *Handler) assigneeFallbackAgent(ctx context.Context, issue db.Issue, actorType, actorID string, opts commentTriggerComputeOptions) (db.Agent, bool, bool) {
-	if !issue.AssigneeType.Valid || issue.AssigneeType.String != "agent" || !issue.AssigneeID.Valid {
-		return db.Agent{}, false, false
-	}
-	agent, err := h.Queries.GetAgent(ctx, issue.AssigneeID)
-	if err != nil || !agent.RuntimeID.Valid || agent.ArchivedAt.Valid {
-		return db.Agent{}, false, false
-	}
-	if !h.canInvokeAgent(ctx, agent, actorType, actorID, opts.OriginatorUserID, uuidToString(issue.WorkspaceID)) {
-		return db.Agent{}, false, false
-	}
-	// Coalescing queue: pending is still a valid route target, but callers
-	// that actually enqueue tasks use this flag to avoid piling on duplicates.
-	hasPending, err := h.hasPendingTaskForIssueAndAgent(ctx, issue.ID, issue.AssigneeID, opts)
-	if err != nil {
-		return db.Agent{}, false, false
-	}
-	return agent, hasPending, true
 }
 
 // isAgentRunningOnIssue reports whether the calling agent's current task
@@ -4906,6 +4873,7 @@ func (h *Handler) BatchUpdateIssues(w http.ResponseWriter, r *http.Request) {
 		}
 
 		writeCtx := withWakeupHandedTo(r.Context(), h.handedToAgent(r.Context(), prevIssue, params, handoff != nil))
+		writeCtx = h.withIssueSessionHandoff(writeCtx, prevIssue, params, handoff, req.Updates.HandoffNote)
 		var issue db.Issue
 		if req.Updates.Description != nil {
 			// One batch-level base cannot describe multiple issue documents.
@@ -4980,7 +4948,9 @@ func (h *Handler) BatchUpdateIssues(w http.ResponseWriter, r *http.Request) {
 		if handoff != nil && req.Updates.StopPreviousAssigneeRuns {
 			h.stopPreviousAssigneeRuns(r.Context(), prevIssue, issue, actorType, actorID)
 		}
-		if willRun {
+		if issue.AssigneeType.String == "agent" {
+			h.wakeAssignedIssueSession(r.Context(), issue)
+		} else if willRun {
 			h.dispatchIssueRun(r.Context(), issue, trigger, actorType, actorID, batchHandoffNote)
 		}
 

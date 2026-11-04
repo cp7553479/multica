@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgtype"
@@ -242,12 +243,9 @@ func TestExhaustedRecoveryIsSettled(t *testing.T) {
 	}
 }
 
-// A manual rerun clears the pending slot with its own bulk cancel. That
-// statement terminates a coordinator task that may already hold a recovery
-// receipt, so it has to settle like every other terminal path — otherwise the
-// row stays in the unsettled index forever and the index regrows the unbounded
-// history this change set removes.
-func TestManualRerunSettlesDeliveredRecovery(t *testing.T) {
+// Assigned issues resume through their durable inbox. Rejecting a legacy rerun
+// leaves both the current execution and its recovery receipt untouched.
+func TestManualRerunRejectsAssignedIssueWithoutSettlingDeliveredRecovery(t *testing.T) {
 	f, svc := seedDelegatedFailureFixture(t)
 	ctx := context.Background()
 	recoveryTaskID, recoveryCommentID := f.seedRecoverySignal(t, svc)
@@ -268,19 +266,19 @@ func TestManualRerunSettlesDeliveredRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse actor id: %v", err)
 	}
-	if _, err := svc.RerunIssue(ctx, issueID, recoveryTaskID, pgtype.UUID{}, actorID, false, func(db.Agent) bool { return true }); err != nil {
-		t.Fatalf("RerunIssue: %v", err)
+	if _, err := svc.RerunIssue(ctx, issueID, recoveryTaskID, pgtype.UUID{}, actorID, false, func(db.Agent) bool { return true }); !errors.Is(err, ErrIssueSessionRerunRequiresEvent) {
+		t.Fatalf("RerunIssue error = %v, want issue-session event requirement", err)
 	}
 
 	var status string
 	if err := f.pool.QueryRow(ctx, `SELECT status FROM agent_task_queue WHERE id = $1`, recoveryTaskID).Scan(&status); err != nil {
 		t.Fatalf("read coordinator task status: %v", err)
 	}
-	if status != "cancelled" {
-		t.Fatalf("rerun left the pending coordinator task in %q; the test no longer covers the cancel path", status)
+	if status != "queued" {
+		t.Fatalf("rejected rerun mutated coordinator task status to %q", status)
 	}
-	if !f.settled(t, recoveryCommentID) {
-		t.Fatal("manual rerun cancelled a task holding a recovery receipt without settling it")
+	if f.settled(t, recoveryCommentID) {
+		t.Fatal("rejected rerun settled a receipt without a terminal task transition")
 	}
 }
 

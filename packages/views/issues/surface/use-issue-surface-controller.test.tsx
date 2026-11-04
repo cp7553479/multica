@@ -57,6 +57,7 @@ function makeIssue(
 }
 
 const updateIssueMutate = vi.hoisted(() => vi.fn());
+const updateIssueMutateAsync = vi.hoisted(() => vi.fn());
 const batchUpdateMutateAsync = vi.hoisted(() => vi.fn());
 const batchDeleteMutateAsync = vi.hoisted(() => vi.fn());
 const openModal = vi.hoisted(() => vi.fn());
@@ -71,7 +72,7 @@ vi.mock("@multica/core/auth", () => ({
 }));
 
 vi.mock("@multica/core/issues/mutations", () => ({
-  useUpdateIssue: () => ({ mutate: updateIssueMutate, isPending: false }),
+  useUpdateIssue: () => ({ mutate: updateIssueMutate, mutateAsync: updateIssueMutateAsync, isPending: false }),
   useBatchUpdateIssues: () => ({
     mutateAsync: batchUpdateMutateAsync,
     isPending: false,
@@ -213,6 +214,7 @@ describe("useIssueSurfaceController", () => {
     } as unknown as ApiClient);
     pruneIssueSurfaceViewStates([]);
     updateIssueMutate.mockClear();
+    updateIssueMutateAsync.mockReset().mockResolvedValue(makeIssue({ id: "issue-1", status: "todo" }));
     openModal.mockClear();
     batchUpdateMutateAsync.mockResolvedValue(undefined);
     batchDeleteMutateAsync.mockResolvedValue(undefined);

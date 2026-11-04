@@ -30,8 +30,6 @@
     "steer_waiting": "等待 {{name}} 读取",
     "steer_read": "{{name}} 已读取",
     "steer_not_received": "{{name}} 未收到 · {{reason}}",
-    "steer_resend": "作为新一轮发送",
-    "steer_resend_failed": "没能作为新一轮发送。",
     "steer_step": "{{name}} 插话",
     "steer_step_read": "已读取"
   },
@@ -680,17 +678,11 @@
     "trigger_source_mention_squad_leader": "小队",
     "trigger_source_unknown": "将触发",
     "trigger_skipped_label": "已跳过",
-    "trigger_wont_trigger": "本次不会开始",
-    "trigger_none_will_trigger": "都不会开始",
-    "all_members_notice": "成员广播 · @all 不会启动智能体",
+    "all_members_notice": "成员广播",
     "trigger_reason_mention_squad_leader": "被 @ 小队的队长。",
     "trigger_reason_unknown": "将由这条评论开始。",
-    "trigger_will_start": "发送后开始",
     "trigger_will_start_count_other": "发送后 {{count}} 个智能体开始工作",
-    "trigger_starts_now": "立即开始。",
-    "trigger_starts_when_online": "当前离线，上线后开始。",
     "trigger_click_to_skip": "点击本次跳过。",
-    "trigger_click_to_manage": "点击为每个智能体选择这条消息的处理方式。",
     "trigger_click_to_restore": "本次不会开始，点击恢复。",
     "trigger_preview_title": "接收方",
     "trigger_chip_aria": "{{name}} 触发状态：{{state}}",
@@ -708,21 +700,7 @@
       "resolve_failed": "标记已解决失败",
       "unresolve_failed": "重新打开失败"
     },
-    "recipient_steer": "插话到当前运行",
-    "recipient_steer_desc": "{{name}} 会在当前步骤结束后读到，并继续完成原任务。仅支持文字。",
-    "recipient_after_run": "本轮结束后开始",
-    "recipient_after_run_desc": "不打断当前运行，结束后作为新一轮处理。",
-    "recipient_restart": "停止并重新开始",
-    "recipient_restart_desc": "立即停止当前运行，按这条消息从头开始。",
-    "recipient_join": "开始时一并处理",
-    "recipient_join_desc": "{{name}} 的运行还在排队，开始时会连同这条消息一起处理。",
-    "recipient_state_running": "正在运行",
-    "recipient_state_starting": "正在启动",
-    "recipient_state_queued": "排队中",
-    "recipient_count_other": "{{count}} 个智能体会收到",
-    "steer_attachment_notice": "插话只支持文字，带附件的消息会在本轮结束后处理。",
-    "restart_send": "停止并发送",
-    "restart_failed": "没能停止当前运行，消息还没有发送。"
+    "session_recipient": "发送到 {{name}} 的会话"
   },
   "reply": {
     "placeholder": "回复...",
@@ -1795,5 +1773,37 @@
       "empty_title": "还没有保存的视图",
       "empty_description": "在任务列表里调好筛选和显示方式，然后另存为视图。"
     }
+  },
+  "agent_sessions": {
+    "title": "智能体会话",
+    "idle": "空闲",
+    "working": "工作中",
+    "blocked": "已阻塞",
+    "paused": "已暂停",
+    "closed": "已关闭",
+    "unknown": "未知状态",
+    "pending": "待投递",
+    "delivering": "投递中",
+    "delivered": "已送达",
+    "failed": "失败",
+    "ignored": "已忽略",
+    "event": "事件 {{sequence}}",
+    "retry": "重试",
+    "retry_event": "重试事件 {{sequence}}",
+    "load_failed": "无法加载会话投递状态。",
+    "retry_failed": "无法重试此事件。",
+    "unsupported": "此运行时不支持在运行中接收消息。",
+    "blocked_hint": "投递受阻，请检查智能体运行时。",
+    "truncated_other": "显示会话历史中的 {{count}} 个事件。",
+    "invocation_not_allowed": "你没有向此智能体发送消息的权限。",
+    "delivery_unconfirmed": "无法确认投递结果，重试前请检查会话。",
+    "provider_rejected": "智能体拒绝了此消息。",
+    "turn_ended": "运行在消息送达前结束。",
+    "detached": "已重新分配／停用",
+    "resume_unavailable": "此会话无法恢复。请先恢复原运行时和会话数据，再重试。",
+    "retry_original_session": "可重试此事件，重新检查并恢复原会话。"
+  },
+  "delivery_receipts": {
+    "delivered_to": "已送达 {{name}}"
   }
 }

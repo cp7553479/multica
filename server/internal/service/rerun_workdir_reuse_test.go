@@ -26,6 +26,9 @@ func TestRerunIssuePinsForceFreshSessionForRollbackSafety(t *testing.T) {
 	q := db.New(pool)
 	workspaceID, creatorID, agentID, issueID := seedAttributionFixture(t, pool)
 	_ = workspaceID
+	if _, err := pool.Exec(ctx, `UPDATE issue SET assignee_type=NULL,assignee_id=NULL WHERE id=$1`, issueID); err != nil {
+		t.Fatalf("prepare auxiliary issue: %v", err)
+	}
 
 	svc := &TaskService{Queries: q, TxStarter: pool, Bus: events.New()}
 

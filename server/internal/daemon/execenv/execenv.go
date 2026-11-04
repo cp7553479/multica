@@ -128,9 +128,10 @@ type PrepareParams struct {
 
 // TaskContextForEnv is the subset of task context used for writing context files.
 type TaskContextForEnv struct {
-	IssueID          string
-	TriggerCommentID string // comment that triggered this task (empty for on_assign)
-	TriggerThreadID  string // root comment ID for the triggering thread; falls back to TriggerCommentID when empty
+	IssueAgentSessionID string
+	IssueID             string
+	TriggerCommentID    string // comment that triggered this task (empty for on_assign)
+	TriggerThreadID     string // root comment ID for the triggering thread; falls back to TriggerCommentID when empty
 	// CommentReplyTargets is set for a comment run that coalesced comments
 	// spanning MORE THAN ONE root thread (MUL-4348). When it has >=2 entries the
 	// workflow's reply step fans out — one reply per thread — instead of the
@@ -634,12 +635,19 @@ func Prepare(params PrepareParams, logger *slog.Logger) (*Environment, error) {
 	// session), which must never block dispatching this task.
 	if params.LocalWorkDir == "" && (params.Task.IssueID != "" || params.Task.ChatSessionID != "") {
 		if err := WriteManagedEnvProvenance(envRoot, ManagedEnvProvenance{
-			WorkspaceID:   params.WorkspaceID,
-			IssueID:       params.Task.IssueID,
-			ChatSessionID: params.Task.ChatSessionID,
-			AgentID:       params.Task.AgentID,
-		}); err != nil && logger != nil {
-			logger.Warn("execenv: write managed env provenance failed (non-fatal); a follow-up may start a fresh session", "error", err)
+			IssueAgentSessionID: params.Task.IssueAgentSessionID,
+			WorkDir:             workDir,
+			WorkspaceID:         params.WorkspaceID,
+			IssueID:             params.Task.IssueID,
+			ChatSessionID:       params.Task.ChatSessionID,
+			AgentID:             params.Task.AgentID,
+		}); err != nil {
+			if params.Task.IssueAgentSessionID != "" {
+				return nil, fmt.Errorf("write issue session provenance: %w", err)
+			}
+			if logger != nil {
+				logger.Warn("execenv: write managed env provenance failed (non-fatal); a follow-up may start a fresh session", "error", err)
+			}
 		}
 	}
 
@@ -765,6 +773,7 @@ func Prepare(params PrepareParams, logger *slog.Logger) (*Environment, error) {
 // the per-provider knobs (CodexVersion, OpenclawBin) so callers can pass
 // the same resolved binary path on both first-run and reuse paths.
 type ReuseParams struct {
+	EnvRoot string
 	// WorkspacesRoot is the daemon-owned root under which all task envs live.
 	// Passed on reuse so the root-level fail-closed marker is self-healed here
 	// too — a marker removed while the daemon runs is restored before a reused
@@ -839,7 +848,10 @@ func Reuse(params ReuseParams, logger *slog.Logger) *Environment {
 		}
 	}
 
-	rootDir := filepath.Dir(params.WorkDir)
+	rootDir := params.EnvRoot
+	if rootDir == "" {
+		rootDir = filepath.Dir(params.WorkDir)
+	}
 	if params.LocalDirectory {
 		// For local_directory tasks the user's WorkDir is unrelated to
 		// envRoot (envRoot still lives under workspacesRoot/{wsID}/...),
@@ -1228,11 +1240,13 @@ const ManagedEnvProvenanceManagedBy = "multica-daemon-managed-env"
 // chat envs, so its presence is itself the "safe to reuse, not a user
 // local_directory" assertion; see shouldReusePriorWorkdir.
 type ManagedEnvProvenance struct {
-	ManagedBy     string `json:"managed_by"`
-	WorkspaceID   string `json:"workspace_id"`
-	IssueID       string `json:"issue_id,omitempty"`
-	ChatSessionID string `json:"chat_session_id,omitempty"`
-	AgentID       string `json:"agent_id"`
+	IssueAgentSessionID string `json:"issue_agent_session_id,omitempty"`
+	WorkDir             string `json:"work_dir,omitempty"`
+	ManagedBy           string `json:"managed_by"`
+	WorkspaceID         string `json:"workspace_id"`
+	IssueID             string `json:"issue_id,omitempty"`
+	ChatSessionID       string `json:"chat_session_id,omitempty"`
+	AgentID             string `json:"agent_id"`
 }
 
 // WriteManagedEnvProvenance persists the reuse-eligibility marker at the env

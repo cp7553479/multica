@@ -103,7 +103,7 @@ describe("ApiClient edit guards", () => {
     const client = new ApiClient("https://api.example.test");
 
     await client.updateIssue("issue-1", { title: "Latest", title_base: "Original" });
-    await client.updateComment("comment-1", "Latest", [], undefined, "Original");
+    await client.updateComment("comment-1", "Latest", [], "Original");
 
     expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toMatchObject({
       title: "Latest",
@@ -1397,7 +1397,7 @@ describe("ApiClient", () => {
     });
   });
 
-  it("uses the expected HTTP contract for comment trigger preview and suppress", async () => {
+  it("uses the expected HTTP contract for comment preview and automatic session delivery", async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(
         new Response(JSON.stringify({ agents: [] }), {
@@ -1451,9 +1451,8 @@ describe("ApiClient", () => {
       "comment",
       "parent-1",
       ["attachment-1"],
-      ["agent-1"],
     );
-    await client.updateComment("comment-1", "updated", ["attachment-1"], ["agent-1"]);
+    await client.updateComment("comment-1", "updated", ["attachment-1"]);
 
     expect(fetchMock.mock.calls.map(([url, init]) => ({
       url,
@@ -1473,7 +1472,6 @@ describe("ApiClient", () => {
           type: "comment",
           parent_id: "parent-1",
           attachment_ids: ["attachment-1"],
-          suppress_agent_ids: ["agent-1"],
         }),
       },
       {
@@ -1482,7 +1480,6 @@ describe("ApiClient", () => {
         body: JSON.stringify({
           content: "updated",
           attachment_ids: ["attachment-1"],
-          suppress_agent_ids: ["agent-1"],
         }),
       },
     ]);

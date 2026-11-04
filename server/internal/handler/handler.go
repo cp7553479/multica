@@ -259,8 +259,7 @@ type Handler struct {
 	// heartbeat-carried requests (MUL-5444). Optional: when nil,
 	// requestDaemonPendingWork falls back to the local DaemonHub, which is the
 	// correct delivery scope for a single-node deployment.
-	DaemonPendingWork    DaemonPendingWorkNotifier
-	DaemonTaskSupplement DaemonTaskSupplementNotifier
+	DaemonPendingWork DaemonPendingWorkNotifier
 	// ModelCatalogCache serves the last known good model list for a runtime so
 	// the picker can render without waiting for a daemon round trip
 	// (stale-while-revalidate, MUL-5444). Nil-safe: every call site treats a nil
@@ -543,6 +542,12 @@ func New(queries *db.Queries, txStarter txStarter, hub *realtime.Hub, bus *event
 		}),
 		LLM: llmClient,
 		cfg: cfg,
+	}
+	if daemonHub != nil {
+		taskSvc.IssueSessionWakeup = daemonHub
+	}
+	taskSvc.IssueSessionCanInvoke = func(ctx context.Context, agent db.Agent, event db.IssueAgentEvent) bool {
+		return h.canInvokeAgent(ctx, agent, event.ActorType, uuidToString(event.ActorID), uuidToString(event.OriginatorUserID), uuidToString(event.WorkspaceID))
 	}
 	h.WebhookDeliveryWorker = NewWebhookDeliveryWorker(h)
 	// The default passthrough scheduler reports sweeper-race recoveries so the

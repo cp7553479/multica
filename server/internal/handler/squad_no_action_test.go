@@ -134,7 +134,7 @@ func TestCompleteTask_SquadLeaderNoActionCanonicalizesTaskID(t *testing.T) {
 	}
 }
 
-func TestCompleteTask_SquadLeaderActionStillSynthesizesComment(t *testing.T) {
+func TestCompleteTask_SquadLeaderActionKeepsOutputInTranscript(t *testing.T) {
 	if testHandler == nil || testPool == nil {
 		t.Skip("database not available")
 	}
@@ -144,8 +144,13 @@ func TestCompleteTask_SquadLeaderActionStillSynthesizesComment(t *testing.T) {
 
 	completeRunningTask(t, fx, "Delegated the review.")
 
-	if got := countAgentCommentsForIssue(t, fx.IssueID, fx.LeaderID); got != 1 {
-		t.Fatalf("expected action completion to synthesize one comment, got %d", got)
+	if got := countAgentCommentsForIssue(t, fx.IssueID, fx.LeaderID); got != 0 {
+		t.Fatalf("completion published an implicit comment: %d", got)
+	}
+	var output string
+	dbfx.QueryRow(t, "SELECT result->>'output' FROM agent_task_queue WHERE id=$1", fx.TaskID).Scan(&output)
+	if output != "Delegated the review." {
+		t.Fatalf("transcript output = %q", output)
 	}
 }
 

@@ -40,6 +40,12 @@ func TestRerunIssueBlockedBeforeMutationWhenInvokeDenied(t *testing.T) {
 		t.Fatalf("EnqueueTaskForIssue (original): %v", err)
 	}
 
+	// This source is now an auxiliary execution; assigned-agent sessions use
+	// their event inbox instead of this rerun endpoint.
+	if _, err := pool.Exec(ctx, `UPDATE issue SET assignee_type=NULL,assignee_id=NULL WHERE id=$1`, issueID); err != nil {
+		t.Fatalf("prepare auxiliary issue: %v", err)
+	}
+
 	countTasks := func() int {
 		var n int
 		if err := pool.QueryRow(ctx, `SELECT count(*) FROM agent_task_queue WHERE issue_id = $1`, issueID).Scan(&n); err != nil {

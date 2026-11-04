@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -14,6 +15,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -380,6 +382,17 @@ func (b *piBackend) Execute(ctx context.Context, prompt string, opts ExecOptions
 	// --session is strictly resume-only; let it create fresh sessions in a
 	// private directory, then return the transcript it actually persisted.
 	sessionPath := opts.ResumeSessionID
+	if opts.StrictSessionResume && sessionPath != "" {
+		info, err := os.Stat(sessionPath)
+		if err != nil || info.Size() == 0 {
+			return nil, fmt.Errorf("%s persistent session history is unavailable", label)
+		}
+		if label == "pi" {
+			if err := readPiSessionHeader(sessionPath); err != nil {
+				return nil, fmt.Errorf("pi persistent session history is unavailable: %w", err)
+			}
+		}
+	}
 	var sessionDir string
 	var sessionLock *os.File
 	if label == "omp" && sessionPath == "" {
@@ -542,19 +555,44 @@ func (b *piBackend) Execute(ctx context.Context, prompt string, opts ExecOptions
 	// stdin pipe while the child fills stdout; serialising those operations can
 	// deadlock both processes. RPC keeps stdin open until agent_settled; print
 	// mode closes it to signal the end of the initial prompt.
-	writeErrCh := make(chan error, 1)
+	var sessionPersisted atomic.Bool
+	sessionPersisted.Store(opts.PersistSession == nil || label != "pi")
+	var sessionEstablished atomic.Bool
+	sessionEstablished.Store(opts.PersistSession == nil || label != "pi")
+	type promptWriteResult struct {
+		err                error
+		persistenceFailure bool
+	}
+	writeErrCh := make(chan promptWriteResult, 1)
 	go func() {
 		var err error
-		if rpcMode {
+		persistenceFailure := false
+		if !sessionPersisted.Load() {
+			// Pi initializes an explicitly supplied empty --session file with
+			// its real header before reading the prompt. Persist that evidence
+			// before any model input; the empty reservation alone is not resumable.
+			err = waitPiSessionHeader(processCtx, cleanup.exited, sessionPath, opts.HandshakeTimeout)
+			if err == nil {
+				sessionEstablished.Store(true)
+				err = opts.PersistSession(processCtx, sessionPath)
+			}
+			if err != nil {
+				err = fmt.Errorf("pi session persistence failed: %w", err)
+				persistenceFailure = true
+			} else {
+				sessionPersisted.Store(true)
+			}
+		}
+		if err == nil && rpcMode {
 			err = supplements.write(processCtx, map[string]string{"id": "initial-prompt", "type": "prompt", "message": prompt})
-		} else {
+		} else if err == nil {
 			_, err = io.WriteString(stdin, prompt)
 			closeStdin()
 		}
 		if err != nil {
 			cancelProcess()
 		}
-		writeErrCh <- err
+		writeErrCh <- promptWriteResult{err: err, persistenceFailure: persistenceFailure}
 	}()
 
 	go func() {
@@ -806,10 +844,15 @@ func (b *piBackend) Execute(ctx context.Context, prompt string, opts ExecOptions
 
 		// Wait closes the process pipes, so a prompt write still blocked when the
 		// child exited has returned by now. The writer sends exactly once.
-		writeErr := <-writeErrCh
+		writeResult := <-writeErrCh
+		writeErr := writeResult.err
 		authoritativeTerminal := false
 
-		if runCtx.Err() == context.DeadlineExceeded {
+		if writeResult.persistenceFailure {
+			finalStatus = "failed"
+			finalError = writeErr.Error()
+			authoritativeTerminal = true
+		} else if runCtx.Err() == context.DeadlineExceeded {
 			finalStatus = "timeout"
 			finalError = fmt.Sprintf("%s timed out after %s", label, timeout)
 		} else if runCtx.Err() == context.Canceled {
@@ -900,12 +943,16 @@ func (b *piBackend) Execute(ctx context.Context, prompt string, opts ExecOptions
 		// still busy after Pi had already exited.
 		releasePiSessionFileLock(sessionLock)
 		sessionLock = nil
+		reportedSessionID := sessionPath
+		if !sessionEstablished.Load() {
+			reportedSessionID = ""
+		}
 		resCh <- Result{
 			Status:     finalStatus,
 			Output:     output.String(),
 			Error:      finalError,
 			DurationMs: duration.Milliseconds(),
-			SessionID:  sessionPath,
+			SessionID:  reportedSessionID,
 			Usage:      usage,
 			// Only a run that asked to resume can have had a resume refused.
 			// On a cold run the phrase cannot appear anyway, but stating the
@@ -922,8 +969,15 @@ func (b *piBackend) Execute(ctx context.Context, prompt string, opts ExecOptions
 		TerminalObserved: turnErrors.terminalObserved,
 	}
 	if rpcMode {
-		session.Supplement = supplements.send
-		session.SupplementReady = supplements.ready
+		session.Supplement = func(ctx context.Context, text string) error {
+			if !sessionPersisted.Load() {
+				return fmt.Errorf("pi session persistence is not confirmed")
+			}
+			return supplements.send(ctx, text)
+		}
+		session.SupplementReady = func() bool {
+			return sessionPersisted.Load() && supplements.ready()
+		}
 	}
 	return session, nil
 }
@@ -1450,6 +1504,58 @@ func newPiSessionPath() (string, error) {
 	}
 	name := fmt.Sprintf("%s.jsonl", time.Now().UTC().Format("20060102T150405.000000000"))
 	return filepath.Join(dir, name), nil
+}
+
+// readPiSessionHeader accepts the same first-entry identity Pi needs to reopen
+// a transcript. A nonempty placeholder or an unrelated JSON object cannot prove
+// that the provider established a session. Bound the read independently of the
+// rest of a potentially large transcript.
+func readPiSessionHeader(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	var header struct {
+		Type string `json:"type"`
+		ID   string `json:"id"`
+	}
+	line, err := bufio.NewReader(io.LimitReader(f, 1<<20)).ReadBytes('\n')
+	if err != nil && err != io.EOF {
+		return fmt.Errorf("session header is unavailable: %w", err)
+	}
+	if err := json.Unmarshal(line, &header); err != nil {
+		return fmt.Errorf("session header is unavailable: %w", err)
+	}
+	if header.Type != "session" || strings.TrimSpace(header.ID) == "" {
+		return fmt.Errorf("session header has no provider identity")
+	}
+	return nil
+}
+
+func waitPiSessionHeader(ctx context.Context, exited <-chan struct{}, path string, timeout time.Duration) error {
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		err := readPiSessionHeader(path)
+		if err == nil {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-exited:
+			return fmt.Errorf("runtime exited before establishing session history: %w", err)
+		case <-timer.C:
+			return fmt.Errorf("timed out waiting for session history: %w", err)
+		case <-ticker.C:
+		}
+	}
 }
 
 // ensurePiSessionFile creates an empty session file if one does not yet

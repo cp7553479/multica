@@ -510,8 +510,8 @@ func TestClaimTaskByRuntime_NonBodyFieldsAreOutOfScope(t *testing.T) {
 		issueSnapshotJSON(t, issueSnapshotVersion, name+" issue", ""))
 	// Since that run the issue moved status, was reassigned, and was
 	// re-prioritised. None of the three is in the compared set.
-	dbfx.Exec(t, `UPDATE issue SET status = 'in_review', assignee_type = 'agent', assignee_id = $1, priority = 'urgent' WHERE id = $2`,
-		agentID, issueID)
+	dbfx.Exec(t, `UPDATE issue SET status = 'in_review', assignee_type = 'member', assignee_id = $1, priority = 'urgent' WHERE id = $2`,
+		testUserID, issueID)
 	createCommentTriggeredClaimTask(t, ctx, agentID, runtimeID, issueID, nil)
 
 	resp := claimCommentTask(t, runtimeID, "narrowed-scope-claim")
@@ -528,9 +528,9 @@ func TestClaimTaskByRuntime_NonBodyFieldsAreOutOfScope(t *testing.T) {
 	if resp.Task.IssueStatus != "in_review" {
 		t.Errorf("current status must still ship: got %q, want in_review", resp.Task.IssueStatus)
 	}
-	if resp.Task.IssueAssigneeType != "agent" || resp.Task.IssueAssigneeID != agentID {
-		t.Errorf("current assignee must still ship: type=%q id=%q, want agent/%s",
-			resp.Task.IssueAssigneeType, resp.Task.IssueAssigneeID, agentID)
+	if resp.Task.IssueAssigneeType != "member" || resp.Task.IssueAssigneeID != testUserID {
+		t.Errorf("current assignee must still ship: type=%q id=%q, want member/%s",
+			resp.Task.IssueAssigneeType, resp.Task.IssueAssigneeID, testUserID)
 	}
 }
 

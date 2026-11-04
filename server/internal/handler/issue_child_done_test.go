@@ -13,6 +13,8 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/service"
 	"github.com/multica-ai/multica/server/internal/testutil"
+	db "github.com/multica-ai/multica/server/pkg/db/generated"
+	"github.com/multica-ai/multica/server/pkg/protocol"
 )
 
 // childDoneFixture creates a parent + child pair so the child_done system rule
@@ -99,6 +101,11 @@ func setIssueAssigneeDirect(t *testing.T, issueID, assigneeType, assigneeID stri
 	); err != nil {
 		t.Fatalf("set parent assignee: %v", err)
 	}
+	// This helper establishes a pre-existing assignment for child-rule tests;
+	// it is not the user assignment action these tests are exercising.
+	dbfx.Exec(t, `UPDATE issue_agent_event SET status='ignored',failure_reason='fixture_setup'
+        WHERE kind='assigned' AND source_id=$1
+          AND source_revision=(SELECT revision FROM issue WHERE id=$1)`, issueID)
 }
 
 func handlerTestAgentID(t *testing.T) string {
@@ -132,6 +139,8 @@ type childDoneEntry struct {
 	TargetType string `json:"target_type"`
 	TargetID   string `json:"target_id"`
 	TaskID     string `json:"task_id"`
+	SessionID  string `json:"session_id"`
+	EventID    string `json:"event_id"`
 }
 
 func childDoneEntries(t *testing.T, parentID string) []childDoneEntry {
@@ -160,16 +169,20 @@ func childDoneEntries(t *testing.T, parentID string) []childDoneEntry {
 
 type childDoneRunRow struct {
 	ID, AgentID, SquadID, Note, Status, WakeupID string
+	SessionID, EventID                           string
 	Leader                                       bool
 }
 
-// childDoneRuns lists the runs the parent's rule started, oldest first.
+// childDoneRuns reads the rule's durable inputs and their current or recorded
+// consumer. An input is not a separate execution; several can share one ID.
 func childDoneRuns(t *testing.T, parentID string) []childDoneRunRow {
 	t.Helper()
-	rows, err := testPool.Query(context.Background(), `SELECT id::text, agent_id::text, COALESCE(squad_id::text, ''),
-		COALESCE(handoff_note, ''), status, context->>'wakeup_id', COALESCE(is_leader_task, false)
-		FROM agent_task_queue WHERE issue_id = $1 AND context->>'wakeup_system' = 'child_done'
-		ORDER BY created_at, id`, parentID)
+	rows, err := testPool.Query(context.Background(), `SELECT COALESCE(t.id::text,''), s.agent_id::text, COALESCE(t.squad_id::text,''),
+		COALESCE(e.payload->>'note',''), COALESCE(t.status,''), e.payload->>'wakeup_id', COALESCE(t.is_leader_task,false), s.id::text,e.id::text
+		FROM issue_agent_event e JOIN issue_agent_session s ON s.id=e.session_id
+		LEFT JOIN agent_task_queue t ON t.id=COALESCE(e.delivery_task_id,s.active_task_id)
+		WHERE s.issue_id=$1 AND e.kind='wakeup.fired' AND e.payload->>'system_rule'='child_done'
+		ORDER BY e.sequence`, parentID)
 	if err != nil {
 		t.Fatalf("read child_done runs: %v", err)
 	}
@@ -177,12 +190,59 @@ func childDoneRuns(t *testing.T, parentID string) []childDoneRunRow {
 	runs := []childDoneRunRow{}
 	for rows.Next() {
 		var r childDoneRunRow
-		if err := rows.Scan(&r.ID, &r.AgentID, &r.SquadID, &r.Note, &r.Status, &r.WakeupID, &r.Leader); err != nil {
+		if err := rows.Scan(&r.ID, &r.AgentID, &r.SquadID, &r.Note, &r.Status, &r.WakeupID, &r.Leader, &r.SessionID, &r.EventID); err != nil {
 			t.Fatal(err)
 		}
 		runs = append(runs, r)
 	}
 	return runs
+}
+
+func childDoneSessionTask(t *testing.T, parentID, agentID string) db.AgentTaskQueue {
+	t.Helper()
+	var taskID string
+	dbfx.QueryRow(t, `SELECT active_task_id FROM issue_agent_session WHERE issue_id=$1 AND agent_id=$2`, parentID, agentID).Scan(&taskID)
+	task, err := testHandler.Queries.GetAgentTask(t.Context(), parseUUID(taskID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var carrier map[string]any
+	if json.Unmarshal(task.Context, &carrier) != nil || carrier["type"] != "issue_session" || carrier["wakeup_id"] != nil || carrier["wakeup_system"] != nil || task.TriggerCommentID.Valid {
+		t.Fatalf("child completion created a legacy wakeup task: %+v context=%s", task, task.Context)
+	}
+	return task
+}
+
+func childDoneClaimSessionInput(t *testing.T, task db.AgentTaskQueue) []db.IssueAgentEvent {
+	t.Helper()
+	if task.Status == "queued" {
+		dbfx.Exec(t, `UPDATE agent_task_queue SET status='dispatched',dispatched_at=clock_timestamp() WHERE id=$1`, task.ID)
+	}
+	inputs, err := testHandler.TaskService.ClaimIssueAgentEvents(t.Context(), task.ID, 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return inputs
+}
+
+func finishChildDoneSession(t *testing.T, parentID, agentID string) {
+	t.Helper()
+	task := childDoneSessionTask(t, parentID, agentID)
+	inputs := childDoneClaimSessionInput(t, task)
+	dbfx.Exec(t, `UPDATE agent_task_queue SET status='running',started_at=clock_timestamp() WHERE id=$1`, task.ID)
+	identity := "child-provider-" + uuidToString(service.IssueAgentSessionID(task))
+	directory := "/tmp/child-session-" + uuidToString(service.IssueAgentSessionID(task))
+	if err := testHandler.TaskService.PinIssueAgentSession(t.Context(), task.ID, identity, directory); err != nil {
+		t.Fatal(err)
+	}
+	for _, input := range inputs {
+		if err := testHandler.TaskService.AckIssueAgentEvent(t.Context(), task.ID, input.ID, true, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := testHandler.TaskService.CompleteTask(t.Context(), task.ID, []byte(`{"comment":""}`), identity, directory, "", false, "", ""); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // runWakeupTick is one scheduler pass over this package's ready wakeups. It is
@@ -195,9 +255,7 @@ func runWakeupTick(t *testing.T) {
 	}
 }
 
-// The parent's agent is woken by an ordinary wakeup run: the platform's
-// instruction and the stage facts ride in its [WAKEUP] block, and the
-// timeline entry names the run.
+// The rule's instruction and stage facts enter the parent's persistent session.
 func TestChildDoneWakesAgentAssignee(t *testing.T) {
 	fx := newChildDoneFixture(t, "in_progress")
 	agentID := handlerTestAgentID(t)
@@ -215,8 +273,8 @@ func TestChildDoneWakesAgentAssignee(t *testing.T) {
 		}
 	}
 	entries := childDoneEntries(t, fx.parent.ID)
-	if len(entries) != 1 || entries[0].Outcome != "woke" || entries[0].TargetType != "agent" || entries[0].TargetID != agentID ||
-		entries[0].TaskID != runs[0].ID || entries[0].Stage != nil || entries[0].Total != 1 {
+	if len(entries) != 1 || entries[0].Outcome != "queued" || entries[0].TargetType != "agent" || entries[0].TargetID != agentID ||
+		entries[0].SessionID != runs[0].SessionID || entries[0].EventID != runs[0].EventID || entries[0].TaskID != "" || entries[0].Stage != nil || entries[0].Total != 1 {
 		t.Fatalf("entries = %+v", entries)
 	}
 	if n := dbfx.Count(t, `SELECT count(*) FROM comment WHERE issue_id = $1 AND author_type = 'system'`, fx.parent.ID); n != 0 {
@@ -288,11 +346,11 @@ func TestChildDoneHeldWhileParentInBacklog(t *testing.T) {
 	dbfx.Exec(t, `UPDATE issue SET status = 'todo' WHERE id = $1`, fx.parent.ID)
 	runWakeupTick(t)
 	entries := childDoneEntries(t, fx.parent.ID)
-	if len(entries) != 1 || entries[0].Outcome != "woke" {
+	if len(entries) != 1 || entries[0].Outcome != "queued" {
 		t.Fatalf("leaving backlog: entries = %+v, want one wake", entries)
 	}
 
-	dbfx.Exec(t, `UPDATE agent_task_queue SET status = 'completed', completed_at = now() WHERE issue_id = $1`, fx.parent.ID)
+	finishChildDoneSession(t, fx.parent.ID, agentID)
 	dbfx.Exec(t, `UPDATE issue SET status = 'backlog' WHERE id = $1`, fx.parent.ID)
 	runWakeupTick(t)
 	dbfx.Exec(t, `UPDATE issue SET status = 'todo' WHERE id = $1`, fx.parent.ID)
@@ -457,7 +515,7 @@ func TestChildDoneStagesThenWrapUp(t *testing.T) {
 	last := createStagedChild(t, fx.parent.ID, 2, "backlog")
 	loose := createUnstagedChild(t, fx.parent.ID, "todo")
 	completeRuns := func() {
-		dbfx.Exec(t, `UPDATE agent_task_queue SET status = 'completed', completed_at = now() WHERE issue_id = $1`, fx.parent.ID)
+		finishChildDoneSession(t, fx.parent.ID, agentID)
 	}
 
 	updateChildStatus(t, fx.child.ID, "done")
@@ -466,7 +524,7 @@ func TestChildDoneStagesThenWrapUp(t *testing.T) {
 	}
 	updateChildStatus(t, second.ID, "cancelled")
 	entries := childDoneEntries(t, fx.parent.ID)
-	if len(entries) != 1 || entries[0].Stage == nil || *entries[0].Stage != 1 || entries[0].Total != 2 || entries[0].Outcome != "woke" {
+	if len(entries) != 1 || entries[0].Stage == nil || *entries[0].Stage != 1 || entries[0].Total != 2 || entries[0].Outcome != "queued" {
 		t.Fatalf("stage 1: entries = %+v", entries)
 	}
 	runs := childDoneRuns(t, fx.parent.ID)
@@ -486,41 +544,62 @@ func TestChildDoneStagesThenWrapUp(t *testing.T) {
 	}
 }
 
-// Another run of the same agent that has not started yet reads the current
-// sub-issues when it does, so the rule hands it the stage facts when it is
-// claimed instead of queuing a second run. Claimed by a daemon that cannot
-// render them, the rule wakes the agent with its own run.
+// A child completion is another ordered input for the current consumer. Once
+// idle, the same logical session resumes its saved provider conversation.
 func TestChildDoneJoinsPendingRun(t *testing.T) {
-	for _, rendersJoined := range []bool{true, false} {
-		t.Run(fmt.Sprintf("renders joined wakeups %t", rendersJoined), func(t *testing.T) {
+	for _, busy := range []bool{false, true} {
+		t.Run(fmt.Sprintf("consumer running %t", busy), func(t *testing.T) {
 			fx := newChildDoneFixture(t, "in_progress")
 			agentID := handlerTestAgentID(t)
 			setIssueAssigneeDirect(t, fx.parent.ID, "agent", agentID)
-			waiting := dbfx.Task(t, agentID, testutil.Cols{"issue_id": fx.parent.ID, "runtime_id": testRuntimeID, "status": "queued", "originator_user_id": testUserID, "accountable_user_id": testUserID})
-
+			req := withURLParam(newRequest(http.MethodPost, "/comments", map[string]any{"content": "Existing session input"}), "id", fx.parent.ID)
+			testutil.Call(t, testHandler.CreateComment, req).Want(http.StatusCreated)
+			waiting := childDoneSessionTask(t, fx.parent.ID, agentID)
+			sessionID := uuidToString(service.IssueAgentSessionID(waiting))
+			if busy {
+				inputs := childDoneClaimSessionInput(t, waiting)
+				dbfx.Exec(t, `UPDATE agent_task_queue SET status='running',started_at=now() WHERE id=$1`, waiting.ID)
+				if err := testHandler.TaskService.PinIssueAgentSession(t.Context(), waiting.ID, "child-provider-"+sessionID, "/tmp/child-session-"+sessionID); err != nil {
+					t.Fatal(err)
+				}
+				for _, input := range inputs {
+					if err := testHandler.TaskService.AckIssueAgentEvent(t.Context(), waiting.ID, input.ID, true, ""); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
 			updateChildStatus(t, fx.child.ID, "done")
-			if entries := childDoneEntries(t, fx.parent.ID); len(entries) != 0 {
-				t.Fatalf("entries before the claim = %+v", entries)
+			inputs := childDoneRuns(t, fx.parent.ID)
+			if len(inputs) != 1 || inputs[0].ID != uuidToString(waiting.ID) || inputs[0].SessionID != sessionID || !strings.Contains(inputs[0].Note, service.ChildDoneDefaultInstruction) {
+				t.Fatalf("child completion replaced the existing consumer: %+v", inputs)
 			}
 			if got := countPendingTasksForAgent(t, fx.parent.ID, agentID); got != 1 {
-				t.Fatalf("pending runs = %d, want the existing one only", got)
+				t.Fatalf("child completion created %d concurrent consumers, want one", got)
 			}
-
-			notes := claimRun(t, waiting, rendersJoined)
-			startRun(t, waiting)
-			runWakeupTick(t)
-			entries := childDoneEntries(t, fx.parent.ID)
-			if !rendersJoined {
-				if notes != "" || len(entries) != 1 || entries[0].Outcome != "woke" || len(childDoneRuns(t, fx.parent.ID)) != 1 {
-					t.Fatalf("notes = %q entries = %+v", notes, entries)
-				}
-				return
+			finishChildDoneSession(t, fx.parent.ID, agentID)
+			updateChildStatus(t, fx.child.ID, "in_progress")
+			updateChildStatus(t, fx.child.ID, "done")
+			next := childDoneSessionTask(t, fx.parent.ID, agentID)
+			if next.ID == waiting.ID || service.IssueAgentSessionID(next) != service.IssueAgentSessionID(waiting) {
+				t.Fatalf("idle wake changed logical session: old=%s new=%s context=%s", uuidToString(waiting.ID), uuidToString(next.ID), next.Context)
 			}
-			if !strings.Contains(notes, service.ChildDoneDefaultInstruction) || !strings.Contains(notes, `"all":true`) {
-				t.Fatalf("joined notes = %q", notes)
+			dbfx.Exec(t, `UPDATE agent_task_queue SET status='dispatched',dispatched_at=clock_timestamp() WHERE id=$1`, next.ID)
+			next, err := testHandler.Queries.GetAgentTask(t.Context(), next.ID)
+			if err != nil {
+				t.Fatal(err)
 			}
-			if len(entries) != 1 || entries[0].Outcome != "merged" || entries[0].TaskID != waiting || len(childDoneRuns(t, fx.parent.ID)) != 0 {
-				t.Fatalf("entries = %+v", entries)
+			runtime, err := testHandler.Queries.GetAgentRuntime(t.Context(), next.RuntimeID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req = newOwnerDaemonRequest(http.MethodPost, "/claim", nil)
+			req.Header.Set("X-Client-Capabilities", protocol.DaemonCapabilityIssueSessionEventsV1)
+			response, _, _, _, _, failure := testHandler.buildClaimedTaskResponse(req, &next, runtime, uuidToString(next.RuntimeID), testWorkspaceID)
+			if failure != nil || response.PriorSessionID != "child-provider-"+sessionID || response.PriorWorkDir != "/tmp/child-session-"+sessionID {
+				t.Fatalf("idle wake did not restore original provider storage: response=%+v failure=%+v", response, failure)
+			}
+			if len(response.IssueSessionEvents) != 1 || response.IssueSessionEvents[0].Kind != "wakeup.fired" {
+				t.Fatalf("idle wake replayed earlier inputs: %+v", response.IssueSessionEvents)
 			}
 		})
 	}
@@ -538,21 +617,28 @@ func TestChildDoneAndConditionRuleWakeOnce(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-
 	updateChildStatus(t, fx.child.ID, "done")
-
 	if got := countPendingTasksForAgent(t, fx.parent.ID, agentID); got != 1 {
-		t.Fatalf("pending runs = %d, want 1", got)
+		t.Fatalf("two rule inputs created %d consumers, want one", got)
 	}
-	var run string
-	dbfx.QueryRow(t, `SELECT id FROM agent_task_queue WHERE issue_id = $1 AND context->>'wakeup_system' IS NULL AND context->>'wakeup_id' IS NOT NULL`, fx.parent.ID).Scan(&run)
-	if notes := claimRun(t, run, true); !strings.Contains(notes, service.ChildDoneDefaultInstruction) {
-		t.Fatalf("the person's run lacks the system rule: %q", notes)
+	task := childDoneSessionTask(t, fx.parent.ID, agentID)
+	inputs := childDoneClaimSessionInput(t, task)
+	if len(inputs) != 2 || inputs[0].Sequence >= inputs[1].Sequence {
+		t.Fatalf("independent rule instructions lost ordering: %+v", inputs)
 	}
-	startRun(t, run)
-	runWakeupTick(t)
+	var humanRule, systemRule bool
+	for _, input := range inputs {
+		if input.Kind != "wakeup.fired" {
+			t.Fatalf("unexpected input: %+v", input)
+		}
+		humanRule = humanRule || strings.Contains(string(input.Payload), "Summarize the children")
+		systemRule = systemRule || strings.Contains(string(input.Payload), service.ChildDoneDefaultInstruction)
+	}
+	if !humanRule || !systemRule {
+		t.Fatalf("one rule instruction was dropped: %+v", inputs)
+	}
 	entries := childDoneEntries(t, fx.parent.ID)
-	if len(entries) != 1 || entries[0].Outcome != "merged" || entries[0].TaskID != run {
+	if len(entries) != 1 || entries[0].Outcome != "queued" || entries[0].SessionID != uuidToString(service.IssueAgentSessionID(task)) {
 		t.Fatalf("system entries = %+v", entries)
 	}
 }
@@ -568,11 +654,12 @@ func TestChildDoneRateLimitPausesRule(t *testing.T) {
 	if len(runs) != 1 {
 		t.Fatalf("first close: runs = %+v", runs)
 	}
-	dbfx.Exec(t, `UPDATE agent_task_queue SET status = 'completed', completed_at = now() WHERE issue_id = $1`, fx.parent.ID)
-	for range 12 {
-		dbfx.Task(t, agentID, testutil.Cols{"issue_id": fx.parent.ID, "runtime_id": testRuntimeID, "status": "completed",
-			"context": fmt.Sprintf(`{"wakeup_id":%q}`, runs[0].WakeupID)})
-	}
+	finishChildDoneSession(t, fx.parent.ID, agentID)
+	// The limiter counts durable rule inputs, not per-comment execution rows.
+	dbfx.Exec(t, `INSERT INTO issue_agent_event(workspace_id,session_id,sequence,event_key,kind,source_id,source_revision,actor_type,originator_user_id,payload,status,delivered_at)
+		SELECT s.workspace_id,s.id,s.next_sequence+n,gen_random_uuid()::text,'wakeup.fired',gen_random_uuid(),1,'system',$2,e.payload,'delivered',now()
+		FROM issue_agent_session s JOIN issue_agent_event e ON e.id=$3 CROSS JOIN generate_series(1,12) n WHERE s.id=$1`, runs[0].SessionID, testUserID, runs[0].EventID)
+	dbfx.Exec(t, `UPDATE issue_agent_session SET next_sequence=next_sequence+12 WHERE id=$1`, runs[0].SessionID)
 
 	updateChildStatus(t, fx.child.ID, "in_progress")
 	updateChildStatus(t, fx.child.ID, "done")
@@ -588,11 +675,8 @@ func TestChildDoneRateLimitPausesRule(t *testing.T) {
 	}
 }
 
-// TestStageLeaderPrepareTimeoutRetryCanAdvanceNextStage covers the server half
-// of MUL-4923's recovery chain: a stage barrier wakes the squad leader, the
-// pre-start attempt fails with the daemon's timeout reason, the atomic retry
-// preserves the leader, squad and wakeup provenance, and that retry can
-// promote the parked next stage as the leader actor.
+// A pre-start failure is retried explicitly through the same event inbox. The
+// replacement execution keeps its logical session and leader authority.
 func TestStageLeaderPrepareTimeoutRetryCanAdvanceNextStage(t *testing.T) {
 	if testHandler == nil || testPool == nil {
 		t.Skip("database not available")
@@ -631,20 +715,36 @@ func TestStageLeaderPrepareTimeoutRetryCanAdvanceNextStage(t *testing.T) {
 		t.Fatalf("stage barrier wake = %+v, want a leader run naming stage 2", runs)
 	}
 	original := runs[0]
-	dbfx.Exec(t, `UPDATE agent_task_queue SET status = 'dispatched', dispatched_at = now() WHERE id = $1`, original.ID)
+	originalTask := childDoneSessionTask(t, fx.parent.ID, sq.LeaderID)
+	inputs := childDoneClaimSessionInput(t, originalTask)
+	if len(inputs) != 1 || uuidToString(inputs[0].ID) != original.EventID {
+		t.Fatalf("stage barrier inputs = %+v", inputs)
+	}
 	if _, err := testHandler.TaskService.FailTask(ctx, parseUUID(original.ID), "task preparation timed out after 5m0s", "", "", "", "timeout", false, "", ""); err != nil {
 		t.Fatalf("fail original leader task: %v", err)
 	}
-
-	var retryID, retryStatus, retrySquadID, retryWakeupID string
-	var retryLeader bool
-	var retryAttempt int32
-	dbfx.QueryRow(t, `SELECT id::text, status, is_leader_task, squad_id::text, COALESCE(context->>'wakeup_id', ''), attempt
-		FROM agent_task_queue WHERE parent_task_id = $1`, original.ID).
-		Scan(&retryID, &retryStatus, &retryLeader, &retrySquadID, &retryWakeupID, &retryAttempt)
-	if retryStatus != "queued" || retryAttempt != 2 || !retryLeader || retrySquadID != original.SquadID || retryWakeupID != original.WakeupID {
-		t.Fatalf("retry provenance = status:%q attempt:%d leader:%v squad:%q wakeup:%q; want queued attempt 2 with the original leader context",
-			retryStatus, retryAttempt, retryLeader, retrySquadID, retryWakeupID)
+	if n := dbfx.Count(t, `SELECT count(*) FROM agent_task_queue WHERE parent_task_id=$1`, original.ID); n != 0 {
+		t.Fatalf("pre-start failure silently created %d automatic retries", n)
+	}
+	if err := testHandler.TaskService.RetryIssueAgentEvent(ctx, parseUUID(original.SessionID), parseUUID(original.EventID)); err != nil {
+		t.Fatalf("explicit retry of the original stage event: %v", err)
+	}
+	retry := childDoneSessionTask(t, fx.parent.ID, sq.LeaderID)
+	retryID := uuidToString(retry.ID)
+	if retry.ID == originalTask.ID || service.IssueAgentSessionID(retry) != service.IssueAgentSessionID(originalTask) || !retry.IsLeaderTask || uuidToString(retry.SquadID) != original.SquadID || retry.ParentTaskID.Valid {
+		t.Fatalf("explicit retry changed leader/session provenance: %+v", retry)
+	}
+	inputs = childDoneClaimSessionInput(t, retry)
+	var retried struct {
+		Note string `json:"note"`
+	}
+	if len(inputs) == 1 {
+		if err := json.Unmarshal(inputs[0].Payload, &retried); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(inputs) != 1 || uuidToString(inputs[0].ID) != original.EventID || !strings.Contains(retried.Note, `"next_stage":2`) {
+		t.Fatalf("explicit retry did not retain the original stage input: %+v", inputs)
 	}
 	dbfx.Exec(t, `UPDATE agent_task_queue SET status = 'running', dispatched_at = now(), started_at = now() WHERE id = $1`, retryID)
 
@@ -654,6 +754,7 @@ func TestStageLeaderPrepareTimeoutRetryCanAdvanceNextStage(t *testing.T) {
 	req = newRequest("PUT", "/api/issues/"+stage2.ID, map[string]any{"status": "todo"})
 	req.Header.Set("X-Agent-ID", sq.LeaderID)
 	req.Header.Set("X-Task-ID", retryID)
+	req.Header.Set("X-Actor-Source", "task_token")
 	req = withURLParam(req, "id", stage2.ID)
 	testHandler.UpdateIssue(w, req)
 	if w.Code != http.StatusOK {

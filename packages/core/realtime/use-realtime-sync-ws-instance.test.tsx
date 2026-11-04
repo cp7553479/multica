@@ -101,6 +101,15 @@ describe("useRealtimeSync — ws instance change", () => {
     expect(invalidateSpy).not.toHaveBeenCalled();
   });
 
+  it("leaves delivery hints to the scoped issue query instead of refreshing the workspace", async () => {
+    const ws = createMockWs();
+    renderHook(() => useRealtimeSync(ws, stores), { wrapper: createWrapper(qc) });
+    const onAny = vi.mocked(ws.onAny).mock.calls[0]![0];
+    onAny({ type: "issue:agent_delivery_updated", payload: { issue_id: "issue-1" } });
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    expect(invalidateSpy).not.toHaveBeenCalled();
+  });
+
   it("does not invalidate when ws goes from instance to null", () => {
     const ws1 = createMockWs();
     const { rerender } = renderHook(

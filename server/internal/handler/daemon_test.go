@@ -2528,19 +2528,12 @@ func TestClaimTaskByRuntime_TaskWorkspaceMismatch_CancelsAndRejects(t *testing.T
 	}
 }
 
-// Regression test for MUL-1198: comment-triggered tasks that finish without
-// the agent posting any comment must still deliver a synthesized result
-// comment, threaded under the trigger. Before the fix, CompleteTask exempted
-// comment-triggered tasks from the auto-synthesis path, so a Claude Code /
-// Codex / etc. agent that ended its run with only terminal text (no
-// `multica issue comment add` call) left the user staring at a "Completed"
-// badge with no reply.
-func TestCompleteTask_CommentTriggered_SynthesizesCommentWhenAgentSilent(t *testing.T) {
+// Final provider output belongs to the run transcript. Publication requires
+// an explicit comment tool call, even for historical comment-triggered tasks.
+func TestCompleteTask_CommentTriggeredKeepsFinalOutputInTranscript(t *testing.T) {
 	if testHandler == nil {
 		t.Skip("database not available")
 	}
-
-	ctx := context.Background()
 
 	var agentID, runtimeID string
 	dbfx.QueryRow(t, `
@@ -2583,48 +2576,20 @@ func TestCompleteTask_CommentTriggered_SynthesizesCommentWhenAgentSilent(t *test
 		t.Fatalf("CompleteTask: expected 200, got %d: %s", w.Code, w.Body.String())
 	}
 
-	// Exactly one agent comment on the issue, threaded under the trigger,
-	// carrying the agent's final output.
-	rows, err := testPool.Query(ctx, `
-		SELECT content, parent_id FROM comment
-		WHERE issue_id = $1 AND author_type = 'agent' AND author_id = $2
-		ORDER BY created_at ASC
-	`, issueID, agentID)
-	if err != nil {
-		t.Fatalf("query synthesized comments: %v", err)
+	if n := countAgentCommentsForIssue(t, issueID, agentID); n != 0 {
+		t.Fatalf("completion published an implicit comment: %d", n)
 	}
-	defer rows.Close()
+	var storedOutput string
+	dbfx.QueryRow(t, "SELECT result->>'output' FROM agent_task_queue WHERE id=$1", taskID).Scan(&storedOutput)
+	if storedOutput != agentFinalOutput {
+		t.Fatalf("transcript output = %q, want %q", storedOutput, agentFinalOutput)
+	}
 
-	var (
-		content  string
-		parentID *string
-		seen     int
-	)
-	for rows.Next() {
-		if err := rows.Scan(&content, &parentID); err != nil {
-			t.Fatalf("scan comment: %v", err)
-		}
-		seen++
-	}
-	if seen != 1 {
-		t.Fatalf("expected exactly 1 synthesized agent comment, got %d", seen)
-	}
-	if content != agentFinalOutput {
-		t.Fatalf("synthesized comment content = %q, want %q", content, agentFinalOutput)
-	}
-	if parentID == nil || *parentID != triggerCommentID {
-		got := "<nil>"
-		if parentID != nil {
-			got = *parentID
-		}
-		t.Fatalf("synthesized comment parent_id = %s, want trigger comment %s", got, triggerCommentID)
-	}
 }
 
-// Companion to the above: when the agent DID post its own comment during the
-// run, CompleteTask must not synthesize a duplicate. Guards against the
-// common case where the fix is over-eager and creates two comments per task.
-func TestCompleteTask_CommentTriggered_SkipsSynthesisWhenAgentAlreadyCommented(t *testing.T) {
+// An explicitly published comment remains the only timeline output when
+// the provider later returns its final text.
+func TestCompleteTask_CommentTriggeredPreservesOnlyExplicitComment(t *testing.T) {
 	if testHandler == nil {
 		t.Skip("database not available")
 	}
@@ -2649,7 +2614,7 @@ func TestCompleteTask_CommentTriggered_SkipsSynthesisWhenAgentAlreadyCommented(t
 		"started_at":         testutil.Raw("now()"),
 	})
 
-	// Agent posts its own reply during the run — exactly the compliant path.
+	// The agent explicitly chooses to reply under this comment.
 	dbfx.Exec(t, `
 		INSERT INTO comment (issue_id, workspace_id, author_type, author_id, content, type, parent_id)
 		VALUES ($1, $2, 'agent', $3, 'done, see PR', 'comment', $4)
@@ -2674,11 +2639,11 @@ func TestCompleteTask_CommentTriggered_SkipsSynthesisWhenAgentAlreadyCommented(t
 		WHERE issue_id = $1 AND author_type = 'agent' AND author_id = $2
 	`, issueID, agentID).Scan(&count)
 	if count != 1 {
-		t.Fatalf("expected 1 agent comment (the agent's own reply), got %d — synthesis duplicated", count)
+		t.Fatalf("expected 1 agent comment (the agent's own reply), got %d after completion", count)
 	}
 }
 
-func TestCompleteTask_CommentTriggered_SuppressesTrivialDoneOutput(t *testing.T) {
+func TestCompleteTask_CommentTriggeredKeepsShortOutputInTranscript(t *testing.T) {
 	if testHandler == nil {
 		t.Skip("database not available")
 	}
@@ -2722,11 +2687,11 @@ func TestCompleteTask_CommentTriggered_SuppressesTrivialDoneOutput(t *testing.T)
 		WHERE issue_id = $1 AND author_type = 'agent' AND author_id = $2
 	`, issueID, agentID).Scan(&count)
 	if count != 0 {
-		t.Fatalf("expected no synthesized agent comment for trivial Done output, got %d", count)
+		t.Fatalf("completion must not publish short terminal output, got %d", count)
 	}
 }
 
-func TestCompleteTask_AssignmentTriggered_DoesNotSuppressTrivialDoneOutput(t *testing.T) {
+func TestCompleteTask_AssignmentTriggeredKeepsShortOutputInTranscript(t *testing.T) {
 	if testHandler == nil {
 		t.Skip("database not available")
 	}
@@ -2761,15 +2726,15 @@ func TestCompleteTask_AssignmentTriggered_DoesNotSuppressTrivialDoneOutput(t *te
 		t.Fatalf("CompleteTask: expected 200, got %d: %s", w.Code, w.Body.String())
 	}
 
-	var content string
-	dbfx.QueryRow(t, `
-		SELECT content FROM comment
-		WHERE issue_id = $1 AND author_type = 'agent' AND author_id = $2
-		ORDER BY created_at DESC LIMIT 1
-	`, issueID, agentID).Scan(&content)
-	if content != "Done." {
-		t.Fatalf("synthesized comment content = %q, want Done.", content)
+	if n := countAgentCommentsForIssue(t, issueID, agentID); n != 0 {
+		t.Fatalf("completion published an implicit comment: %d", n)
 	}
+	var storedOutput string
+	dbfx.QueryRow(t, "SELECT result->>'output' FROM agent_task_queue WHERE id=$1", taskID).Scan(&storedOutput)
+	if storedOutput != "Done." {
+		t.Fatalf("transcript output = %q, want Done.", storedOutput)
+	}
+
 }
 
 func TestClaimResponseAgentIdentityMatches(t *testing.T) {

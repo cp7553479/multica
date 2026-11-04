@@ -3,7 +3,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { api } from "@multica/core/api";
 import { issueKeys } from "@multica/core/issues/queries";
-import type { AgentTask, Comment, TimelineEntry } from "@multica/core/types";
+import type { AgentTask, TimelineEntry } from "@multica/core/types";
 import { renderWithI18n } from "../../test/i18n";
 import { formatAgentNames, SteerBadge, SteerReceipts } from "./steer-receipts";
 
@@ -12,9 +12,6 @@ vi.mock("@multica/core/api", () => ({ api: {
   previewCommentTriggers: vi.fn(),
 } }));
 
-function recipients(...ids: string[]) {
-  return { agents: ids.map((id) => ({ id, name: id, source: "mention_agent", reason: "" })) };
-}
 vi.mock("@multica/core/hooks", () => ({ useWorkspaceId: () => "workspace" }));
 vi.mock("@multica/core/workspace/hooks", () => ({
   useActorName: () => ({ getActorName: (_type: string, id: string) => (id === "orion" ? "Orion" : "Lambda") }),
@@ -73,9 +70,7 @@ describe("SteerReceipts", () => {
     expect(screen.getByText("Read by Orion")).toBeInTheDocument();
   });
 
-  it("settles a pending receipt when its run ends first and offers a new run instead", async () => {
-    vi.mocked(api.createComment).mockResolvedValue({ id: "resent" } as Comment);
-    vi.mocked(api.previewCommentTriggers).mockResolvedValue(recipients("lambda"));
+  it("shows a delivery failure when its run ends without offering a new run", async () => {
     const client = render(<SteerReceipts issueId="issue" entry={entry({
       supplement_task_id: turn, supplement_status: "pending",
     })} />);
@@ -83,27 +78,8 @@ describe("SteerReceipts", () => {
     act(() => client.setQueryData(issueKeys.tasks("issue"), [task({ status: "completed" })]));
     await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("Lambda didn't get it · the run ended before delivery"));
     expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Send as a new run" }));
-    await waitFor(() => expect(api.createComment).toHaveBeenCalledWith(
-      "issue", "Only fix web.", undefined, "thread", undefined, undefined, undefined,
-    ));
-    await waitFor(() => expect(screen.queryByRole("button", { name: "Send as a new run" })).not.toBeInTheDocument());
-  });
-
-  it("resends a failed receipt only to its own agent", async () => {
-    vi.mocked(api.createComment).mockResolvedValue({ id: "resent" } as Comment);
-    vi.mocked(api.previewCommentTriggers).mockResolvedValue(recipients("lambda", "orion"));
-    render(<SteerReceipts issueId="issue" entry={entry({
-      content: "[@Lambda](mention://agent/lambda) fix web; [@Orion](mention://agent/orion) check desktop",
-      supplements: [
-        { task_id: turn, agent_id: "lambda", status: "failed", failure_reason: "turn_ended" },
-        { task_id: "other-turn", agent_id: "orion", status: "delivered" },
-      ],
-    })} />, [task({ status: "completed" }), task({ id: "other-turn", agent_id: "orion", status: "completed" })]);
-    fireEvent.click(screen.getByRole("button", { name: "Send as a new run" }));
-    await waitFor(() => expect(api.createComment).toHaveBeenCalled());
-    const suppressed = vi.mocked(api.createComment).mock.calls[0]![5];
-    expect(suppressed).toEqual(["orion"]);
+    expect(screen.queryByRole("button", { name: "Send as a new run" })).not.toBeInTheDocument();
+    expect(api.createComment).not.toHaveBeenCalled();
   });
 
   it("retries a stable delivery failure into the same running turn", async () => {

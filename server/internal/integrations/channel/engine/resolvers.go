@@ -479,7 +479,7 @@ type TaskEnqueuer interface {
 	EnqueuePreparedChannelChatTaskInTx(ctx context.Context, tx pgx.Tx, session db.ChatSession, initiatorUserID pgtype.UUID, forceFreshSession bool, contextRevision int64, prepared service.PreparedChatTaskEnqueue) (db.AgentTaskQueue, error)
 	FinalizeChatTaskEnqueue(ctx context.Context, task db.AgentTaskQueue)
 	PromoteChannelChatTasksIfMediaReady(ctx context.Context, sessionID pgtype.UUID) error
-	PromoteDeferredChannelIssueTask(ctx context.Context, taskID pgtype.UUID) error
+	ReleaseIssueAgentSession(ctx context.Context, sessionID pgtype.UUID) error
 	// MemberMayInvokeAgent applies the invocation policy by agent id: the
 	// Router has the installation's agent id, not the loaded row.
 	//

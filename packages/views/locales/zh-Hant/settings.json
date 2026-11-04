@@ -185,12 +185,6 @@
     "sticky_comment_bar": {
       "title": "固定底部評論欄"
     },
-    "running_agent_reply": {
-      "title": "回覆正在執行的 AI 代理時",
-      "steer": "插話到當前執行",
-      "after_run": "本輪結束後開始",
-      "hint": "只決定預設選項，每條訊息傳送前仍可單獨修改。"
-    },
     "comments_title": "評論與聊天",
     "region_title": "語言與地區",
     "appearance_title": "外觀",

@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"sync"
@@ -76,79 +77,161 @@ func wakeSetStatus(t *testing.T, f principalFixture, issue pgtype.UUID, status s
 	return cancelled
 }
 
+// wakeupInbox reads the durable inputs transferred by this rule. Receipt
+// consumption is independent of provider delivery.
+func wakeupInbox(t *testing.T, f principalFixture, id pgtype.UUID) []db.IssueAgentEvent {
+	t.Helper()
+	rows, err := f.Pool.Query(context.Background(), "SELECT id FROM issue_agent_event WHERE kind='wakeup.fired' AND payload->>'wakeup_id'=$1 ORDER BY sequence", util.UUIDToString(id))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ids []pgtype.UUID
+	for rows.Next() {
+		var id pgtype.UUID
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []db.IssueAgentEvent
+	for _, id := range ids {
+		e, err := f.q.GetIssueAgentEvent(context.Background(), id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, e)
+	}
+	return out
+}
+func wakeupTargetSession(t *testing.T, f principalFixture, issue pgtype.UUID, agent string) db.IssueAgentSession {
+	t.Helper()
+	s, err := f.q.GetIssueAgentSessionForPair(context.Background(), db.GetIssueAgentSessionForPairParams{WorkspaceID: parseTestUUID(t, f.WorkspaceID), IssueID: issue, AgentID: parseTestUUID(t, agent)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+func wakeupSessionTask(t *testing.T, f principalFixture, issue pgtype.UUID, agent string) db.AgentTaskQueue {
+	t.Helper()
+	session := wakeupTargetSession(t, f, issue, agent)
+	if !session.ActiveTaskID.Valid {
+		t.Fatalf("session has no active execution: %+v", session)
+	}
+	task, err := f.q.GetAgentTask(context.Background(), session.ActiveTaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !IsIssueAgentSessionTask(task) || task.HandoffNote.Valid || task.TriggerCommentID.Valid || task.CommentThreadID.Valid {
+		t.Fatalf("rule created a legacy execution: %+v", task)
+	}
+	var carrier map[string]json.RawMessage
+	if err := json.Unmarshal(task.Context, &carrier); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := carrier["wakeup_id"]; ok {
+		t.Fatalf("rule id leaked into scheduling context: %s", task.Context)
+	}
+	return task
+}
+func wakeupClaimEvents(t *testing.T, f principalFixture, s *IssueWakeupService, task db.AgentTaskQueue, limit int32) []db.IssueAgentEvent {
+	t.Helper()
+	if task.Status == "queued" {
+		f.Exec(t, "UPDATE agent_task_queue SET status='dispatched',dispatched_at=clock_timestamp() WHERE id=$1", task.ID)
+	}
+	events, err := s.Tasks.ClaimIssueAgentEvents(context.Background(), task.ID, limit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return events
+}
+func wakeupAckEvents(t *testing.T, s *IssueWakeupService, task db.AgentTaskQueue, events []db.IssueAgentEvent) {
+	t.Helper()
+	for _, e := range events {
+		if err := s.Tasks.AckIssueAgentEvent(context.Background(), task.ID, e.ID, true, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+func wakeupFinishExecution(t *testing.T, f principalFixture, s *IssueWakeupService, task db.AgentTaskQueue, status string) {
+	t.Helper()
+	f.Exec(t, "UPDATE agent_task_queue SET status=$2,completed_at=now(),session_id='provider-wakeup-session',work_dir='/tmp/wakeup-session' WHERE id=$1", task.ID, status)
+	ended, err := f.q.GetAgentTask(context.Background(), task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = s.Tasks.runInTx(context.Background(), func(q *db.Queries) error { return SettleTerminalTaskState(context.Background(), q, ended) }); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestIssueWakeupEventAtomicOnceAndIndependentInputs(t *testing.T) {
 	f, s, issue, agent := wakeFixture(t)
 	ctx := context.Background()
 	w := wakeCreate(t, f, s, issue, WakeupInput{AgentID: agent, Kind: "event", EventTypes: []string{"comment.created"}, Instruction: "Review latest changes"})
-	// A source rollback cannot leave a notification behind.
-	tx, e := f.Pool.Begin(ctx)
-	if e != nil {
-		t.Fatal(e)
+	tx, err := f.Pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
 	}
-	_, e = tx.Exec(ctx, "INSERT INTO comment(issue_id,workspace_id,author_type,author_id,content,type) VALUES($1,$2,'member',$3,'rollback','comment')", issue, f.WorkspaceID, f.UserID)
-	if e != nil {
-		t.Fatal(e)
+	if _, err = tx.Exec(ctx, "INSERT INTO comment(issue_id,workspace_id,author_type,author_id,content,type) VALUES($1,$2,'member',$3,'rollback','comment')", issue, f.WorkspaceID, f.UserID); err != nil {
+		t.Fatal(err)
 	}
-	_ = tx.Rollback(ctx)
+	if err = tx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
 	if n := f.Count(t, "SELECT count(*) FROM issue_wakeup_receipt WHERE wakeup_id=$1", w.ID); n != 0 {
 		t.Fatalf("rollback left %d receipts", n)
 	}
 	comment := f.Comment(t, util.UUIDToString(issue), "source")
-	// The agent's assignment run, which runs as the rule's creator, is still
-	// waiting to start: the wakeup keeps its input for it instead of queuing a
-	// second run behind it, and hands it over when the run is claimed.
-	ordinary := wakeWaitingRun(t, f, issue, agent, f.UserID)
 	wakeDispatch(t, s, w)
 	wakeDispatch(t, s, w)
-	if n := wakeRuns(t, f, w.ID); n != 0 {
-		t.Fatalf("the wakeup queued %d runs of its own", n)
+	events := wakeupInbox(t, f, w.ID)
+	if len(events) != 1 || events[0].Status != "pending" || events[0].DeliveryTaskID.Valid {
+		t.Fatalf("once transfer = %+v, want one undelivered inbox input", events)
 	}
-	got, e := f.q.GetIssueWakeup(ctx, db.GetIssueWakeupParams{ID: w.ID, WorkspaceID: w.WorkspaceID})
-	if e != nil {
-		t.Fatal(e)
+	if !strings.Contains(string(events[0].Payload), comment) || !strings.Contains(string(events[0].Payload), "Review latest changes") {
+		t.Fatalf("lost source or instruction: %s", events[0].Payload)
 	}
-	if !got.Enabled || got.LastTaskID.Valid {
-		t.Fatalf("the once rule was used up before its input was handed over: %+v", got)
+	if n := f.Count(t, "SELECT count(*) FROM issue_wakeup_receipt WHERE wakeup_id=$1 AND processed_at IS NOT NULL AND task_id IS NULL", w.ID); n != 1 {
+		t.Fatalf("durably transferred receipts = %d, want 1", n)
 	}
-	if notes := wakeClaim(t, f, s, ordinary); !strings.Contains(notes, comment) || !strings.Contains(notes, "Review latest changes") {
-		t.Fatalf("the claimed run lacks the joined input: %q", notes)
+	got, err := f.q.GetIssueWakeup(ctx, db.GetIssueWakeupParams{ID: w.ID, WorkspaceID: w.WorkspaceID})
+	if err != nil {
+		t.Fatal(err)
 	}
-	// The input is the run's once it starts; until then the rule keeps it.
-	wakeDispatch(t, s, w)
-	if got, e = f.q.GetIssueWakeup(ctx, db.GetIssueWakeupParams{ID: w.ID, WorkspaceID: w.WorkspaceID}); e != nil || !got.Enabled || got.FireCount != 0 {
-		t.Fatalf("before the run started: %+v %v", got, e)
+	if got.Enabled || got.FireCount != 1 {
+		t.Fatalf("once rule did not settle after durable transfer: %+v", got)
 	}
-	wakeStart(t, f, ordinary)
-	wakeDispatch(t, s, w)
-	got, e = f.q.GetIssueWakeup(ctx, db.GetIssueWakeupParams{ID: w.ID, WorkspaceID: w.WorkspaceID})
-	if e != nil {
-		t.Fatal(e)
+	task := wakeupSessionTask(t, f, issue, agent)
+	if task.OriginatorUserID != parseTestUUID(t, f.UserID) {
+		t.Fatal("execution lost the rule creator")
 	}
-	if got.Enabled || util.UUIDToString(got.LastTaskID) != ordinary || got.FireCount != 1 {
-		t.Fatalf("after the run started: enabled=%t last_task=%s fire_count=%d", got.Enabled, util.UUIDToString(got.LastTaskID), got.FireCount)
-	}
-	if n := wakeRuns(t, f, w.ID); n != 0 {
-		t.Fatalf("the wakeup also queued %d runs of its own", n)
+	if n := f.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id=$1", issue); n != 1 {
+		t.Fatalf("duplicate dispatch created %d executions", n)
 	}
 }
 
-// Without a run waiting to start, the wakeup starts its own run under the
-// rule creator's authority.
 func TestIssueWakeupStartsItsOwnRunWhenNothingWaits(t *testing.T) {
 	f, s, issue, agent := wakeFixture(t)
 	w := wakeCreate(t, f, s, issue, WakeupInput{AgentID: agent, Kind: "event", EventTypes: []string{"comment.created"}, Instruction: "Review latest changes"})
-	comment := f.Comment(t, util.UUIDToString(issue), "source")
+	f.Comment(t, util.UUIDToString(issue), "source")
 	wakeDispatch(t, s, w)
-	got, err := f.q.GetIssueWakeup(context.Background(), db.GetIssueWakeupParams{ID: w.ID, WorkspaceID: w.WorkspaceID})
-	if err != nil {
-		t.Fatal(err)
+	task := wakeupSessionTask(t, f, issue, agent)
+	if task.OriginatorUserID != parseTestUUID(t, f.UserID) || task.WorkflowStep.Valid {
+		t.Fatalf("explicit auxiliary execution has wrong principal or workflow ownership: %+v", task)
 	}
-	task, err := f.q.GetAgentTask(context.Background(), got.LastTaskID)
-	if err != nil {
-		t.Fatal(err)
+	events := wakeupClaimEvents(t, f, s, task, 32)
+	if len(events) != 1 || events[0].Kind != "wakeup.fired" {
+		t.Fatalf("session claim = %+v", events)
 	}
-	if !strings.Contains(task.HandoffNote.String, comment) || task.OriginatorUserID != parseTestUUID(t, f.UserID) {
-		t.Fatal("missing input or principal")
+	wakeupAckEvents(t, s, task, events)
+	if got := wakeupInbox(t, f, w.ID); len(got) != 1 || got[0].Status != "delivered" {
+		t.Fatalf("provider delivery was not recorded separately: %+v", got)
 	}
 }
 
@@ -173,38 +256,52 @@ func TestIssueWakeupContinuousSelfLoopAndClose(t *testing.T) {
 	w := wakeCreate(t, f, s, issue, WakeupInput{AgentID: agent, Kind: "event", Mode: "continuous", EventTypes: []string{"comment.created", "task.completed"}, Instruction: "check"})
 	f.Comment(t, util.UUIDToString(issue), "one")
 	wakeDispatch(t, s, w)
-	got, _ := f.q.GetIssueWakeup(ctx, db.GetIssueWakeupParams{ID: w.ID, WorkspaceID: w.WorkspaceID})
-	first := got.LastTaskID
-	f.Exec(t, "UPDATE agent_task_queue SET status='running',started_at=now() WHERE id=$1", first)
-	f.Comment(t, util.UUIDToString(issue), "self", testutil.Cols{"author_type": "agent", "author_id": agent, "source_task_id": first})
+	first := wakeupSessionTask(t, f, issue, agent)
+	delivered := wakeupClaimEvents(t, f, s, first, 32)
+	wakeupAckEvents(t, s, first, delivered)
+	wakeStart(t, f, util.UUIDToString(first.ID))
+	f.Comment(t, util.UUIDToString(issue), "self", testutil.Cols{"author_type": "agent", "author_id": agent, "source_task_id": first.ID})
+	wakeDispatch(t, s, w)
+	if events := wakeupInbox(t, f, w.ID); len(events) != 1 {
+		t.Fatalf("self comment produced another session input: %+v", events)
+	}
 	if n := f.Count(t, "SELECT count(*) FROM issue_wakeup_receipt WHERE wakeup_id=$1 AND processed_at IS NULL", w.ID); n != 0 {
-		t.Fatal("self comment reawakened")
+		t.Fatal("self comment remained eligible for another dispatch")
 	}
 	f.Comment(t, util.UUIDToString(issue), "two")
 	wakeDispatch(t, s, w)
 	f.Comment(t, util.UUIDToString(issue), "three")
 	wakeDispatch(t, s, w)
-	if n := f.Count(t, "SELECT count(*) FROM agent_task_queue WHERE context->>'wakeup_id'=$1 AND status='queued'", util.UUIDToString(w.ID)); n != 1 {
-		t.Fatalf("pending backlog: %d", n)
+	if task := wakeupSessionTask(t, f, issue, agent); task.ID != first.ID {
+		t.Fatal("busy inbox created a second execution")
+	}
+	if events := wakeupInbox(t, f, w.ID); len(events) != 3 || events[1].Status != "pending" || events[2].Status != "pending" {
+		t.Fatalf("busy inbox inputs = %+v", events)
 	}
 	f.Insert(t, "issue_status", testutil.Cols{"workspace_id": f.WorkspaceID, "key": "finished", "name": "Finished", "category": "done", "color": "#000000"})
-	cancelled := wakeSetStatus(t, f, issue, "finished")
-	got, _ = f.q.GetIssueWakeup(ctx, db.GetIssueWakeupParams{ID: w.ID, WorkspaceID: w.WorkspaceID})
+	if cancelled := wakeSetStatus(t, f, issue, "finished"); len(cancelled) != 0 {
+		t.Fatalf("close cancelled the session execution: %+v", cancelled)
+	}
+	got, err := f.q.GetIssueWakeup(ctx, db.GetIssueWakeupParams{ID: w.ID, WorkspaceID: w.WorkspaceID})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if got.Enabled || !got.DisabledAt.Valid {
 		t.Fatal("custom end state did not disable")
 	}
-	if len(cancelled) != 1 || cancelled[0].Status != "cancelled" || cancelled[0].ID == first {
-		t.Fatalf("close did not withdraw only the unstarted run: %+v", cancelled)
+	events := wakeupInbox(t, f, w.ID)
+	if events[0].Status != "delivered" || events[1].Status != "ignored" || events[2].Status != "ignored" {
+		t.Fatalf("close did not withdraw only undelivered rule inputs: %+v", events)
 	}
-	task, _ := f.q.GetAgentTask(ctx, first)
-	if task.Status != "running" {
-		t.Fatal("close stopped active run")
+	task, err := f.q.GetAgentTask(ctx, first.ID)
+	if err != nil || task.Status != "running" {
+		t.Fatalf("close stopped active execution: %+v %v", task, err)
 	}
-	if cancelled = wakeSetStatus(t, f, issue, "todo"); len(cancelled) != 0 {
-		t.Fatal("reopen cancelled runs")
+	if cancelled := wakeSetStatus(t, f, issue, "todo"); len(cancelled) != 0 {
+		t.Fatal("reopen cancelled executions")
 	}
-	got, _ = f.q.GetIssueWakeup(ctx, db.GetIssueWakeupParams{ID: w.ID, WorkspaceID: w.WorkspaceID})
-	if got.Enabled {
+	got, err = f.q.GetIssueWakeup(ctx, db.GetIssueWakeupParams{ID: w.ID, WorkspaceID: w.WorkspaceID})
+	if err != nil || got.Enabled {
 		t.Fatal("reopen enabled old subscription")
 	}
 }
@@ -229,26 +326,38 @@ func TestIssueWakeupTimeRecoveryUpdateAndRevocation(t *testing.T) {
 			f.Exec(t, "UPDATE agent_runtime SET status='offline' WHERE id=(SELECT runtime_id FROM agent WHERE id=$1)", agent)
 			wakeDispatch(t, s, w)
 			wakeDispatch(t, s, w)
-			if n := f.Count(t, "SELECT count(*) FROM agent_task_queue WHERE context->>'wakeup_id'=$1", util.UUIDToString(w.ID)); n != 1 {
-				t.Fatalf("offline catchup creates %d runs", n)
+			events := wakeupInbox(t, f, w.ID)
+			if len(events) != 1 || events[0].Status != "pending" {
+				t.Fatalf("offline catchup inputs = %+v", events)
 			}
-			// Replacing the configuration withdraws the old queued input.
-			updated, e := s.Save(ctx, issue, parseTestUUID(t, f.UserID), pgtype.UUID{}, w.ID, in)
-			if e != nil {
-				t.Fatal(e)
+			task := wakeupSessionTask(t, f, issue, agent)
+			updated, err := s.Save(ctx, issue, parseTestUUID(t, f.UserID), pgtype.UUID{}, w.ID, in)
+			if err != nil {
+				t.Fatal(err)
 			}
 			if updated.Revision != 2 {
 				t.Fatal("revision missing")
 			}
-			if n := f.Count(t, "SELECT count(*) FROM agent_task_queue WHERE context->>'wakeup_id'=$1 AND status='queued'", util.UUIDToString(w.ID)); n != 0 {
-				t.Fatal("stale revision still queued")
+			events = wakeupInbox(t, f, w.ID)
+			if events[0].Status != "ignored" {
+				t.Fatalf("stale revision still deliverable: %+v", events)
+			}
+			current, err := f.q.GetAgentTask(ctx, task.ID)
+			if err != nil || current.Status != "cancelled" {
+				t.Fatalf("configuration edit retained an execution with no remaining input: %+v %v", current, err)
+			}
+			if session := wakeupTargetSession(t, f, issue, agent); session.ActiveTaskID.Valid {
+				t.Fatalf("configuration edit retained the cancelled consumer: %+v", session)
 			}
 			f.Exec(t, "UPDATE issue_wakeup SET next_fire_at=now()-interval '1 second' WHERE id=$1", w.ID)
 			f.Exec(t, "DELETE FROM member WHERE user_id=$1 AND workspace_id=$2", f.UserID, f.WorkspaceID)
 			wakeDispatch(t, s, updated)
-			got, _ := f.q.GetIssueWakeup(ctx, db.GetIssueWakeupParams{ID: w.ID, WorkspaceID: w.WorkspaceID})
-			if got.Enabled || !got.LastError.Valid {
-				t.Fatal("permission revoked but still enabled")
+			got, err := f.q.GetIssueWakeup(ctx, db.GetIssueWakeupParams{ID: w.ID, WorkspaceID: w.WorkspaceID})
+			if err != nil || got.Enabled || !got.LastError.Valid {
+				t.Fatalf("permission revoked but still enabled: %+v %v", got, err)
+			}
+			if len(wakeupInbox(t, f, w.ID)) != 1 {
+				t.Fatal("revoked creator transferred another input")
 			}
 		})
 	}
@@ -269,21 +378,34 @@ func TestIssueWakeupStatusSourceAndClaimAuthority(t *testing.T) {
 	w := wakeCreate(t, f, s, issue, WakeupInput{AgentID: agent, Kind: "event", Mode: "continuous", EventTypes: []string{"issue.status_changed"}, Instruction: "check state"})
 	f.Exec(t, "UPDATE issue SET status='in_progress',revision=revision+1 WHERE id=$1", issue)
 	wakeDispatch(t, s, w)
-	got, _ := f.q.GetIssueWakeup(ctx, db.GetIssueWakeupParams{ID: w.ID, WorkspaceID: w.WorkspaceID})
-	_, err := f.q.UpdateIssue(ctx, db.UpdateIssueParams{ID: issue, Status: pgtype.Text{String: "in_review", Valid: true}, SourceTaskID: got.LastTaskID})
-	if err != nil {
+	task := wakeupSessionTask(t, f, issue, agent)
+	claimed := wakeupClaimEvents(t, f, s, task, 32)
+	if len(claimed) != 1 {
+		t.Fatalf("authorized creator could not claim: %+v", claimed)
+	}
+	wakeupAckEvents(t, s, task, claimed)
+	wakeStart(t, f, util.UUIDToString(task.ID))
+	if _, err := f.q.UpdateIssue(ctx, db.UpdateIssueParams{ID: issue, Status: pgtype.Text{String: "in_review", Valid: true}, SourceTaskID: task.ID}); err != nil {
 		t.Fatal(err)
+	}
+	wakeDispatch(t, s, w)
+	if events := wakeupInbox(t, f, w.ID); len(events) != 1 {
+		t.Fatalf("self status update produced another session input: %+v", events)
 	}
 	if n := f.Count(t, "SELECT count(*) FROM issue_wakeup_receipt WHERE wakeup_id=$1 AND processed_at IS NULL", w.ID); n != 0 {
-		t.Fatal("self status update created a loop")
+		t.Fatal("self status input remained eligible for another dispatch")
 	}
-	task, _ := f.q.GetAgentTask(ctx, got.LastTaskID)
-	if err = s.CheckClaim(ctx, task); err != nil {
-		t.Fatal(err)
+	f.Exec(t, "UPDATE issue SET status='todo',revision=revision+1 WHERE id=$1", issue)
+	wakeDispatch(t, s, w)
+	if len(wakeupInbox(t, f, w.ID)) != 2 {
+		t.Fatal("missing independent status input")
 	}
 	f.Exec(t, "DELETE FROM member WHERE user_id=$1 AND workspace_id=$2", f.UserID, f.WorkspaceID)
-	if !errors.Is(s.CheckClaim(ctx, task), ErrWakeupForbidden) {
-		t.Fatal("revoked member still claimable")
+	if events := wakeupClaimEvents(t, f, s, task, 32); len(events) != 0 {
+		t.Fatalf("revoked creator's event reached provider: %+v", events)
+	}
+	if events := wakeupInbox(t, f, w.ID); events[1].Status != "ignored" || events[1].FailureReason.String != "invocation_not_allowed" {
+		t.Fatalf("revoked event not visibly refused: %+v", events)
 	}
 }
 
@@ -294,20 +416,38 @@ func TestIssueWakeupRetryKeepsPromptAndSchedulingScope(t *testing.T) {
 	w := wakeCreate(t, f, s, issue, WakeupInput{AgentID: agent, Kind: "at", AfterSeconds: 1, ParentCommentID: parent, Instruction: "specific wakeup instruction"})
 	f.Exec(t, "UPDATE issue_wakeup SET next_fire_at=now()-interval '1 second' WHERE id=$1", w.ID)
 	wakeDispatch(t, s, w)
-	got, _ := f.q.GetIssueWakeup(ctx, db.GetIssueWakeupParams{ID: w.ID, WorkspaceID: w.WorkspaceID})
-	task, _ := f.q.GetAgentTask(ctx, got.LastTaskID)
-	if task.CommentThreadID != w.ID || util.UUIDToString(task.TriggerCommentID) != parent {
-		t.Fatal("delivery thread and scheduling scope confused")
+	session := wakeupTargetSession(t, f, issue, agent)
+	task := wakeupSessionTask(t, f, issue, agent)
+	batch := wakeupClaimEvents(t, f, s, task, 1)
+	if len(batch) != 1 {
+		t.Fatalf("claim = %+v", batch)
 	}
-	f.Exec(t, "UPDATE agent_task_queue SET status='failed',completed_at=now() WHERE id=$1", task.ID)
-	child, err := f.q.CreateRetryTask(ctx, db.CreateRetryTaskParams{ID: task.ID})
-	if err != nil {
+	if err := s.Tasks.AckIssueAgentEvent(ctx, task.ID, batch[0].ID, false, "provider_rejected"); err != nil {
 		t.Fatal(err)
 	}
-	if child.HandoffNote != task.HandoffNote || child.CommentThreadID != w.ID {
-		t.Fatal("retry lost wakeup prompt or scope")
+	wakeupFinishExecution(t, f, s, task, "failed")
+	if err := s.Tasks.RetryIssueAgentEvent(ctx, session.ID, batch[0].ID); err != nil {
+		t.Fatal(err)
 	}
-	f.Cleanup(t, "DELETE FROM agent_task_queue WHERE id=$1", child.ID)
+	resumed := wakeupTargetSession(t, f, issue, agent)
+	next := wakeupSessionTask(t, f, issue, agent)
+	if resumed.ID != session.ID || resumed.ProviderSessionID.String != "provider-wakeup-session" || resumed.WorkDir.String != "/tmp/wakeup-session" || next.ID == task.ID {
+		t.Fatalf("retry lost persistent session: %+v next=%+v", resumed, next)
+	}
+	again := wakeupClaimEvents(t, f, s, next, 1)
+	if len(again) != 1 || again[0].ID != batch[0].ID || string(again[0].Payload) != string(batch[0].Payload) || again[0].AttemptCount != 2 {
+		t.Fatalf("retry changed or duplicated the inbox input: %+v", again)
+	}
+	var payload wakeupSessionPayload
+	if err := json.Unmarshal(again[0].Payload, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.ParentCommentID == nil || *payload.ParentCommentID != parent || payload.Instruction != "specific wakeup instruction" {
+		t.Fatalf("retry lost explicit reply metadata: %+v", payload)
+	}
+	if len(wakeupInbox(t, f, w.ID)) != 1 {
+		t.Fatal("retry created another rule input")
+	}
 }
 
 func TestIssueWakeupConcurrentDispatchIsIdempotent(t *testing.T) {
@@ -341,7 +481,10 @@ func TestIssueWakeupConcurrentDispatchIsIdempotent(t *testing.T) {
 	if winners == 0 {
 		t.Fatal("no dispatch succeeded")
 	}
-	if n := f.Count(t, "SELECT count(*) FROM agent_task_queue WHERE context->>'wakeup_id'=$1", util.UUIDToString(w.ID)); n != 1 {
-		t.Fatalf("created %d runs", n)
+	if events := wakeupInbox(t, f, w.ID); len(events) != 1 {
+		t.Fatalf("concurrent dispatch transferred %d inputs", len(events))
+	}
+	if n := f.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id=$1", issue); n != 1 {
+		t.Fatalf("concurrent dispatch created %d session executions", n)
 	}
 }

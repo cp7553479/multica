@@ -2777,43 +2777,22 @@ func TestBacklogToTodoByAgentTriggersDifferentAssignee(t *testing.T) {
 // issue — is the documented serial chain and is covered by
 // TestBacklogToTodoByAgentSameAgentDifferentIssue.
 func TestBacklogToTodoByAgentSameIssueDoesNotSelfTrigger(t *testing.T) {
-	if testHandler == nil {
-		t.Skip("database not available")
+	issueID, selfAgent, _ := issueSessionCaptureFixture(t)
+	captureSessionComment(t, issueID, map[string]any{"content": "Start the issue session"}, "", "")
+	var sessionID, selfTask string
+	dbfx.QueryRow(t, "SELECT id,active_task_id FROM issue_agent_session WHERE issue_id=$1", issueID).Scan(&sessionID, &selfTask)
+	dbfx.Exec(t, "UPDATE agent_task_queue SET status='running',started_at=now() WHERE id=$1", selfTask)
+	// Parking an already-running issue does not detach its logical session.
+	captureSessionUpdateIssue(t, issueID, map[string]any{"status": "backlog"}, "", "")
+	captureSessionUpdateIssue(t, issueID, map[string]any{"status": "todo"}, selfAgent, selfTask)
+	if got := queuedTaskCountFor(t, issueID, selfAgent); got != 0 {
+		t.Fatalf("same-session promotion created %d additional queued consumers", got)
 	}
-	ctx := context.Background()
-
-	selfAgent := createHandlerTestAgent(t, "Backlog Self Agent", nil)
-
-	req := newRequest("POST", "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
-		"title":         "Self-promoted backlog",
-		"status":        "backlog",
-		"assignee_type": "agent",
-		"assignee_id":   selfAgent,
-	})
-	w := testutil.Call(t, testHandler.CreateIssue, req).Want(http.StatusCreated)
-	var created IssueResponse
-	json.NewDecoder(w.Body).Decode(&created)
-	t.Cleanup(func() {
-		testPool.Exec(ctx, `DELETE FROM agent_task_queue WHERE issue_id = $1`, created.ID)
-		testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, created.ID)
-	})
-
-	// Task bound to the SAME issue being promoted — true self-loop.
-	selfTask := createHandlerTestTaskForAgentOnIssue(t, selfAgent, created.ID)
-
-	req = newRequest("PUT", "/api/issues/"+created.ID, map[string]any{"status": "todo"})
-	req = withURLParam(req, "id", created.ID)
-	req.Header.Set("X-Agent-ID", selfAgent)
-	req.Header.Set("X-Task-ID", selfTask)
-	w = testutil.Call(t, testHandler.UpdateIssue, req).Want(http.StatusOK)
-
-	var tasks int
-	dbfx.QueryRow(t,
-		`SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2 AND status = 'queued'`,
-		created.ID, selfAgent,
-	).Scan(&tasks)
-	if tasks != 0 {
-		t.Fatalf("expected no self-trigger when agent promotes the same issue its task is running on, got %d queued tasks", tasks)
+	if got := taskStatus(t, selfTask); got != "running" {
+		t.Fatalf("promotion changed the existing consumer to %q", got)
+	}
+	if got := dbfx.Count(t, "SELECT count(*) FROM issue_agent_session WHERE id=$1 AND active_task_id=$2", sessionID, selfTask); got != 1 {
+		t.Fatal("promotion replaced or detached the running issue session")
 	}
 }
 
@@ -2953,6 +2932,9 @@ func TestAssignDifferentIssueToSelfStillEnqueues(t *testing.T) {
 	source := createIssueForTest(t, map[string]any{"title": "cross-issue source", "status": "todo"})
 	target := createIssueForTest(t, map[string]any{"title": "cross-issue target", "status": "todo"})
 	sourceTask := createHandlerTestTaskForAgentOnIssue(t, agentID, source.ID)
+	// This explicit assignment is authorized by the active source execution's
+	// human principal, rather than the target issue's creator.
+	dbfx.Exec(t, "UPDATE agent_task_queue SET originator_user_id=$2,accountable_user_id=$2,originator_source='direct_human' WHERE id=$1", sourceTask, testUserID)
 
 	req := withURLParam(newRequest("PUT", "/api/issues/"+target.ID, map[string]any{
 		"assignee_type": "agent",
@@ -2978,6 +2960,9 @@ func TestBatchAssignFreshIssuesToSelfEnqueuesEach(t *testing.T) {
 	target1 := createIssueForTest(t, map[string]any{"title": "batch target one", "status": "todo"})
 	target2 := createIssueForTest(t, map[string]any{"title": "batch target two", "status": "todo"})
 	sourceTask := createHandlerTestTaskForAgentOnIssue(t, agentID, source.ID)
+	// This explicit assignment is authorized by the active source execution's
+	// human principal, rather than the target issue's creator.
+	dbfx.Exec(t, "UPDATE agent_task_queue SET originator_user_id=$2,accountable_user_id=$2,originator_source='direct_human' WHERE id=$1", sourceTask, testUserID)
 
 	req := newRequest("PATCH", "/api/issues/batch?workspace_id="+testWorkspaceID, map[string]any{
 		"issue_ids": []string{target1.ID, target2.ID},
@@ -3136,287 +3121,96 @@ func TestDaemonRegisterMissingWorkspaceReturns404(t *testing.T) {
 	}
 }
 
-// TestRootMentionOwnerRoutesMemberReplyButNotAgentReply verifies that a member
-// root @mention owns later member replies, while agent-authored acknowledgments
-// still do not self-expand the route.
-func TestRootMentionOwnerRoutesMemberReplyButNotAgentReply(t *testing.T) {
-	if testHandler == nil {
-		t.Skip("database not available")
-	}
-	ctx := context.Background()
-
-	// Create two agents.
-	agentA := createHandlerTestAgent(t, "Loop Agent A", nil)
-	agentB := createHandlerTestAgent(t, "Loop Agent B", nil)
-
-	// Create an unassigned issue so on_comment doesn't fire.
-	w := httptest.NewRecorder()
-	req := newRequest("POST", "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
-		"title":  "Agent mention inheritance test",
-		"status": "todo",
+func TestRootMentionsDoNotChangeTheIssueSessionOwner(t *testing.T) {
+	issueID, ownerID, runtimeID := issueSessionCaptureFixture(t)
+	authorID := dbfx.Agent(t, "Thread participant", runtimeID)
+	mentionedID := dbfx.Agent(t, "Mentioned participant", runtimeID)
+	sourceID := dbfx.Task(t, authorID, testutil.Cols{
+		"runtime_id": runtimeID, "status": "running", "originator_user_id": testUserID, "accountable_user_id": testUserID,
 	})
-	testHandler.CreateIssue(w, req)
-	if w.Code != http.StatusCreated {
-		t.Fatalf("CreateIssue: expected 201, got %d: %s", w.Code, w.Body.String())
+	root := captureSessionComment(t, issueID, map[string]any{
+		"content": fmt.Sprintf("[@Mentioned](mention://agent/%s) context", mentionedID),
+	}, "", "")
+	ack := captureSessionComment(t, issueID, map[string]any{"content": "Agent acknowledgment", "parent_id": root.ID}, authorID, sourceID)
+	followup := captureSessionComment(t, issueID, map[string]any{"content": "A member follow-up", "parent_id": root.ID}, "", "")
+	if ack.SourceTaskID == nil || *ack.SourceTaskID != sourceID {
+		t.Fatalf("agent acknowledgment lost its authoring task: %+v", ack)
 	}
-	var issue IssueResponse
-	json.NewDecoder(w.Body).Decode(&issue)
-	issueID := issue.ID
-
-	t.Cleanup(func() {
-		testPool.Exec(ctx, `DELETE FROM agent_task_queue WHERE issue_id = $1`, issueID)
-		testPool.Exec(ctx, `DELETE FROM comment WHERE issue_id = $1`, issueID)
-		testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, issueID)
-	})
-
-	// Helper: count queued tasks for a given agent on this issue.
-	countTasks := func(agentID string) int {
-		var n int
-		err := testPool.QueryRow(ctx,
-			`SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2 AND status = 'queued'`,
-			issueID, agentID,
-		).Scan(&n)
-		if err != nil {
-			t.Fatalf("failed to count tasks: %v", err)
-		}
-		return n
+	sessions := captureIssueSessions(t, issueID)
+	if len(sessions) != 1 || sessions[0].AgentID != ownerID || len(sessions[0].Events) != 4 {
+		t.Fatalf("thread participants selected another execution owner: %+v", sessions)
 	}
-
-	// Helper: cancel all tasks for an agent on this issue.
-	cancelTasks := func(agentID string) {
-		_, err := testPool.Exec(ctx,
-			`UPDATE agent_task_queue SET status = 'cancelled' WHERE issue_id = $1 AND agent_id = $2`,
-			issueID, agentID,
-		)
-		if err != nil {
-			t.Fatalf("failed to cancel tasks: %v", err)
+	for i, comment := range []CommentResponse{root, ack, followup} {
+		event := sessions[0].Events[i+1]
+		if event.SourceID == nil || *event.SourceID != comment.ID || event.Sequence != int64(i+2) {
+			t.Fatalf("thread message lost inbox order: %+v", event)
 		}
 	}
-
-	postComment := func(issueID string, body map[string]any, headers map[string]string) *httptest.ResponseRecorder {
-		w := httptest.NewRecorder()
-		r := newRequest("POST", "/api/issues/"+issueID+"/comments", body)
-		r = withURLParam(r, "id", issueID)
-		for k, v := range headers {
-			r.Header.Set(k, v)
-		}
-		testHandler.CreateComment(w, r)
-		return w
-	}
-
-	// 1. Member posts top-level comment mentioning Agent B.
-	mentionB := fmt.Sprintf("[@Agent B](mention://agent/%s) please review", agentB)
-	w = postComment(issueID, map[string]any{"content": mentionB}, nil)
-	if w.Code != http.StatusCreated {
-		t.Fatalf("member mention comment: expected 201, got %d: %s", w.Code, w.Body.String())
-	}
-	var parentComment CommentResponse
-	json.NewDecoder(w.Body).Decode(&parentComment)
-	if countTasks(agentB) != 1 {
-		t.Fatalf("expected 1 task for Agent B after member mention, got %d", countTasks(agentB))
-	}
-
-	// 2. Cancel Agent B's task so it's free to be re-triggered.
-	cancelTasks(agentB)
-	if countTasks(agentB) != 0 {
-		t.Fatalf("expected 0 tasks for Agent B after cancel, got %d", countTasks(agentB))
-	}
-
-	// 3. Agent A posts a reply in the same thread with NO mentions.
-	// Agent-authored comments still do not inherit the root mention of Agent B.
-	// resolveActor requires X-Task-ID paired with X-Agent-ID to trust the
-	// agent identity, so we seed a task that belongs to agent A.
-	agentATask := createHandlerTestTaskForAgent(t, agentA)
-	w = postComment(issueID, map[string]any{
-		"content":   "No reply needed — just an acknowledgment.",
-		"parent_id": parentComment.ID,
-	}, map[string]string{"X-Agent-ID": agentA, "X-Task-ID": agentATask})
-	if w.Code != http.StatusCreated {
-		t.Fatalf("agent A reply: expected 201, got %d: %s", w.Code, w.Body.String())
-	}
-	if countTasks(agentB) != 0 {
-		t.Fatalf("expected 0 tasks for Agent B after agent reply (no parent inheritance), got %d", countTasks(agentB))
-	}
-
-	// 4. Cancel any stray tasks.
-	cancelTasks(agentB)
-
-	// 5. Member posts a reply in the same thread with NO mentions.
-	// The member-authored root @mention owns the thread, so this routes to B.
-	w = postComment(issueID, map[string]any{
-		"content":   "Thanks for the review.",
-		"parent_id": parentComment.ID,
-	}, nil)
-	if w.Code != http.StatusCreated {
-		t.Fatalf("member reply: expected 201, got %d: %s", w.Code, w.Body.String())
-	}
-	if countTasks(agentB) != 1 {
-		t.Fatalf("expected 1 task for Agent B after member reply (root owner), got %d", countTasks(agentB))
+	if n := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id=$1 AND agent_id<>$2", issueID, ownerID); n != 0 {
+		t.Fatalf("a participant mention or reply dispatched %d non-owner tasks", n)
 	}
 }
 
-// TestMemberReplyToAgentRootDoesNotInheritParentMentions is the regression
-// for MUL-1535. When an agent posts a comment that @mentions another agent
-// (e.g. J posting a PR completion that @mentions a reviewer agent), a later
-// member reply in the same thread with no explicit mentions must NOT inherit
-// the @reviewer mention. The reviewer was a one-shot delegation; subsequent
-// member follow-ups are directed at the assignee, not the reviewer.
-func TestMemberReplyToAgentRootDoesNotInheritParentMentions(t *testing.T) {
-	if testHandler == nil {
-		t.Skip("database not available")
+func TestMemberReplyToAgentRootStaysInTheOwnerSession(t *testing.T) {
+	issueID, ownerID, runtimeID := issueSessionCaptureFixture(t)
+	initial := captureSessionComment(t, issueID, map[string]any{"content": "Initial instruction"}, "", "")
+	var ownerTaskID string
+	dbfx.QueryRow(t, "SELECT active_task_id FROM issue_agent_session WHERE issue_id=$1", issueID).Scan(&ownerTaskID)
+	dbfx.Exec(t, "UPDATE agent_task_queue SET status='running',started_at=now() WHERE id=$1", ownerTaskID)
+	reviewerID := dbfx.Agent(t, "Mentioned reviewer", runtimeID)
+	root := captureSessionComment(t, issueID, map[string]any{
+		"content": fmt.Sprintf("PR ready [@Reviewer](mention://agent/%s)", reviewerID), "parent_id": initial.ID,
+	}, ownerID, ownerTaskID)
+	followup := captureSessionComment(t, issueID, map[string]any{"content": "How do I test this?", "parent_id": root.ID}, "", "")
+	if root.SourceTaskID == nil || *root.SourceTaskID != ownerTaskID {
+		t.Fatalf("agent root lost its source task: %+v", root)
 	}
-	ctx := context.Background()
-
-	jAgent := createHandlerTestAgent(t, "J", nil)
-	reviewerAgent := createHandlerTestAgent(t, "Reviewer", nil)
-
-	req := newRequest("POST", "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
-		"title":  "PR review delegation no-leak test",
-		"status": "todo",
-	})
-	w := testutil.Call(t, testHandler.CreateIssue, req).Want(http.StatusCreated)
-	var issue IssueResponse
-	json.NewDecoder(w.Body).Decode(&issue)
-	issueID := issue.ID
-
-	t.Cleanup(func() {
-		testPool.Exec(ctx, `DELETE FROM agent_task_queue WHERE issue_id = $1`, issueID)
-		testPool.Exec(ctx, `DELETE FROM comment WHERE issue_id = $1`, issueID)
-		testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, issueID)
-	})
-
-	countTasks := func(agentID string) int {
-		var n int
-		err := testPool.QueryRow(ctx,
-			`SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2 AND status = 'queued'`,
-			issueID, agentID,
-		).Scan(&n)
-		if err != nil {
-			t.Fatalf("failed to count tasks: %v", err)
-		}
-		return n
+	sessions := captureIssueSessions(t, issueID)
+	if len(sessions) != 1 || sessions[0].AgentID != ownerID || len(sessions[0].Events) != 4 {
+		t.Fatalf("reply changed the issue session: %+v", sessions)
 	}
-
-	// 1. Agent J posts a PR-completion comment that @mentions Reviewer for review.
-	// This is a deliberate handoff and must enqueue a task for Reviewer.
-	// X-Task-ID is required alongside X-Agent-ID for resolveActor to grant
-	// the "agent" actor identity (defense against header forgery).
-	jAgentTask := createHandlerTestTaskForAgent(t, jAgent)
-	r := newRequest("POST", "/api/issues/"+issueID+"/comments", map[string]any{
-		"content": fmt.Sprintf("PR ready. [@Reviewer](mention://agent/%s) please review this.", reviewerAgent),
-	})
-	r = withURLParam(r, "id", issueID)
-	r.Header.Set("X-Agent-ID", jAgent)
-	r.Header.Set("X-Task-ID", jAgentTask)
-	w = testutil.Call(t, testHandler.CreateComment, r).Want(http.StatusCreated)
-	var rootComment CommentResponse
-	json.NewDecoder(w.Body).Decode(&rootComment)
-	if got := countTasks(reviewerAgent); got != 1 {
-		t.Fatalf("expected 1 task for Reviewer after explicit mention, got %d", got)
+	if sessions[0].Events[2].Status != "ignored" || sessions[0].Events[3].SourceID == nil || *sessions[0].Events[3].SourceID != followup.ID || sessions[0].Events[3].Status != "pending" {
+		t.Fatalf("owner output and member follow-up were not distinguished: %+v", sessions[0].Events)
 	}
-
-	// Cancel reviewer's task so it's free to be re-triggered if the bug returns.
-	dbfx.Exec(t,
-		`UPDATE agent_task_queue SET status = 'cancelled' WHERE issue_id = $1 AND agent_id = $2`,
-		issueID, reviewerAgent,
-	)
-
-	// 2. Member posts a plain follow-up reply under J's PR comment, with no
-	// explicit mentions. The pre-fix code path inherited mentions from the
-	// parent regardless of the parent author, which re-triggered Reviewer.
-	// With the fix, the reply must NOT inherit because the parent was
-	// authored by an agent.
-	r = newRequest("POST", "/api/issues/"+issueID+"/comments", map[string]any{
-		"content":   "How do I test this after merging?",
-		"parent_id": rootComment.ID,
-	})
-	r = withURLParam(r, "id", issueID)
-	w = testutil.Call(t, testHandler.CreateComment, r).Want(http.StatusCreated)
-	if got := countTasks(reviewerAgent); got != 0 {
-		t.Fatalf("expected 0 tasks for Reviewer after plain member reply (no inheritance from agent root), got %d", got)
+	if n := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id=$1 AND agent_id=$2", issueID, reviewerID); n != 0 {
+		t.Fatalf("an agent root mention dispatched %d reviewer tasks", n)
+	}
+	if n := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id=$1", issueID); n != 1 {
+		t.Fatalf("member follow-up created a second consumer while its owner is busy: %d", n)
 	}
 }
 
-// TestNestedMemberReplyUsesDirectParentForThreadOwnership is the regression
-// for parent-root write normalization leaking root mentions into plain nested
-// replies. Stored parent_id keeps the direct parent, and trigger logic routes
-// to that direct agent parent rather than the thread root's explicit mention.
-func TestNestedMemberReplyUsesDirectParentForMentionInheritance(t *testing.T) {
-	if testHandler == nil || testPool == nil {
-		t.Skip("database not available")
-	}
-
-	assigneeAgent := createHandlerTestAgent(t, "Nested Mention Assignee", nil)
-	mentionedAgent := createHandlerTestAgent(t, "Nested Mention Target", nil)
-	parentAgent := createHandlerTestAgent(t, "Nested Direct Parent", nil)
-
-	var number int
-	dbfx.QueryRow(t, `
-		UPDATE workspace
-		SET issue_counter = GREATEST(issue_counter, (SELECT COALESCE(MAX(number), 0) FROM issue WHERE workspace_id = $1)) + 1
-		WHERE id = $1 RETURNING issue_counter
-	`, testWorkspaceID).Scan(&number)
-
-	issueID := dbfx.Insert(t, "issue", testutil.Cols{
-		"workspace_id":  testWorkspaceID,
-		"creator_type":  "member",
-		"creator_id":    testUserID,
-		"title":         "nested mention inheritance regression",
-		"assignee_type": "agent",
-		"assignee_id":   assigneeAgent,
-		"number":        number,
+func TestNestedMemberReplyKeepsItsDirectParentAndTheIssueOwner(t *testing.T) {
+	issueID, ownerID, runtimeID := issueSessionCaptureFixture(t)
+	mentionedID := dbfx.Agent(t, "Nested mention participant", runtimeID)
+	parentAuthorID := dbfx.Agent(t, "Nested parent author", runtimeID)
+	parentTaskID := dbfx.Task(t, parentAuthorID, testutil.Cols{
+		"runtime_id": runtimeID, "status": "running", "originator_user_id": testUserID, "accountable_user_id": testUserID,
 	})
-	t.Cleanup(func() {
-		testPool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE issue_id = $1`, issueID)
-		testPool.Exec(context.Background(), `DELETE FROM comment WHERE issue_id = $1`, issueID)
-		testPool.Exec(context.Background(), `DELETE FROM issue WHERE id = $1`, issueID)
-	})
-
-	countQueued := func(agentID string) int {
-		t.Helper()
-		var n int
-		dbfx.QueryRow(t, `
-			SELECT count(*) FROM agent_task_queue
-			WHERE issue_id = $1 AND agent_id = $2 AND status = 'queued'
-		`, issueID, agentID).Scan(&n)
-		return n
+	root := captureSessionComment(t, issueID, map[string]any{
+		"content": fmt.Sprintf("[@Mentioned](mention://agent/%s) context", mentionedID),
+	}, "", "")
+	directParent := captureSessionComment(t, issueID, map[string]any{
+		"content": "Redirect configuration details", "parent_id": root.ID,
+	}, parentAuthorID, parentTaskID)
+	nested := captureSessionComment(t, issueID, map[string]any{
+		"content": "Please also check expiry", "parent_id": directParent.ID,
+	}, "", "")
+	if nested.ParentID == nil || *nested.ParentID != directParent.ID {
+		t.Fatalf("nested reply parent = %v, want direct parent %s", nested.ParentID, directParent.ID)
 	}
-	postMemberComment := func(body map[string]any) CommentResponse {
-		t.Helper()
-		r := newRequest("POST", "/api/issues/"+issueID+"/comments", body)
-		r = withURLParam(r, "id", issueID)
-		w := testutil.Call(t, testHandler.CreateComment, r).Want(http.StatusCreated)
-		var resp CommentResponse
-		w.JSON(&resp)
-		return resp
+	sessions := captureIssueSessions(t, issueID)
+	if len(sessions) != 1 || sessions[0].AgentID != ownerID || len(sessions[0].Events) != 4 {
+		t.Fatalf("nested reply changed the execution owner: %+v", sessions)
 	}
-
-	root := postMemberComment(map[string]any{
-		"content": fmt.Sprintf("[@Mentioned](mention://agent/%s) please look", mentionedAgent),
-	})
-	if got := countQueued(mentionedAgent); got != 1 {
-		t.Fatalf("expected root mention to queue mentioned agent once, got %d", got)
+	var payload struct {
+		ParentCommentID string `json:"parent_comment_id"`
 	}
-	dbfx.Exec(t, `UPDATE agent_task_queue SET status = 'cancelled' WHERE issue_id = $1`, issueID)
-
-	directParentID := dbfx.Comment(t, issueID, "looks like redirect config", testutil.Cols{
-		"author_type": "agent",
-		"author_id":   parentAgent,
-		"parent_id":   root.ID,
-	})
-
-	nested := postMemberComment(map[string]any{
-		"content":   "can you also check session expiry?",
-		"parent_id": directParentID,
-	})
-	if nested.ParentID == nil || *nested.ParentID != directParentID {
-		t.Fatalf("stored nested reply parent_id should keep direct parent %s, got %v", directParentID, nested.ParentID)
+	if err := json.Unmarshal(sessions[0].Events[3].Payload, &payload); err != nil || payload.ParentCommentID != directParent.ID {
+		t.Fatalf("nested inbox event lost its direct parent: %+v, %v", payload, err)
 	}
-	if got := countQueued(mentionedAgent); got != 0 {
-		t.Fatalf("plain nested reply must not inherit root mention from non-direct parent; got %d queued tasks", got)
-	}
-	if got := countQueued(parentAgent); got != 1 {
-		t.Fatalf("plain nested reply should route to direct agent parent; got %d queued tasks", got)
+	if n := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id=$1 AND agent_id<>$2", issueID, ownerID); n != 0 {
+		t.Fatalf("nested reply selected a participant as owner: %d tasks", n)
 	}
 }
 
@@ -3493,66 +3287,31 @@ func TestNestedMemberReplyUnderMemberSkipsAssigneeFallback(t *testing.T) {
 	}
 }
 
-// TestAgentExplicitMentionStillTriggers documents the boundary the structural
-// fix preserves: suppressing implicit parent-mention inheritance for agent
-// authors does NOT block deliberate handoffs. An agent that explicitly
-// @mentions another agent in its own comment content still enqueues a task
-// for that mentioned agent.
-func TestAgentExplicitMentionStillTriggers(t *testing.T) {
-	if testHandler == nil {
-		t.Skip("database not available")
-	}
-	ctx := context.Background()
-
-	agentA := createHandlerTestAgent(t, "Handoff Agent A", nil)
-	agentB := createHandlerTestAgent(t, "Handoff Agent B", nil)
-
-	req := newRequest("POST", "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
-		"title":  "Agent explicit handoff test",
-		"status": "todo",
+func TestAgentMentionRequiresExplicitAssignmentForCollaboration(t *testing.T) {
+	runtimeID := dbfx.Runtime(t, "Explicit collaboration")
+	authorID := dbfx.Agent(t, "Collaboration author", runtimeID)
+	workerID := dbfx.Agent(t, "Collaboration worker", runtimeID)
+	targetID := dbfx.Issue(t, "Assign this issue explicitly")
+	sourceTaskID := dbfx.Task(t, authorID, testutil.Cols{
+		"runtime_id": runtimeID, "status": "running", "originator_user_id": testUserID, "accountable_user_id": testUserID,
 	})
-	w := testutil.Call(t, testHandler.CreateIssue, req).Want(http.StatusCreated)
-	var issue IssueResponse
-	json.NewDecoder(w.Body).Decode(&issue)
-	issueID := issue.ID
-
-	t.Cleanup(func() {
-		testPool.Exec(ctx, `DELETE FROM agent_task_queue WHERE issue_id = $1`, issueID)
-		testPool.Exec(ctx, `DELETE FROM comment WHERE issue_id = $1`, issueID)
-		testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, issueID)
-	})
-
-	countTasks := func(agentID string) int {
-		var n int
-		err := testPool.QueryRow(ctx,
-			`SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2 AND status = 'queued'`,
-			issueID, agentID,
-		).Scan(&n)
-		if err != nil {
-			t.Fatalf("failed to count tasks: %v", err)
-		}
-		return n
+	comment := captureSessionComment(t, targetID, map[string]any{
+		"content": fmt.Sprintf("[@Worker](mention://agent/%s) collaboration context", workerID),
+	}, authorID, sourceTaskID)
+	if comment.SourceTaskID == nil || *comment.SourceTaskID != sourceTaskID || len(comment.TriggerOutcomes) != 0 {
+		t.Fatalf("mention lost attribution or created execution targets: %+v", comment)
 	}
-
-	// Agent A posts a top-level comment that explicitly @mentions Agent B —
-	// a deliberate handoff. This must enqueue a task for Agent B, and must
-	// not enqueue a self-trigger for Agent A. resolveActor requires
-	// X-Task-ID to grant "agent" identity; without it the self-trigger
-	// suppression (authorType=="agent") would not fire.
-	agentATask := createHandlerTestTaskForAgent(t, agentA)
-	explicitMention := fmt.Sprintf("[@Agent B](mention://agent/%s) please take it from here", agentB)
-	r := newRequest("POST", "/api/issues/"+issueID+"/comments", map[string]any{
-		"content": explicitMention,
-	})
-	r = withURLParam(r, "id", issueID)
-	r.Header.Set("X-Agent-ID", agentA)
-	r.Header.Set("X-Task-ID", agentATask)
-	w = testutil.Call(t, testHandler.CreateComment, r).Want(http.StatusCreated)
-	if got := countTasks(agentB); got != 1 {
-		t.Fatalf("expected 1 task for Agent B after explicit mention by Agent A, got %d", got)
+	if n := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id=$1", targetID); n != 0 {
+		t.Fatalf("mention dispatched %d tasks before assignment", n)
 	}
-	if got := countTasks(agentA); got != 0 {
-		t.Fatalf("expected 0 tasks for Agent A (no self-trigger on own mention), got %d", got)
+	captureSessionUpdateIssue(t, targetID, map[string]any{"assignee_type": "agent", "assignee_id": workerID}, authorID, sourceTaskID)
+	sessions := captureIssueSessions(t, targetID)
+	if len(sessions) != 1 || sessions[0].AgentID != workerID || sessions[0].ActiveTaskID == nil || len(sessions[0].Events) != 1 || sessions[0].Events[0].Kind != "assigned" {
+		t.Fatalf("explicit assignment did not create the worker session: %+v", sessions)
+	}
+	task, err := testHandler.Queries.GetAgentTask(context.Background(), parseUUID(*sessions[0].ActiveTaskID))
+	if err != nil || uuidToString(task.AgentID) != workerID || uuidToString(task.OriginatorUserID) != testUserID {
+		t.Fatalf("worker execution lost its authorizing human: %+v, %v", task, err)
 	}
 }
 

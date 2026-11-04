@@ -56,9 +56,10 @@ func failTaskSuccessorCase(t *testing.T, failureReason string) {
 
 	runtimeID := dbfx.Runtime(t, "fail-successor-runtime-"+failureReason)
 	agentID := dbfx.Agent(t, "fail-successor-agent-"+failureReason, runtimeID)
+	squadID := dbfx.Squad(t, "auxiliary successor squad "+t.Name(), agentID)
 	issueID := dbfx.Issue(t, "manual rerun races auto-retry", testutil.Cols{
-		"assignee_type": "agent",
-		"assignee_id":   agentID,
+		"assignee_type": "squad",
+		"assignee_id":   squadID,
 	})
 	t.Cleanup(func() {
 		testPool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE issue_id = $1`, issueID)
@@ -188,9 +189,10 @@ func TestFailTaskAndRerunConcurrently_NeverStrandsRunningTask(t *testing.T) {
 
 	runtimeID := dbfx.Runtime(t, "rerun-race-runtime")
 	agentID := dbfx.Agent(t, "rerun-race-agent", runtimeID)
+	squadID := dbfx.Squad(t, "auxiliary successor squad "+t.Name(), agentID)
 	issueID := dbfx.Issue(t, "rerun races auto-retry", testutil.Cols{
-		"assignee_type": "agent",
-		"assignee_id":   agentID,
+		"assignee_type": "squad",
+		"assignee_id":   squadID,
 	})
 	t.Cleanup(func() {
 		testPool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE issue_id = $1`, issueID)
@@ -391,9 +393,10 @@ func TestFailTaskAndRerunConcurrently_NonAssigneeTarget(t *testing.T) {
 	runtimeID := dbfx.Runtime(t, "non-assignee-race-runtime")
 	assigneeID := dbfx.Agent(t, "non-assignee-race-current", runtimeID)
 	displacedID := dbfx.Agent(t, "non-assignee-race-displaced", runtimeID)
+	squadID := dbfx.Squad(t, "auxiliary successor squad "+t.Name(), assigneeID)
 	issueID := dbfx.Issue(t, "rerun a displaced agent while it fails", testutil.Cols{
-		"assignee_type": "agent",
-		"assignee_id":   assigneeID,
+		"assignee_type": "squad",
+		"assignee_id":   squadID,
 	})
 	t.Cleanup(func() {
 		testPool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE issue_id = $1`, issueID)

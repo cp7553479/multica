@@ -202,6 +202,7 @@ func daemonHTTPClientCapabilities() string {
 
 func daemonCommonCapabilities() []string {
 	return []string{
+		protocol.DaemonCapabilityIssueSessionEventsV1,
 		protocol.DaemonCapabilitySkillBundlesV1,
 		protocol.DaemonCapabilityCoalescedCommentsV1,
 		protocol.DaemonCapabilityLocalWorktreeV1,
@@ -729,6 +730,12 @@ func (c *Client) PinTaskSession(ctx context.Context, taskID, sessionID, workDir 
 		body["work_dir"] = workDir
 	}
 	return c.postJSON(ctx, fmt.Sprintf("/api/daemon/tasks/%s/session", taskID), body, nil)
+}
+
+func (c *Client) pinIssueTaskSession(ctx context.Context, taskID, sessionID, workDir string) error {
+	return c.postJSONWithRetry(ctx, fmt.Sprintf("/api/daemon/tasks/%s/session", taskID), map[string]any{
+		"session_id": sessionID, "work_dir": workDir,
+	}, nil, []time.Duration{100 * time.Millisecond, 300 * time.Millisecond})
 }
 
 // RecoverOrphans tells the server to fail any dispatched/running tasks the

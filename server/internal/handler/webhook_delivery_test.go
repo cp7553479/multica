@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/multica-ai/multica/server/internal/attribution"
+	"github.com/multica-ai/multica/server/internal/service"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
@@ -832,40 +834,108 @@ func TestWebhookDeliveryWorker_RepairsCreateIssueTaskCrashWindow(t *testing.T) {
 		"Idempotency-Key": "worker-issue-recovery",
 	})
 	deliveryID := requireAcceptedWebhookResponse(t, post)
+	// The issue/run transaction commits the assignment input before waking
+	// its consumer. Fail only that subsequent wake, without deleting a task
+	// whose durable run linkage already proves it was dispatched.
+	originalStarter := testHandler.TaskService.TxStarter
+	t.Cleanup(func() { testHandler.TaskService.TxStarter = originalStarter })
+	testHandler.TaskService.TxStarter = &failNthBegin{delegate: testPool, failAt: 1}
 	first := processQueuedWebhookDelivery(t, deliveryID)
-	run, err := testHandler.Queries.GetAutopilotRun(context.Background(), first.AutopilotRunID)
-	if err != nil || !run.IssueID.Valid {
-		t.Fatalf("load create_issue run: run=%#v err=%v", run, err)
+	testHandler.TaskService.TxStarter = originalStarter
+	run, err := testHandler.Queries.GetAutopilotRun(t.Context(), first.AutopilotRunID)
+	if err != nil || !run.IssueID.Valid || run.TaskID.Valid || run.Status != "issue_created" {
+		t.Fatalf("post-commit wake failure did not retain the partial run: run=%#v err=%v", run, err)
 	}
 	issueID := uuidToString(run.IssueID)
 	t.Cleanup(func() {
 		testPool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE issue_id = $1`, issueID)
 		testPool.Exec(context.Background(), `DELETE FROM issue WHERE id = $1`, issueID)
 	})
+	issue, err := testHandler.Queries.GetIssue(t.Context(), run.IssueID)
+	if err != nil || issue.CreatorType != "agent" || issue.CreatorID != parseUUID(agentID) || issue.AssigneeType.String != "agent" || issue.AssigneeID != parseUUID(agentID) || issue.OriginID != parseUUID(apID) {
+		t.Fatalf("dispatch did not commit its original creator and target: issue=%+v err=%v", issue, err)
+	}
+	session, err := testHandler.Queries.GetIssueAgentSessionForPair(t.Context(), db.GetIssueAgentSessionForPairParams{
+		WorkspaceID: parseUUID(testWorkspaceID), IssueID: run.IssueID, AgentID: parseUUID(agentID),
+	})
+	if err != nil || session.ActiveTaskID.Valid {
+		t.Fatalf("failed wake left a partial consumer: session=%+v err=%v", session, err)
+	}
+	input, err := testHandler.Queries.GetAutopilotIssueAgentAssignment(t.Context(), session.ID)
+	if err != nil || input.Status != "pending" || input.Sequence != 1 {
+		t.Fatalf("committed assignment input was lost: input=%+v err=%v", input, err)
+	}
+	var binding struct {
+		Dispatch struct {
+			RunID       pgtype.UUID        `json:"run_id"`
+			Attribution attribution.Result `json:"attribution"`
+		} `json:"autopilot_dispatch"`
+	}
+	if err := json.Unmarshal(input.Payload, &binding); err != nil || binding.Dispatch.RunID != run.ID || binding.Dispatch.Attribution.UserID != parseUUID(testUserID) || input.OriginatorUserID != parseUUID(testUserID) {
+		t.Fatalf("assignment lacks its transactionally bound run and principal: %s (%v)", input.Payload, err)
+	}
+	requeue := func() db.WebhookDelivery {
+		t.Helper()
+		dbfx.Exec(t, `UPDATE webhook_delivery SET status='queued',autopilot_run_id=NULL,available_at=now(),lease_token=NULL,lease_expires_at=NULL WHERE id=$1`, deliveryID)
+		return processQueuedWebhookDelivery(t, deliveryID)
+	}
+	second := requeue()
+	if second.AutopilotRunID != first.AutopilotRunID {
+		t.Fatal("repair created another Autopilot run")
+	}
+	repaired, err := testHandler.Queries.GetAutopilotRun(t.Context(), run.ID)
+	if err != nil || repaired.IssueID != run.IssueID || !repaired.TaskID.Valid {
+		t.Fatalf("repair did not link the original issue's consumer: run=%+v err=%v", repaired, err)
+	}
+	task, err := testHandler.Queries.GetAgentTask(t.Context(), repaired.TaskID)
+	if err != nil || !service.IsIssueAgentSessionTask(task) || service.IssueAgentSessionID(task) != session.ID || task.OriginatorUserID != parseUUID(testUserID) || task.AutopilotRunID.Valid {
+		t.Fatalf("repair bypassed the original authorized session: task=%+v err=%v", task, err)
+	}
+	requeue()
+	current, err := testHandler.Queries.GetAutopilotIssueAgentAssignment(t.Context(), session.ID)
+	if err != nil || current.ID != input.ID || current.Sequence != input.Sequence || !bytes.Equal(current.Payload, input.Payload) || current.Status != "pending" {
+		t.Fatalf("linked delivery retry rewrote or replayed its input: input=%+v err=%v", current, err)
+	}
 
-	// Remove the task to model a process exit after the issue/run transaction
-	// but before task enqueue, then make the delivery recoverable again.
-	if _, err := testPool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE issue_id = $1`, issueID); err != nil {
-		t.Fatalf("remove issue task: %v", err)
+	// Deliver and end the actual consumer. A later webhook retry of a terminal
+	// run must not turn its retained input into another execution, even if the
+	// old run-to-task link is no longer present.
+	dbfx.Exec(t, "UPDATE agent_task_queue SET status='dispatched',dispatched_at=now() WHERE id=$1", task.ID)
+	if err := testHandler.TaskService.PinIssueAgentSession(t.Context(), task.ID, "webhook-provider-session", "/tmp/webhook-issue-session"); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := testPool.Exec(context.Background(), `
-		UPDATE webhook_delivery
-		SET status = 'queued', autopilot_run_id = NULL, available_at = now(),
-		    lease_token = NULL, lease_expires_at = NULL
-		WHERE id = $1
-	`, deliveryID); err != nil {
-		t.Fatalf("requeue delivery: %v", err)
+	inputs, err := testHandler.TaskService.ClaimIssueAgentEvents(t.Context(), task.ID, 32)
+	if err != nil || len(inputs) != 1 || inputs[0].ID != input.ID {
+		t.Fatalf("repair claimed different input: count=%d err=%v", len(inputs), err)
 	}
-	second := processQueuedWebhookDelivery(t, deliveryID)
-	if got := uuidToString(second.AutopilotRunID); got != uuidToString(first.AutopilotRunID) {
-		t.Fatalf("repair should reuse run: got %s want %s", got, uuidToString(first.AutopilotRunID))
+	if err := testHandler.TaskService.AckIssueAgentEvent(t.Context(), task.ID, input.ID, true, ""); err != nil {
+		t.Fatal(err)
 	}
-	var taskCount int
-	if err := testPool.QueryRow(context.Background(), `SELECT count(*) FROM agent_task_queue WHERE issue_id = $1`, issueID).Scan(&taskCount); err != nil {
-		t.Fatalf("count repaired task: %v", err)
+	dbfx.Exec(t, "UPDATE agent_task_queue SET status='running',started_at=now() WHERE id=$1", task.ID)
+	if _, err := testHandler.TaskService.CompleteTask(t.Context(), task.ID, []byte(`{"output":""}`), "webhook-provider-session", "/tmp/webhook-issue-session", "", false, "", ""); err != nil {
+		t.Fatal(err)
 	}
-	if taskCount != 1 {
-		t.Fatalf("expected one repaired issue task, got %d", taskCount)
+	dbfx.Exec(t, "UPDATE autopilot_run SET status='completed',completed_at=now(),task_id=NULL WHERE id=$1", run.ID)
+	terminalReplay := requeue()
+	if terminalReplay.AutopilotRunID != run.ID {
+		t.Fatal("terminal delivery retry created another run")
+	}
+	current, err = testHandler.Queries.GetAutopilotIssueAgentAssignment(t.Context(), session.ID)
+	if err != nil || current.ID != input.ID || current.Status != "delivered" || !bytes.Equal(current.Payload, input.Payload) {
+		t.Fatalf("terminal retry replayed the delivered input: status=%s err=%v", current.Status, err)
+	}
+	currentSession, err := testHandler.Queries.GetIssueAgentSession(t.Context(), session.ID)
+	if err != nil || currentSession.ActiveTaskID.Valid {
+		t.Fatalf("terminal replay restarted the session: session=%+v err=%v", currentSession, err)
+	}
+	if n := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id=$1", run.IssueID); n != 1 {
+		t.Fatalf("webhook repair/retries created %d consumers, want 1", n)
+	}
+	if n := dbfx.Count(t, "SELECT count(*) FROM issue WHERE origin_type='autopilot' AND origin_id=$1", apID); n != 1 {
+		t.Fatalf("webhook repair/retries created %d issues, want 1", n)
+	}
+	if n := dbfx.Count(t, "SELECT count(*) FROM autopilot_run WHERE webhook_delivery_id=$1", deliveryID); n != 1 {
+		t.Fatalf("webhook repair/retries created %d runs, want 1", n)
 	}
 }
 

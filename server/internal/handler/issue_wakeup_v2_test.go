@@ -3,14 +3,13 @@ package handler
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/service"
-	"github.com/multica-ai/multica/server/internal/testutil"
+	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
 // A status write outside the HTTP handlers still records the child's change
@@ -111,6 +110,11 @@ type workspaceWakeupRow struct {
 	Runs7d          int     `json:"runs_7d"`
 	CanManage       bool    `json:"can_manage"`
 	Condition       any     `json:"condition"`
+	LastTaskID      *string `json:"last_task_id"`
+	ActiveRuns      int     `json:"active_runs"`
+	Task            *struct {
+		ID string `json:"id"`
+	} `json:"task"`
 }
 
 func listWorkspaceWakeupRows(t *testing.T, query string) ([]workspaceWakeupRow, map[string]int) {
@@ -140,6 +144,7 @@ func TestWorkspaceWakeupsListSourcesSystemRulesAndPaused(t *testing.T) {
 	dbfx.Cleanup(t, "DELETE FROM issue_wakeup_receipt WHERE wakeup_id IN (SELECT id FROM issue_wakeup WHERE issue_id=$1)", issue)
 	dbfx.Cleanup(t, "DELETE FROM issue_wakeup WHERE issue_id=$1", issue)
 	dbfx.Cleanup(t, "DELETE FROM activity_log WHERE issue_id=$1", issue)
+	dbfx.Cleanup(t, "DELETE FROM agent_task_queue WHERE issue_id=$1", issue)
 	svc := service.IssueWakeupService{Tasks: testHandler.TaskService}
 	create := func(in service.WakeupInput) string {
 		t.Helper()
@@ -152,10 +157,58 @@ func TestWorkspaceWakeupsListSourcesSystemRulesAndPaused(t *testing.T) {
 	}
 	member := create(service.WakeupInput{Kind: "event", Condition: json.RawMessage(`{"type":"issue_field","field":"status","value":"in_review"}`)})
 	paused := create(service.WakeupInput{Kind: "event", Mode: "continuous", EventTypes: []string{"comment.created"}})
-	dbfx.Exec(t, "UPDATE issue_wakeup SET enabled=false,paused_reason='rate',disabled_at=now() WHERE id=$1", paused)
-	for range 2 {
-		dbfx.Task(t, agent, testutil.Cols{"issue_id": issue, "runtime_id": testRuntimeID, "status": "completed", "context": fmt.Sprintf(`{"wakeup_id":%q}`, paused)})
+	var lastRun string
+	for turn := range 2 {
+		if err := svc.Trigger(t.Context(), parseUUID(issue), parseUUID(paused), parseUUID(testUserID)); err != nil {
+			t.Fatal(err)
+		}
+		if turn == 0 {
+			// Two rule firings delivered to one consumer count as one execution.
+			if err := svc.Trigger(t.Context(), parseUUID(issue), parseUUID(paused), parseUUID(testUserID)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		session, err := testHandler.Queries.GetIssueAgentSessionForPair(t.Context(), db.GetIssueAgentSessionForPairParams{WorkspaceID: parseUUID(testWorkspaceID), IssueID: parseUUID(issue), AgentID: parseUUID(agent)})
+		if err != nil || !session.ActiveTaskID.Valid {
+			t.Fatalf("rule consumer: %+v %v", session, err)
+		}
+		lastRun = uuidToString(session.ActiveTaskID)
+		dbfx.Exec(t, "UPDATE agent_task_queue SET status='dispatched',dispatched_at=now() WHERE id=$1", lastRun)
+		if err := testHandler.TaskService.PinIssueAgentSession(t.Context(), session.ActiveTaskID, "inventory-provider-session", "/tmp/wakeup-inventory-session"); err != nil {
+			t.Fatal(err)
+		}
+		inputs, err := testHandler.TaskService.ClaimIssueAgentEvents(t.Context(), session.ActiveTaskID, 32)
+		want := 1
+		if turn == 0 {
+			want = 2
+		}
+		if err != nil || len(inputs) != want {
+			t.Fatalf("actual rule claims=%d want=%d error=%v", len(inputs), want, err)
+		}
+		rows, _ := listWorkspaceWakeupRows(t, "scope=all&limit=100")
+		found := false
+		for _, row := range rows {
+			if row.ID == paused {
+				found = true
+				if row.ActiveRuns != 1 || row.Runs7d != turn+1 || row.Task == nil || row.Task.ID != lastRun {
+					t.Fatalf("claimed rule inputs did not identify one active execution: %+v", row)
+				}
+			}
+		}
+		if !found {
+			t.Fatal("active rule missing from workspace inventory")
+		}
+		for _, input := range inputs {
+			if err := testHandler.TaskService.AckIssueAgentEvent(t.Context(), session.ActiveTaskID, input.ID, true, ""); err != nil {
+				t.Fatal(err)
+			}
+		}
+		dbfx.Exec(t, "UPDATE agent_task_queue SET status='running',started_at=now() WHERE id=$1", lastRun)
+		if _, err := testHandler.TaskService.CompleteTask(t.Context(), session.ActiveTaskID, []byte(`{"output":""}`), "inventory-provider-session", "/tmp/wakeup-inventory-session", "", false, "", ""); err != nil {
+			t.Fatal(err)
+		}
 	}
+	dbfx.Exec(t, "UPDATE issue_wakeup SET enabled=false,paused_reason='rate',disabled_at=now() WHERE id=$1", paused)
 
 	if w := putChildDoneRule(t, fx.parent.ID, map[string]any{"instruction": "Advance the next stage."}); w.Code != http.StatusOK {
 		t.Fatalf("create system rule: %d", w.Code)
@@ -177,7 +230,7 @@ func TestWorkspaceWakeupsListSourcesSystemRulesAndPaused(t *testing.T) {
 	if byID[member].Source != "member" || byID[member].Condition == nil {
 		t.Fatalf("member row: %+v", byID[member])
 	}
-	if byID[paused].PausedReason == nil || *byID[paused].PausedReason != "rate" || byID[paused].Runs7d != 2 {
+	if byID[paused].PausedReason == nil || *byID[paused].PausedReason != "rate" || byID[paused].Runs7d != 2 || byID[paused].ActiveRuns != 0 || byID[paused].LastTaskID == nil || *byID[paused].LastTaskID != lastRun || byID[paused].Task == nil || byID[paused].Task.ID != lastRun {
 		t.Fatalf("paused row: %+v", byID[paused])
 	}
 	if counts["paused"] < 1 {
@@ -245,27 +298,65 @@ func TestIssueWakeupManagementEndpoints(t *testing.T) {
 	if rec := call(testHandler.TriggerIssueWakeup, "POST", nil, nil); rec.Code != http.StatusNoContent {
 		t.Fatalf("wake now: %d %s", rec.Code, rec.Body.String())
 	}
-	var run string
-	dbfx.QueryRow(t, "SELECT id::text FROM agent_task_queue WHERE context->>'wakeup_id'=$1", id).Scan(&run)
+	session, err := testHandler.Queries.GetIssueAgentSessionForPair(t.Context(), db.GetIssueAgentSessionForPairParams{
+		WorkspaceID: parseUUID(testWorkspaceID), IssueID: parseUUID(issue), AgentID: parseUUID(agent),
+	})
+	if err != nil || !session.ActiveTaskID.Valid {
+		t.Fatalf("wake did not start its persistent session consumer: %+v %v", session, err)
+	}
+	run := uuidToString(session.ActiveTaskID)
+	task, err := testHandler.Queries.GetAgentTask(t.Context(), session.ActiveTaskID)
+	if err != nil || !service.IsIssueAgentSessionTask(task) || task.HandoffNote.Valid || task.TriggerCommentID.Valid {
+		t.Fatalf("wake created a legacy execution: %+v %v", task, err)
+	}
+	// Transferring receipts into the inbox does not yet associate a rule with
+	// a provider delivery or grant this consumer the right to check in.
+	rec := call(testHandler.ListIssueWakeupRuns, "GET", nil, nil)
+	var runs []wakeupRunResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &runs); err != nil || rec.Code != http.StatusOK || len(runs) != 0 {
+		t.Fatalf("unclaimed inbox incorrectly counted as delivered run history: %d %s", rec.Code, rec.Body.String())
+	}
 	dbfx.Exec(t, "UPDATE agent_task_queue SET status='running',started_at=now() WHERE id=$1", run)
 	// A member cannot check in for the run.
 	if rec := call(testHandler.CheckInIssueWakeup, "POST", map[string]any{"note": "fine"}, map[string]string{"X-Task-ID": run}); rec.Code != http.StatusForbidden {
 		t.Fatalf("member check-in: %d %s", rec.Code, rec.Body.String())
 	}
 	agentHeaders := map[string]string{"X-Task-ID": run, "X-Agent-ID": agent, "X-Actor-Source": "task_token"}
+	if rec := call(testHandler.CheckInIssueWakeup, "POST", map[string]any{"note": "not received"}, agentHeaders); rec.Code != http.StatusForbidden {
+		t.Fatalf("unclaimed input granted check-in rights: %d %s", rec.Code, rec.Body.String())
+	}
+	if err := testHandler.TaskService.PinIssueAgentSession(t.Context(), task.ID, "management-provider-session", "/tmp/wakeup-management-session"); err != nil {
+		t.Fatal(err)
+	}
+	events, err := testHandler.TaskService.ClaimIssueAgentEvents(t.Context(), task.ID, 32)
+	if err != nil || len(events) != 1 || events[0].Kind != "wakeup.fired" || events[0].DeliveryTaskID != task.ID || events[0].Status != "delivering" {
+		t.Fatalf("rule input was not actually claimed by its consumer: count=%d error=%v", len(events), err)
+	}
+	if err := testHandler.TaskService.AckIssueAgentEvent(t.Context(), task.ID, events[0].ID, true, ""); err != nil {
+		t.Fatal(err)
+	}
 	if rec := call(testHandler.CheckInIssueWakeup, "POST", map[string]any{"note": "Nothing changed"}, agentHeaders); rec.Code != http.StatusNoContent {
 		t.Fatalf("agent check-in: %d %s", rec.Code, rec.Body.String())
 	}
-	rec := call(testHandler.ListIssueWakeupRuns, "GET", nil, nil)
-	var runs []wakeupRunResponse
+	rec = call(testHandler.ListIssueWakeupRuns, "GET", nil, nil)
 	if err := json.Unmarshal(rec.Body.Bytes(), &runs); err != nil || rec.Code != 200 {
 		t.Fatalf("runs %d: %s", rec.Code, rec.Body.String())
 	}
 	if len(runs) != 1 || runs[0].ID != run || runs[0].CheckinNote != "Nothing changed" || len(runs[0].Triggers) != 1 || runs[0].Triggers[0] != "wakeup.manual" {
 		t.Fatalf("runs: %+v", runs)
 	}
+	var note string
+	var legacyCarrier bool
+	dbfx.QueryRow(t, "SELECT context->'wakeup_checkins'->$2::text->>'note', context ? 'wakeup_id' FROM agent_task_queue WHERE id=$1", run, id).Scan(&note, &legacyCarrier)
+	if note != "Nothing changed" || legacyCarrier {
+		t.Fatal("check-in was not stored under the rule in the session execution")
+	}
 	if rec := call(testHandler.DeleteIssueWakeup, "DELETE", nil, nil); rec.Code != http.StatusNoContent {
 		t.Fatalf("delete: %d %s", rec.Code, rec.Body.String())
+	}
+	stillRunning, err := testHandler.Queries.GetAgentTask(t.Context(), task.ID)
+	if err != nil || stillRunning.Status != "running" {
+		t.Fatalf("deleting a rule cancelled its already running consumer: %+v %v", stillRunning, err)
 	}
 	if rec := call(testHandler.ListIssueWakeupRuns, "GET", nil, nil); rec.Code != http.StatusNotFound {
 		t.Fatalf("runs of a deleted rule: %d", rec.Code)

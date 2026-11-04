@@ -5,53 +5,41 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
-func TestWakeupEvidenceStructuredMergeAndLegacyWriter(t *testing.T) {
+func TestWakeupEvidenceKeepsStructuredReceiptFacts(t *testing.T) {
 	w := db.IssueWakeup{Kind: "event", Instruction: "Inspect current state"}
-	fact := func(id string) []db.IssueWakeupReceipt {
-		return []db.IssueWakeupReceipt{{EventType: "comment.created", Payload: json.RawMessage(`{"comment_id":"` + id + `","coalesced_count":1}`)}}
+	receipts := []db.IssueWakeupReceipt{
+		{EventType: "comment.created", Payload: json.RawMessage(`{"comment_id":"first","coalesced_count":1}`)},
+		{EventType: "comment.created", Payload: json.RawMessage(`{"comment_id":"second","coalesced_count":1}`)},
 	}
-	note, raw := mergeWakeupEvidence(w, db.AgentTaskQueue{}, fact("first"))
-	contextJSON, _ := json.Marshal(map[string]json.RawMessage{"wakeup_evidence": raw})
-	previous := db.AgentTaskQueue{Context: contextJSON, HandoffNote: pgtype.Text{String: note, Valid: true}}
-	note, raw = mergeWakeupEvidence(w, previous, fact("second"))
-	var summary wakeupEvidence
-	if err := json.Unmarshal(raw, &summary); err != nil {
+	note, raw := buildWakeupEvidence(w, receipts)
+	var evidence wakeupEvidence
+	if err := json.Unmarshal(raw, &evidence); err != nil {
 		t.Fatal(err)
 	}
-	if len(summary.Facts) != 2 || summary.Legacy != "" || strings.Count(note, "Instruction:") != 1 {
-		t.Fatalf("facts were merged as rendered text: %s", raw)
+	if evidence.Version != 1 || len(evidence.Facts) != 2 || strings.Count(note, "Instruction:") != 1 {
+		t.Fatalf("receipts were not preserved as structured facts: %s", raw)
 	}
-	// An older server only knows handoff_note. Preserve its new input on upgrade.
-	previous.HandoffNote.String += "legacy-only-reference\n"
-	note, raw = mergeWakeupEvidence(w, previous, fact("third"))
-	if !strings.Contains(note, "legacy-only-reference") || !strings.Contains(note, "third") {
-		t.Fatal("old writer's input was lost")
-	}
-	if err := json.Unmarshal(raw, &summary); err != nil || summary.Legacy != previous.HandoffNote.String {
-		t.Fatalf("legacy text was parsed: %s", raw)
+	for i, want := range []string{"first", "second"} {
+		if evidence.Facts[i].EventType != "comment.created" || !strings.Contains(string(evidence.Facts[i].Payload), want) || !strings.Contains(note, want) {
+			t.Fatalf("receipt %d missing from evidence or rendering: %s", i, raw)
+		}
 	}
 }
 
-func TestWakeupEvidenceJSONBFormattingAndTimerReplacement(t *testing.T) {
+func TestWakeupEvidenceJSONBFormattingKeepsNumberPrecision(t *testing.T) {
 	w := db.IssueWakeup{Kind: "event", Instruction: "inspect"}
-	receipt := db.IssueWakeupReceipt{EventType: "comment.created", Payload: json.RawMessage(`{"revision":9007199254740993,"comment_id":"first"}`)}
-	note, _ := mergeWakeupEvidence(w, db.AgentTaskQueue{}, []db.IssueWakeupReceipt{receipt})
-	previous := db.AgentTaskQueue{Context: json.RawMessage(`{"wakeup_evidence":{"version":1,"facts":[{"event_type":"comment.created","payload":{"revision":9007199254740993, "comment_id":"first"}}]}}`), HandoffNote: pgtype.Text{String: note, Valid: true}}
-	_, raw := mergeWakeupEvidence(w, previous, nil)
-	var summary wakeupEvidence
-	_ = json.Unmarshal(raw, &summary)
-	if summary.Legacy != "" || !strings.Contains(string(raw), "9007199254740993") {
-		t.Fatalf("JSONB formatting lost structured data or number precision: %s", raw)
+	receipt := db.IssueWakeupReceipt{EventType: "comment.created", Payload: json.RawMessage(`{"revision":9007199254740993, "comment_id":"first"}`)}
+	note, raw := buildWakeupEvidence(w, []db.IssueWakeupReceipt{receipt})
+	var evidence wakeupEvidence
+	if err := json.Unmarshal(raw, &evidence); err != nil {
+		t.Fatal(err)
 	}
-	w.Kind = "every"
-	note, _ = mergeWakeupEvidence(w, previous, []db.IssueWakeupReceipt{{EventType: "time.due", Payload: json.RawMessage(`{"planned_at":"next"}`)}})
-	if strings.Contains(note, "first") || !strings.Contains(note, "next") {
-		t.Fatal("timer should keep only latest tick")
+	if len(evidence.Facts) != 1 || !strings.Contains(string(raw), "9007199254740993") || !strings.Contains(note, "9007199254740993") {
+		t.Fatalf("JSONB formatting lost structured data or number precision: %s", raw)
 	}
 }
 
@@ -62,32 +50,46 @@ func TestIssueWakeupStructuredEvidenceSurvivesDatabaseRoundTrip(t *testing.T) {
 	wakeDispatch(t, s, w)
 	second := f.Comment(t, util.UUIDToString(issue), "second")
 	wakeDispatch(t, s, w)
-	task, err := f.q.FindPendingWakeupTask(t.Context(), util.UUIDToString(w.ID))
-	if err != nil {
-		t.Fatal(err)
+	task := wakeupSessionTask(t, f, issue, agent)
+	inputs := wakeupInbox(t, f, w.ID)
+	if len(inputs) != 2 || inputs[0].SessionID != inputs[1].SessionID || inputs[0].Sequence >= inputs[1].Sequence {
+		t.Fatalf("independent rule inputs lost order or session identity: %+v", inputs)
 	}
-	var stored struct {
-		Evidence wakeupEvidence `json:"wakeup_evidence"`
+	for i, want := range []string{first, second} {
+		var payload wakeupSessionPayload
+		var evidence wakeupEvidence
+		if err := json.Unmarshal(inputs[i].Payload, &payload); err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(payload.Evidence, &evidence); err != nil {
+			t.Fatal(err)
+		}
+		if len(evidence.Facts) != 1 || evidence.Instruction != w.Instruction || !strings.Contains(payload.Note, want) || !strings.Contains(string(evidence.Facts[0].Payload), want) {
+			t.Fatalf("input %d lost its structured evidence: %s", i, inputs[i].Payload)
+		}
 	}
-	if err = json.Unmarshal(task.Context, &stored); err != nil {
-		t.Fatal(err)
+	claimed := wakeupClaimEvents(t, f, s, task, 32)
+	if len(claimed) != 2 || claimed[0].ID != inputs[0].ID || claimed[1].ID != inputs[1].ID {
+		t.Fatalf("delivery did not preserve round-tripped evidence order: %+v", claimed)
 	}
-	if len(stored.Evidence.Facts) != 2 || stored.Evidence.Legacy != "" || !strings.Contains(task.HandoffNote.String, first) || !strings.Contains(task.HandoffNote.String, second) {
-		t.Fatalf("summary did not survive database round trip: %s", task.Context)
+	if n := f.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id=$1", issue); n != 1 {
+		t.Fatalf("receipt transfers created %d consumers", n)
 	}
 }
 
 func TestWakeupEvidenceInstructionEditDoesNotReintroduceOldPrompt(t *testing.T) {
 	w := db.IssueWakeup{Kind: "event", Instruction: "old instructions"}
-	first, raw := mergeWakeupEvidence(w, db.AgentTaskQueue{}, []db.IssueWakeupReceipt{{EventType: "comment.created", Payload: json.RawMessage(`{"comment_id":"first"}`)}})
-	ctx, _ := json.Marshal(map[string]json.RawMessage{"wakeup_evidence": raw})
+	first, raw := buildWakeupEvidence(w, []db.IssueWakeupReceipt{{EventType: "comment.created", Payload: json.RawMessage(`{"comment_id":"first"}`)}})
 	w.Instruction = "new instructions"
-	note, raw := mergeWakeupEvidence(w, db.AgentTaskQueue{Context: ctx, HandoffNote: pgtype.Text{String: first, Valid: true}}, []db.IssueWakeupReceipt{{EventType: "comment.created", Payload: json.RawMessage(`{"comment_id":"second"}`)}})
+	note, current := buildWakeupEvidence(w, []db.IssueWakeupReceipt{{EventType: "comment.created", Payload: json.RawMessage(`{"comment_id":"second"}`)}})
 	var evidence wakeupEvidence
-	if err := json.Unmarshal(raw, &evidence); err != nil {
+	if err := json.Unmarshal(current, &evidence); err != nil {
 		t.Fatal(err)
 	}
-	if evidence.Legacy != "" || len(evidence.Facts) != 2 || evidence.Instruction != w.Instruction || strings.Contains(note, "old instructions") || !strings.Contains(note, "new instructions") {
-		t.Fatalf("prompt edit confused structured evidence: %s", note)
+	if len(evidence.Facts) != 1 || evidence.Instruction != w.Instruction || strings.Contains(note, "old instructions") || strings.Contains(note, "first") || !strings.Contains(note, "new instructions") {
+		t.Fatalf("new input revived a prior prompt: %s", note)
+	}
+	if !strings.Contains(first, "old instructions") || !strings.Contains(string(raw), "first") {
+		t.Fatal("rendering the next input mutated the previous immutable evidence")
 	}
 }

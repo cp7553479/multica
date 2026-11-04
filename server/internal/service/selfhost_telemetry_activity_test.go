@@ -94,8 +94,12 @@ func TestSelfHostTelemetryAutomaticChildDoneMustNotCountHumanActivity(t *testing
 		t.Fatal(err)
 	}
 	var source string
-	if err := f.Pool.QueryRow(ctx, "SELECT originator_source FROM agent_task_queue WHERE issue_id=$1 AND context->>'wakeup_system'='child_done'", issue).Scan(&source); err != nil {
-		t.Fatalf("child_done run was not created: %v", err)
+	if err := f.Pool.QueryRow(ctx, `SELECT t.originator_source FROM issue_agent_session s
+        JOIN agent_task_queue t ON t.id=s.active_task_id
+        WHERE s.issue_id=$1 AND t.context->>'type'='issue_session'
+        AND EXISTS (SELECT 1 FROM issue_agent_event e WHERE e.session_id=s.id
+            AND e.kind='wakeup.fired' AND e.payload->>'system_rule'='child_done')`, issue).Scan(&source); err != nil {
+		t.Fatalf("child_done input did not wake its persistent session: %v", err)
 	}
 	if got := delegationDays(t, f, f.UserID); len(got) != 0 {
 		t.Fatalf("automatic child_done run (source=%s) marked delegation days %v", source, got)
@@ -184,6 +188,9 @@ func TestSelfHostTelemetryCreateAssignedIssueMarksToday(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			f, s, _, agent := activityFixture(t)
 			cleanupDelegationDays(t, f, f.UserID)
+			s.Tasks.IssueSessionCanInvoke = func(_ context.Context, _ db.Agent, event db.IssueAgentEvent) bool {
+				return event.ActorType == "member" && event.ActorID == parseTestUUID(t, f.UserID)
+			}
 			ctx := context.Background()
 			f.Exec(t, "UPDATE workspace SET issue_counter=(SELECT COALESCE(MAX(number),0) FROM issue WHERE workspace_id=$1) WHERE id=$1", f.WorkspaceID)
 			issues := NewIssueService(f.q, f.Pool, f.svc.Bus, nil, s.Tasks)
@@ -198,8 +205,11 @@ func TestSelfHostTelemetryCreateAssignedIssueMarksToday(t *testing.T) {
 			f.Cleanup(t, "DELETE FROM issue WHERE id=$1", result.Issue.ID)
 			f.Cleanup(t, "DELETE FROM activity_log WHERE issue_id=$1", result.Issue.ID)
 			f.Cleanup(t, "DELETE FROM agent_task_queue WHERE issue_id=$1", result.Issue.ID)
-			if !result.AssignedTaskID.Valid {
-				t.Fatal("no assigned run was created")
+			if !result.AssignedSessionID.Valid {
+				t.Fatal("no assigned session was created")
+			}
+			if tc.fireAt.IsZero() != result.AssignedTaskID.Valid {
+				t.Fatalf("execution created=%v for deadline %v", result.AssignedTaskID.Valid, tc.fireAt)
 			}
 			if got := delegationDays(t, f, f.UserID); len(got) != 1 || got[0] != utcDate(time.Now()) {
 				t.Fatalf("create-with-assignee days = %v, want [today]", got)

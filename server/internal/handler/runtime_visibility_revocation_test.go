@@ -194,16 +194,14 @@ func TestRuntimeRevocationSettlesTaskSupplements(t *testing.T) {
 		t.Run(status, func(t *testing.T) {
 			_, ownerID, memberID := runtimeVisibilityFixture(t)
 			fixture := newSupplementFixture(t, "codex", "running", true)
-			var supplement CommentResponse
-			supplementRequest(t, fixture, "0199a4e8-22ce-7b01-bba5-999999999999", "Supplement for the current run").Want(http.StatusCreated).JSON(&supplement)
+			commentID := insertHistoricalTaskSupplement(t, fixture, "Historical input awaiting delivery", status, "member", testUserID)
 			dbfx.Exec(t, `UPDATE agent_runtime SET owner_id = $2, visibility = 'public' WHERE id = $1`, fixture.runtimeID, ownerID)
 			dbfx.Exec(t, `UPDATE agent SET owner_id = $2 WHERE id = $1`, fixture.agentID, memberID)
-			dbfx.Exec(t, `UPDATE task_supplement SET status = $2 WHERE comment_id = $1`, supplement.ID, status)
 			runtimePrivacyRequest(t, fixture.runtimeID, ownerID, map[string]any{
 				"expected_nonowner_agent_ids": []string{fixture.agentID}, "expected_task_ids": []string{fixture.taskID},
 			}).Want(http.StatusOK)
 			receipt, err := testHandler.Queries.GetTaskSupplementForRun(t.Context(), db.GetTaskSupplementForRunParams{
-				CommentID: parseUUID(supplement.ID), TaskID: parseUUID(fixture.taskID), WorkspaceID: parseUUID(testWorkspaceID),
+				CommentID: parseUUID(commentID), TaskID: parseUUID(fixture.taskID), WorkspaceID: parseUUID(testWorkspaceID),
 			})
 			if err != nil || receipt.Status != "failed" || receipt.FailureReason.String != "turn_ended" {
 				t.Fatalf("revocation left an unresolved supplement: %#v, error=%v", receipt, err)

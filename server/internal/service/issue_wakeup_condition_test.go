@@ -41,7 +41,21 @@ func wakeTick(t *testing.T, f principalFixture, s *IssueWakeupService, id pgtype
 
 func wakeRuns(t *testing.T, f principalFixture, id pgtype.UUID) int {
 	t.Helper()
-	return f.Count(t, "SELECT count(*) FROM agent_task_queue WHERE context->>'wakeup_id'=$1", util.UUIDToString(id))
+	return len(wakeupInbox(t, f, id))
+}
+
+// conditionNote checks the evidence actually persisted for later provider delivery.
+func conditionNote(t *testing.T, f principalFixture, id pgtype.UUID) string {
+	t.Helper()
+	events := wakeupInbox(t, f, id)
+	if len(events) == 0 {
+		t.Fatal("condition has no durable input")
+	}
+	var payload wakeupSessionPayload
+	if err := json.Unmarshal(events[len(events)-1].Payload, &payload); err != nil {
+		t.Fatal(err)
+	}
+	return payload.Note
 }
 
 func condition(t *testing.T, v map[string]any) json.RawMessage {
@@ -76,16 +90,13 @@ func TestWakeupConditionFieldValueWakesOnceWhenItHolds(t *testing.T) {
 	if got.Enabled {
 		t.Fatal("a once condition must be consumed")
 	}
-	task, err := f.q.GetAgentTask(context.Background(), got.LastTaskID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(task.HandoffNote.String, "condition.met") || !strings.Contains(task.HandoffNote.String, `"status":"in_review"`) {
-		t.Fatalf("trigger facts missing the observation: %s", task.HandoffNote.String)
+	note := conditionNote(t, f, got.ID)
+	if !strings.Contains(note, "condition.met") || !strings.Contains(note, `"status":"in_review"`) {
+		t.Fatalf("trigger facts missing the observation: %s", note)
 	}
 	// Status-change hints never reach the agent as separate facts.
-	if strings.Contains(task.HandoffNote.String, "issue.status_changed") {
-		t.Fatalf("hint leaked into the run: %s", task.HandoffNote.String)
+	if strings.Contains(note, "issue.status_changed") {
+		t.Fatalf("hint leaked into the run: %s", note)
 	}
 	if n := f.Count(t, "SELECT count(*) FROM activity_log WHERE issue_id=$1 AND action='wakeup_triggered'", issue); n != 1 {
 		t.Fatalf("trigger timeline entries = %d, want 1", n)
@@ -145,12 +156,9 @@ func TestWakeupConditionOtherIssueUsesScheduledChecks(t *testing.T) {
 	if got.Enabled || got.FireCount != 1 || got.LastError.Valid || wakeRuns(t, f, w.ID) != 1 {
 		t.Fatalf("due condition: enabled=%t fire_count=%d last_error=%+v", got.Enabled, got.FireCount, got.LastError)
 	}
-	task, err := f.q.GetAgentTask(ctx, got.LastTaskID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(task.HandoffNote.String, "condition.met") || !strings.Contains(task.HandoffNote.String, other) || !strings.Contains(task.HandoffNote.String, `"status":"in_review"`) {
-		t.Fatalf("cross-issue observation missing from the run: %s", task.HandoffNote.String)
+	note := conditionNote(t, f, got.ID)
+	if !strings.Contains(note, "condition.met") || !strings.Contains(note, other) || !strings.Contains(note, `"status":"in_review"`) {
+		t.Fatalf("cross-issue observation missing from the run: %s", note)
 	}
 	got = tick()
 	if got.FireCount != 1 || wakeRuns(t, f, w.ID) != 1 {
@@ -188,12 +196,9 @@ func TestWakeupConditionOtherIssueBlocked(t *testing.T) {
 	if got.Enabled || got.FireCount != 1 || wakeRuns(t, f, w.ID) != 1 {
 		t.Fatalf("blocked child: enabled=%t fire_count=%d last_error=%+v", got.Enabled, got.FireCount, got.LastError)
 	}
-	task, err := f.q.GetAgentTask(ctx, got.LastTaskID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(task.HandoffNote.String, other) || !strings.Contains(task.HandoffNote.String, `"status":"blocked"`) {
-		t.Fatalf("blocked observation missing from the run: %s", task.HandoffNote.String)
+	note := conditionNote(t, f, got.ID)
+	if !strings.Contains(note, other) || !strings.Contains(note, `"status":"blocked"`) {
+		t.Fatalf("blocked observation missing from the run: %s", note)
 	}
 }
 
@@ -222,7 +227,6 @@ func TestWakeupConditionRepeatsOnlyWhenItBecomesTrueAgain(t *testing.T) {
 	if n := wakeRuns(t, f, w.ID); n != 1 {
 		t.Fatalf("a condition that stays true fired %d times, want 1", n)
 	}
-	f.Exec(t, "UPDATE agent_task_queue SET status='completed',completed_at=now() WHERE context->>'wakeup_id'=$1", util.UUIDToString(w.ID))
 	f.Exec(t, "DELETE FROM issue_to_label WHERE issue_id=$1 AND label_id=$2", issue, label)
 	wakeTick(t, f, s, w.ID)
 	f.Exec(t, "INSERT INTO issue_to_label(issue_id,label_id) VALUES($1,$2)", issue, label)
@@ -249,9 +253,7 @@ func TestWakeupConditionPRConflictsWakesOnEachNewConflict(t *testing.T) {
 	f.Exec(t, "INSERT INTO issue_pull_request(issue_id,pull_request_id) VALUES($1,$2)", issue, pr)
 	w := wakeCreate(t, f, s, issue, WakeupInput{AgentID: agent, Kind: "event", Mode: "continuous", Instruction: "Resolve the conflict",
 		Condition: condition(t, map[string]any{"type": "pull_request", "event": "conflicts"})})
-	finishRuns := func() {
-		f.Exec(t, "UPDATE agent_task_queue SET status='completed',completed_at=now() WHERE context->>'wakeup_id'=$1 AND status<>'completed'", util.UUIDToString(w.ID))
-	}
+
 	snapshot := func(head, snapshotHead, mergeable string) db.IssueWakeup {
 		t.Helper()
 		f.Exec(t, "UPDATE github_pull_request SET head_sha=$2,snapshot_head_sha=$3,api_mergeable=$4 WHERE id=$1", pr, head, snapshotHead, mergeable)
@@ -268,14 +270,10 @@ func TestWakeupConditionPRConflictsWakesOnEachNewConflict(t *testing.T) {
 	expectRuns(0, "mergeable")
 	got := snapshot("a", "a", "CONFLICTING")
 	expectRuns(1, "conflict")
-	task, err := f.q.GetAgentTask(context.Background(), got.LastTaskID)
-	if err != nil {
-		t.Fatal(err)
+	note := conditionNote(t, f, got.ID)
+	if !strings.Contains(note, `"mergeable":"conflicting"`) || !strings.Contains(note, `"head_sha":"a"`) {
+		t.Fatalf("conflict facts missing from the run: %s", note)
 	}
-	if !strings.Contains(task.HandoffNote.String, `"mergeable":"conflicting"`) || !strings.Contains(task.HandoffNote.String, `"head_sha":"a"`) {
-		t.Fatalf("conflict facts missing from the run: %s", task.HandoffNote.String)
-	}
-	finishRuns()
 	// GitHub recomputing after another base move is not a new conflict.
 	snapshot("a", "a", "UNKNOWN")
 	snapshot("a", "a", "CONFLICTING")
@@ -294,7 +292,6 @@ func TestWakeupConditionPRConflictsWakesOnEachNewConflict(t *testing.T) {
 	if !got.Enabled || got.FireCount != 2 || got.LastError.Valid {
 		t.Fatalf("continuous rule after two conflicts: enabled=%t fire_count=%d error=%+v", got.Enabled, got.FireCount, got.LastError)
 	}
-	finishRuns()
 	f.Exec(t, "UPDATE github_pull_request SET state='merged' WHERE id=$1", pr)
 	wakeTick(t, f, s, w.ID)
 	expectRuns(2, "merged PR")
@@ -337,7 +334,6 @@ func TestWakeupConditionPRConflictsAcrossSeveralPRs(t *testing.T) {
 			if n := wakeRuns(t, f, w.ID); n != 1 {
 				t.Fatalf("initial conflict runs = %d, want 1", n)
 			}
-			f.Exec(t, "UPDATE agent_task_queue SET status='completed',completed_at=now() WHERE context->>'wakeup_id'=$1", util.UUIDToString(w.ID))
 			f.Exec(t, "UPDATE github_pull_request SET api_mergeable='MERGEABLE' WHERE id=$1", a)
 			if tc.sameNumber {
 				f.Exec(t, "UPDATE github_pull_request SET api_mergeable='CONFLICTING' WHERE id=$1", b)
@@ -388,7 +384,6 @@ func TestWakeupConditionPRSharedNumberWakesForEachPR(t *testing.T) {
 			if n := wakeRuns(t, f, w.ID); n != 1 {
 				t.Fatalf("after the first PR: %d runs, want 1", n)
 			}
-			f.Exec(t, "UPDATE agent_task_queue SET status='completed',completed_at=now() WHERE context->>'wakeup_id'=$1", util.UUIDToString(w.ID))
 			satisfy(b)
 			if n := wakeRuns(t, f, w.ID); n != 2 {
 				t.Fatalf("after the second PR: %d runs, want 2", n)
@@ -420,16 +415,19 @@ func TestWakeupConditionChildrenAndOtherIssue(t *testing.T) {
 	f.Exec(t, "UPDATE issue SET status='done' WHERE id=$1", other)
 	wakeTick(t, f, s, stage.ID)
 	wakeTick(t, f, s, watch.ID)
-	// Both hold for the same agent: the second waits for the first one's run
-	// and joins it when it is claimed, instead of queuing another behind it.
-	if wakeRuns(t, f, stage.ID) != 1 || wakeRuns(t, f, watch.ID) != 0 {
-		t.Fatalf("stage runs=%d, other-issue runs=%d, want one shared run", wakeRuns(t, f, stage.ID), wakeRuns(t, f, watch.ID))
+	// Both conditions become ordered inputs of the same logical session.
+	if wakeRuns(t, f, stage.ID) != 1 || wakeRuns(t, f, watch.ID) != 1 {
+		t.Fatalf("stage inputs=%d, other-issue inputs=%d, want one each", wakeRuns(t, f, stage.ID), wakeRuns(t, f, watch.ID))
 	}
-	var shared string
-	f.QueryRow(t, "SELECT id FROM agent_task_queue WHERE context->>'wakeup_id'=$1", util.UUIDToString(stage.ID)).Scan(&shared)
-	if notes := wakeClaim(t, f, s, shared); !strings.Contains(notes, "Continue after the blocker") || !strings.Contains(notes, `"state":"done"`) {
-		t.Fatalf("shared run lacks the joined rule: %q", notes)
+	task := wakeupSessionTask(t, f, issue, agent)
+	events := wakeupClaimEvents(t, f, s, task, 100)
+	if len(events) != 2 || events[0].SessionID != events[1].SessionID || events[0].Sequence >= events[1].Sequence {
+		t.Fatalf("condition inputs did not share one ordered consumer: %+v", events)
 	}
+	if note := conditionNote(t, f, watch.ID); !strings.Contains(note, "Continue after the blocker") || !strings.Contains(note, `"state":"done"`) {
+		t.Fatalf("second condition evidence missing: %q", note)
+	}
+
 }
 
 func TestWakeupConditionPullRequestChecksWaitForNewResult(t *testing.T) {
@@ -458,12 +456,9 @@ func TestWakeupConditionPullRequestChecksWaitForNewResult(t *testing.T) {
 	if n := wakeRuns(t, f, w.ID); n != 1 {
 		t.Fatalf("finished checks started %d runs, want 1", n)
 	}
-	task, err := f.q.GetAgentTask(ctx, got.LastTaskID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(task.HandoffNote.String, `"checks":"failure"`) || !strings.Contains(task.HandoffNote.String, `"head_sha":"bbb"`) {
-		t.Fatalf("PR facts missing: %s", task.HandoffNote.String)
+	note := conditionNote(t, f, got.ID)
+	if !strings.Contains(note, `"checks":"failure"`) || !strings.Contains(note, `"head_sha":"bbb"`) {
+		t.Fatalf("PR facts missing: %s", note)
 	}
 }
 
@@ -688,15 +683,12 @@ func TestWakeupConditionPullRequestChecksCoversVCSProviders(t *testing.T) {
 	if n := wakeRuns(t, f, w.ID); n != 1 {
 		t.Fatalf("failed statuses on the new head started %d runs, want 1", n)
 	}
-	task, err := f.q.GetAgentTask(ctx, got.LastTaskID)
-	if err != nil {
-		t.Fatal(err)
+	note := conditionNote(t, f, got.ID)
+	if !strings.Contains(note, `"checks":"failure"`) || !strings.Contains(note, `"head_sha":"bbb"`) {
+		t.Fatalf("VCS PR facts missing: %s", note)
 	}
-	if !strings.Contains(task.HandoffNote.String, `"checks":"failure"`) || !strings.Contains(task.HandoffNote.String, `"head_sha":"bbb"`) {
-		t.Fatalf("VCS PR facts missing: %s", task.HandoffNote.String)
-	}
-	if !strings.Contains(task.HandoffNote.String, `"provider":"forgejo"`) {
-		t.Fatalf("provider missing from PR facts: %s", task.HandoffNote.String)
+	if !strings.Contains(note, `"provider":"forgejo"`) {
+		t.Fatalf("provider missing from PR facts: %s", note)
 	}
 }
 
