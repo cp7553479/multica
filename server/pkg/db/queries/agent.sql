@@ -2063,16 +2063,6 @@ WHERE issue_id = $1 AND agent_id = $2
   )
   AND comment_thread_id IS NOT DISTINCT FROM comment_thread_root_id(sqlc.narg('thread_comment_id')::uuid);
 
--- name: GetLatestTaskRoleForIssueAndAgent :one
--- Returns the role markers from the agent's most recent task on this issue.
--- Used by the squad-leader self-trigger guard to tell apart leader tasks,
--- same-squad worker tasks, and generic agent tasks such as direct mentions or
--- thread-parent replies.
-SELECT is_leader_task, squad_id FROM agent_task_queue
-WHERE issue_id = $1 AND agent_id = $2
-ORDER BY created_at DESC
-LIMIT 1;
-
 -- name: ListPendingTasksByRuntime :many
 SELECT * FROM agent_task_queue
 WHERE runtime_id = $1 AND status IN ('queued', 'dispatched')

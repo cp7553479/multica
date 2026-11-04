@@ -62,15 +62,11 @@ export function IssueAgentSessions({ issueId }: { issueId: string }) {
   const [open, setOpen] = useState(true);
   const sessions = useQuery(issueAgentSessionsOptions(wsId, issueId));
   const retry = useRetryIssueAgentSessionEvent(wsId, issueId);
-  const [retryError, setRetryError] = useState(false);
 
   if (sessions.isPending || (!sessions.isError && !sessions.data?.length)) return null;
 
   const retryEvent = (event: IssueAgentSessionEvent) => {
-    setRetryError(false);
-    retry.mutate({ sessionId: event.session_id, eventId: event.id }, {
-      onError: () => setRetryError(true),
-    });
+    retry.mutate({ sessionId: event.session_id, eventId: event.id });
   };
 
   return (
@@ -79,7 +75,7 @@ export function IssueAgentSessions({ issueId }: { issueId: string }) {
         count={sessions.data?.length} />
       {open && <div className="space-y-3 px-4">
         {sessions.isError && <p role="alert" className="text-caption text-destructive">{t(($) => $.agent_sessions.load_failed)}</p>}
-        {retryError && <p role="alert" className="text-caption text-destructive">{t(($) => $.agent_sessions.retry_failed)}</p>}
+        {retry.isError && <p role="alert" className="text-caption text-destructive">{t(($) => $.agent_sessions.retry_failed)}</p>}
         {sessions.data?.map((session) => {
           const state = session.state === "ready"
             ? session.active_task_id ? t(($) => $.agent_sessions.working) : t(($) => $.agent_sessions.idle)

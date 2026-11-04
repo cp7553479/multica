@@ -1052,37 +1052,28 @@ func (q *Queries) ListPausedWakeupIssues(ctx context.Context, workspaceID pgtype
 
 const listPendingWakeupInputGroups = `-- name: ListPendingWakeupInputGroups :many
 WITH groups AS (
- SELECT w.id AS wakeup_id,w.issue_id,(w.system_rule IS NOT NULL)::bool AS system_rule,
- false::bool AS reserved,false::bool AS own_claimed,false::bool AS user_waiting,
- min(r.created_at)::timestamptz AS oldest,count(*)::int AS inputs
+ SELECT w.id AS wakeup_id,min(r.created_at)::timestamptz AS oldest
  FROM issue_wakeup_receipt r JOIN issue_wakeup w ON w.id=r.wakeup_id
  WHERE r.processed_at IS NULL
- AND ($5::uuid[] IS NULL OR w.workspace_id=ANY($5::uuid[]))
- GROUP BY 1,2,3
+ AND ($4::uuid[] IS NULL OR w.workspace_id=ANY($4::uuid[]))
+ GROUP BY 1
 )
-SELECT g.wakeup_id,g.issue_id,g.system_rule,g.reserved,g.own_claimed,g.user_waiting,g.oldest,g.inputs FROM groups g
+SELECT g.wakeup_id,g.oldest FROM groups g
 WHERE $1::timestamptz IS NULL
- OR (g.oldest,g.wakeup_id,g.reserved)>($1::timestamptz,$2::uuid,$3::bool)
-ORDER BY g.oldest,g.wakeup_id,g.reserved LIMIT $4
+ OR (g.oldest,g.wakeup_id)>($1::timestamptz,$2::uuid)
+ORDER BY g.oldest,g.wakeup_id LIMIT $3
 `
 
 type ListPendingWakeupInputGroupsParams struct {
 	AfterOldest   pgtype.Timestamptz `json:"after_oldest"`
 	AfterWakeupID pgtype.UUID        `json:"after_wakeup_id"`
-	AfterReserved bool               `json:"after_reserved"`
 	PageSize      int32              `json:"page_size"`
 	WorkspaceIds  []pgtype.UUID      `json:"workspace_ids"`
 }
 
 type ListPendingWakeupInputGroupsRow struct {
-	WakeupID    pgtype.UUID        `json:"wakeup_id"`
-	IssueID     pgtype.UUID        `json:"issue_id"`
-	SystemRule  bool               `json:"system_rule"`
-	Reserved    bool               `json:"reserved"`
-	OwnClaimed  bool               `json:"own_claimed"`
-	UserWaiting bool               `json:"user_waiting"`
-	Oldest      pgtype.Timestamptz `json:"oldest"`
-	Inputs      int32              `json:"inputs"`
+	WakeupID pgtype.UUID        `json:"wakeup_id"`
+	Oldest   pgtype.Timestamptz `json:"oldest"`
 }
 
 // Rule receipts wait only for transactional transfer to the session inbox.
@@ -1092,7 +1083,6 @@ func (q *Queries) ListPendingWakeupInputGroups(ctx context.Context, arg ListPend
 	rows, err := q.db.Query(ctx, listPendingWakeupInputGroups,
 		arg.AfterOldest,
 		arg.AfterWakeupID,
-		arg.AfterReserved,
 		arg.PageSize,
 		arg.WorkspaceIds,
 	)
@@ -1103,16 +1093,7 @@ func (q *Queries) ListPendingWakeupInputGroups(ctx context.Context, arg ListPend
 	items := []ListPendingWakeupInputGroupsRow{}
 	for rows.Next() {
 		var i ListPendingWakeupInputGroupsRow
-		if err := rows.Scan(
-			&i.WakeupID,
-			&i.IssueID,
-			&i.SystemRule,
-			&i.Reserved,
-			&i.OwnClaimed,
-			&i.UserWaiting,
-			&i.Oldest,
-			&i.Inputs,
-		); err != nil {
+		if err := rows.Scan(&i.WakeupID, &i.Oldest); err != nil {
 			return nil, err
 		}
 		items = append(items, i)

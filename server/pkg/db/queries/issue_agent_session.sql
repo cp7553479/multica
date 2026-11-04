@@ -271,13 +271,6 @@ WHERE s.id = @session_id
   AND lock_task_owner_rows(s.agent_id, s.issue_id, s.runtime_id)
 RETURNING agent_task_queue.*;
 
--- name: DeleteIssueAgentSessionsForIssue :exec
-WITH removed_events AS (
-    DELETE FROM issue_agent_event e WHERE e.session_id IN (
-        SELECT s.id FROM issue_agent_session s WHERE s.issue_id = @issue_id AND s.workspace_id = @workspace_id
-    )
-)
-DELETE FROM issue_agent_session s WHERE s.issue_id = @issue_id AND s.workspace_id = @workspace_id;
 
 -- name: GetAutopilotIssueAgentAssignment :one
 SELECT * FROM issue_agent_event WHERE session_id= @session_id AND sequence=1 AND kind='assigned';

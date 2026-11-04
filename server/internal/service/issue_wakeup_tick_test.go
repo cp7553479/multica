@@ -211,8 +211,8 @@ func TestPendingWakeupInputsRemainBacklogUntilDurableTransfer(t *testing.T) {
 	backlog := func(why string) {
 		t.Helper()
 		p := read()
-		if age, ok := p.age(time.Now()); !ok || age < 9*time.Minute || p.Held != 0 {
-			t.Fatalf("%s: age=%v ok=%v held=%d, want ~10m backlog", why, age, ok, p.Held)
+		if age, ok := p.age(time.Now()); !ok || age < 9*time.Minute {
+			t.Fatalf("%s: age=%v ok=%v, want ~10m backlog", why, age, ok)
 		}
 	}
 	backlog("unhandled input")
@@ -227,7 +227,7 @@ func TestPendingWakeupInputsRemainBacklogUntilDurableTransfer(t *testing.T) {
 	// Drain the old execution before starting the new architecture's consumer.
 	f.Exec(t, "UPDATE agent_task_queue SET status='completed',completed_at=now() WHERE id=$1", run)
 	wakeDispatch(t, s, w)
-	if p := read(); p.OldestReady.Valid || p.Held != 0 {
+	if p := read(); p.OldestReady.Valid {
 		t.Fatalf("transferred receipt remains rule backlog: %+v", p)
 	}
 	if events := wakeupInbox(t, f, w.ID); len(events) != 1 || events[0].Status != "pending" || events[0].DeliveredAt.Valid {
@@ -279,17 +279,17 @@ func TestPendingWakeupInputsSystemRuleIsNotHeldByLegacyExecutions(t *testing.T) 
 	}
 	// Another agent's queued run cannot take a platform rule's input.
 	queued(other, runAs.UserID.String())
-	if p := read(); !p.OldestReady.Valid || p.Held != 0 {
+	if p := read(); !p.OldestReady.Valid {
 		t.Fatalf("input with only another agent's run queued: %+v, want backlog", p)
 	}
 	// Nor can the target's run as somebody else.
 	stranger := queued(target, f.member(t, "someone-else"))
-	if p := read(); !p.OldestReady.Valid || p.Held != 0 {
+	if p := read(); !p.OldestReady.Valid {
 		t.Fatalf("input with the target's run as another person: %+v, want backlog", p)
 	}
 	f.Exec(t, "UPDATE agent_task_queue SET status='cancelled', completed_at=now() WHERE id=$1", stranger)
 	queued(target, runAs.UserID.String())
-	if p := read(); !p.OldestReady.Valid || p.Held != 0 {
+	if p := read(); !p.OldestReady.Valid {
 		t.Fatalf("input with the target's run queued: %+v, want backlog", p)
 	}
 }
@@ -322,8 +322,8 @@ func TestPendingWakeupInputsScansEveryPageOfUntransferredGroups(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if age, ok := p.age(time.Now()); !ok || age < 19*time.Minute || age > 25*time.Minute || p.Held != 0 {
-			t.Fatalf("page %d: oldest untransferred input: age=%v ok=%v held=%d", page, age, ok, p.Held)
+		if age, ok := p.age(time.Now()); !ok || age < 19*time.Minute || age > 25*time.Minute {
+			t.Fatalf("page %d: oldest untransferred input: age=%v ok=%v", page, age, ok)
 		}
 	}
 	f.Exec(t, "UPDATE issue_wakeup_receipt SET processed_at=now() WHERE wakeup_id IN (SELECT id FROM issue_wakeup WHERE issue_id=$1)", issue)
@@ -332,8 +332,8 @@ func TestPendingWakeupInputsScansEveryPageOfUntransferredGroups(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if age, ok := p.age(time.Now()); !ok || age < 9*time.Minute || age > 15*time.Minute || p.Held != 0 {
-			t.Fatalf("page %d: younger pending group after transfer: age=%v ok=%v held=%d", page, age, ok, p.Held)
+		if age, ok := p.age(time.Now()); !ok || age < 9*time.Minute || age > 15*time.Minute {
+			t.Fatalf("page %d: younger pending group after transfer: age=%v ok=%v", page, age, ok)
 		}
 	}
 }

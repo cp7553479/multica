@@ -45,7 +45,7 @@ func TestIssueSessionDeliversInitialThenLiveEventsInOrder(t *testing.T) {
 		}
 		return nil
 	}}
-	err := d.runIssueSessionLoop(ctx, session, "task", issueSessionTransport{SessionID: "session", Initial: []IssueSessionEvent{{ID: "initial", Sequence: 1}}}, nil, d.logger)
+	err := d.runIssueSessionLoop(ctx, session, "task", issueSessionTransport{Initial: []IssueSessionEvent{{ID: "initial", Sequence: 1}}}, nil, d.logger)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -133,9 +133,14 @@ func TestIssueAgentSessionEventDeduplication(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	result, err := f.svc.PublishIssueAgentEvent(ctx, issue, f.agentID, IssueAgentEventInput{
-		Kind: "comment.created", SourceID: comment.ID, SourceRevision: comment.Revision,
-		ActorType: "member", ActorID: util.MustParseUUID(f.fx.UserID), Payload: json.RawMessage(`{"content":"duplicate"}`),
+	var result IssueAgentEventDelivery
+	err = f.svc.runInTx(ctx, func(q *db.Queries) error {
+		var err error
+		result, err = f.svc.appendIssueAgentEvent(ctx, q, issue, f.agentID, IssueAgentEventInput{
+			Kind: "comment.created", SourceID: comment.ID, SourceRevision: comment.Revision,
+			ActorType: "member", ActorID: util.MustParseUUID(f.fx.UserID), Payload: json.RawMessage(`{"content":"duplicate"}`),
+		})
+		return err
 	})
 	if err != nil || !result.Duplicate || result.Event.SessionID != session.ID {
 		t.Fatalf("duplicate capture was not reused: result=%+v err=%v", result, err)

@@ -81,7 +81,7 @@ func TestIssueSessionCrashProcessHelper(t *testing.T) {
 	if mode == "resume" {
 		eventID = "followup"
 	}
-	ctx := context.WithValue(t.Context(), issueSessionTransportKey{}, issueSessionTransport{SessionID: "logical-session", Initial: []IssueSessionEvent{{ID: eventID}}, AckedInitial: &atomic.Int32{}})
+	ctx := context.WithValue(t.Context(), issueSessionTransportKey{}, issueSessionTransport{Initial: []IssueSessionEvent{{ID: eventID}}, AckedInitial: &atomic.Int32{}})
 	_, _, err := d.executeAndDrain(ctx, crashRecoveryFakeBackend{url: url, mode: mode}, "input", agent.ExecOptions{
 		EnableTaskSupplement: true, StrictSessionResume: true,
 		ResumeSessionID: os.Getenv("MULTICA_FAKE_DAEMON_PROVIDER_ID"), Cwd: os.Getenv("MULTICA_FAKE_DAEMON_WORKDIR"),

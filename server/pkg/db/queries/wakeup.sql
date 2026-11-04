@@ -167,18 +167,16 @@ ORDER BY w.updated_at,w.id LIMIT @row_limit;
 -- Provider delivery is observed on issue_agent_event, never by holding receipts
 -- behind a queued or claimed execution.
 WITH groups AS (
- SELECT w.id AS wakeup_id,w.issue_id,(w.system_rule IS NOT NULL)::bool AS system_rule,
- false::bool AS reserved,false::bool AS own_claimed,false::bool AS user_waiting,
- min(r.created_at)::timestamptz AS oldest,count(*)::int AS inputs
+ SELECT w.id AS wakeup_id,min(r.created_at)::timestamptz AS oldest
  FROM issue_wakeup_receipt r JOIN issue_wakeup w ON w.id=r.wakeup_id
  WHERE r.processed_at IS NULL
  AND (sqlc.narg('workspace_ids')::uuid[] IS NULL OR w.workspace_id=ANY(sqlc.narg('workspace_ids')::uuid[]))
- GROUP BY 1,2,3
+ GROUP BY 1
 )
-SELECT g.wakeup_id,g.issue_id,g.system_rule,g.reserved,g.own_claimed,g.user_waiting,g.oldest,g.inputs FROM groups g
+SELECT g.wakeup_id,g.oldest FROM groups g
 WHERE sqlc.narg('after_oldest')::timestamptz IS NULL
- OR (g.oldest,g.wakeup_id,g.reserved)>(sqlc.narg('after_oldest')::timestamptz,@after_wakeup_id::uuid,@after_reserved::bool)
-ORDER BY g.oldest,g.wakeup_id,g.reserved LIMIT @page_size;
+ OR (g.oldest,g.wakeup_id)>(sqlc.narg('after_oldest')::timestamptz,@after_wakeup_id::uuid)
+ORDER BY g.oldest,g.wakeup_id LIMIT @page_size;
 -- name: ListPendingWakeupReceipts :many
 SELECT * FROM issue_wakeup_receipt WHERE wakeup_id= @wakeup_id AND revision= @revision AND processed_at IS NULL ORDER BY created_at,id LIMIT 100 FOR UPDATE;
 

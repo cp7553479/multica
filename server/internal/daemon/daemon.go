@@ -8741,7 +8741,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	}
 	prompt := issueSessionPrompt(task, BuildPrompt(task, provider, promptOptions...))
 	if task.IssueAgentSessionID != "" {
-		ctx = context.WithValue(ctx, issueSessionTransportKey{}, issueSessionTransport{SessionID: task.IssueAgentSessionID, Initial: task.IssueSessionEvents, AckedInitial: &atomic.Int32{}})
+		ctx = context.WithValue(ctx, issueSessionTransportKey{}, issueSessionTransport{Initial: task.IssueSessionEvents, AckedInitial: &atomic.Int32{}})
 	}
 
 	// Pass task-scoped auth credentials and context so the spawned agent CLI

@@ -494,25 +494,6 @@ func (q *Queries) DeferIssueAgentSessionUntil(ctx context.Context, arg DeferIssu
 	return i, err
 }
 
-const deleteIssueAgentSessionsForIssue = `-- name: DeleteIssueAgentSessionsForIssue :exec
-WITH removed_events AS (
-    DELETE FROM issue_agent_event e WHERE e.session_id IN (
-        SELECT s.id FROM issue_agent_session s WHERE s.issue_id = $1 AND s.workspace_id = $2
-    )
-)
-DELETE FROM issue_agent_session s WHERE s.issue_id = $1 AND s.workspace_id = $2
-`
-
-type DeleteIssueAgentSessionsForIssueParams struct {
-	IssueID     pgtype.UUID `json:"issue_id"`
-	WorkspaceID pgtype.UUID `json:"workspace_id"`
-}
-
-func (q *Queries) DeleteIssueAgentSessionsForIssue(ctx context.Context, arg DeleteIssueAgentSessionsForIssueParams) error {
-	_, err := q.db.Exec(ctx, deleteIssueAgentSessionsForIssue, arg.IssueID, arg.WorkspaceID)
-	return err
-}
-
 const ensureIssueAgentSession = `-- name: EnsureIssueAgentSession :one
 INSERT INTO issue_agent_session (id, workspace_id, issue_id, agent_id, runtime_id)
 SELECT $1, $2, $3, $4, $5

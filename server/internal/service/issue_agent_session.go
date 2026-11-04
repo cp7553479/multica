@@ -39,7 +39,6 @@ type IssueAgentEventInput struct {
 type IssueAgentEventDelivery struct {
 	Session   db.IssueAgentSession
 	Event     db.IssueAgentEvent
-	Task      *db.AgentTaskQueue
 	Duplicate bool
 }
 
@@ -84,32 +83,6 @@ func issueAgentEventKey(input IssueAgentEventInput) (string, error) {
 	return fmt.Sprintf("%s:%s:%d", input.Kind, util.UUIDToString(input.SourceID), input.SourceRevision), nil
 }
 
-// PublishIssueAgentEvent is also available to non-database event sources. Normal
-// issue and comment writes capture their event in the mutation transaction.
-func (s *TaskService) PublishIssueAgentEvent(ctx context.Context, issue db.Issue, agentID pgtype.UUID, input IssueAgentEventInput) (IssueAgentEventDelivery, error) {
-	var out IssueAgentEventDelivery
-	_, err := issueAgentEventKey(input)
-	if err != nil {
-		return out, err
-	}
-	if !json.Valid(input.Payload) {
-		return out, errors.New("event payload must be valid JSON")
-	}
-	err = s.runInTx(ctx, func(q *db.Queries) error {
-		var appendErr error
-		out, appendErr = s.appendIssueAgentEvent(ctx, q, issue, agentID, input)
-		return appendErr
-	})
-	if err != nil {
-		return out, err
-	}
-	out.Task, err = s.WakeIssueAgentSession(ctx, out.Session.ID)
-	if err == nil {
-		out.Session, err = s.Queries.GetIssueAgentSession(ctx, out.Session.ID)
-	}
-	return out, err
-}
-
 // appendIssueAgentEvent shares the caller's mutation transaction. Waking the
 // consumer happens only after that transaction commits.
 func (s *TaskService) appendIssueAgentEvent(ctx context.Context, q *db.Queries, issue db.Issue, agentID pgtype.UUID, input IssueAgentEventInput) (IssueAgentEventDelivery, error) {
@@ -125,42 +98,39 @@ func (s *TaskService) appendIssueAgentEvent(ctx context.Context, q *db.Queries, 
 	if err != nil {
 		return out, err
 	}
-	err = func() error {
-		session, err := q.EnsureIssueAgentSession(ctx, db.EnsureIssueAgentSessionParams{
-			ID: dbid.NewV7(), WorkspaceID: issue.WorkspaceID, IssueID: issue.ID, AgentID: agentID, RuntimeID: agent.RuntimeID,
-		})
-		if err != nil {
-			return err
-		}
-		out.Session = session
-		prior, err := q.GetIssueAgentEventByKey(ctx, db.GetIssueAgentEventByKeyParams{SessionID: session.ID, EventKey: key})
-		if err == nil {
-			out.Event, out.Duplicate = prior, true
-			return nil
-		}
-		if !errors.Is(err, pgx.ErrNoRows) {
-			return err
-		}
-		sequence, err := q.NextIssueAgentEventSequence(ctx, session.ID)
-		if err != nil {
-			return err
-		}
-		status, reason := "pending", pgtype.Text{}
-		if input.ActorType == "agent" && input.ActorID == agentID {
-			status, reason = "ignored", pgtype.Text{String: "own_write", Valid: true}
-		}
-		originator := input.OriginatorUserID
-		if input.ActorType == "member" {
-			originator = input.ActorID
-		}
-		out.Event, err = q.CreateIssueAgentEvent(ctx, db.CreateIssueAgentEventParams{
-			ID: dbid.NewV7(), WorkspaceID: issue.WorkspaceID, SessionID: session.ID, Sequence: sequence,
-			EventKey: key, Kind: input.Kind, SourceID: input.SourceID, SourceRevision: input.SourceRevision,
-			ActorType: input.ActorType, ActorID: input.ActorID, OriginatorUserID: originator,
-			SourceTaskID: input.SourceTaskID, Payload: input.Payload, Status: status, FailureReason: reason,
-		})
-		return err
-	}()
+	session, err := q.EnsureIssueAgentSession(ctx, db.EnsureIssueAgentSessionParams{
+		ID: dbid.NewV7(), WorkspaceID: issue.WorkspaceID, IssueID: issue.ID, AgentID: agentID, RuntimeID: agent.RuntimeID,
+	})
+	if err != nil {
+		return out, err
+	}
+	out.Session = session
+	prior, err := q.GetIssueAgentEventByKey(ctx, db.GetIssueAgentEventByKeyParams{SessionID: session.ID, EventKey: key})
+	if err == nil {
+		out.Event, out.Duplicate = prior, true
+		return out, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return out, err
+	}
+	sequence, err := q.NextIssueAgentEventSequence(ctx, session.ID)
+	if err != nil {
+		return out, err
+	}
+	status, reason := "pending", pgtype.Text{}
+	if input.ActorType == "agent" && input.ActorID == agentID {
+		status, reason = "ignored", pgtype.Text{String: "own_write", Valid: true}
+	}
+	originator := input.OriginatorUserID
+	if input.ActorType == "member" {
+		originator = input.ActorID
+	}
+	out.Event, err = q.CreateIssueAgentEvent(ctx, db.CreateIssueAgentEventParams{
+		ID: dbid.NewV7(), WorkspaceID: issue.WorkspaceID, SessionID: session.ID, Sequence: sequence,
+		EventKey: key, Kind: input.Kind, SourceID: input.SourceID, SourceRevision: input.SourceRevision,
+		ActorType: input.ActorType, ActorID: input.ActorID, OriginatorUserID: originator,
+		SourceTaskID: input.SourceTaskID, Payload: input.Payload, Status: status, FailureReason: reason,
+	})
 	return out, err
 }
 
@@ -699,10 +669,7 @@ func settleIssueAgentSessionTask(ctx context.Context, q *db.Queries, task db.Age
 	if task.SessionRolloutMissing || task.RetiredSessionID.Valid || ResumeUnsafeFailure(task.FailureReason.String, task.Error.String) {
 		state, reason = "blocked", "resume_unavailable"
 	}
-	if task.StartedAt.Valid && !task.SessionID.Valid && !session.ProviderSessionID.Valid {
-		state, reason = "blocked", "resume_unavailable"
-	}
-	if task.Status == "completed" && !task.SessionID.Valid && !session.ProviderSessionID.Valid {
+	if (task.StartedAt.Valid || task.Status == "completed") && !task.SessionID.Valid && !session.ProviderSessionID.Valid {
 		state, reason = "blocked", "resume_unavailable"
 	}
 	if (task.StartedAt.Valid || task.Status == "completed") && !task.WorkDir.Valid && !session.WorkDir.Valid {

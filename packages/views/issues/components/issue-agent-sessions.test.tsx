@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { api } from "@multica/core/api";
@@ -50,6 +50,26 @@ describe("IssueAgentSessions", () => {
     expect(screen.getByRole("alert")).toHaveTextContent("This runtime cannot receive messages while running.");
     fireEvent.click(screen.getByRole("button", { name: "Retry event 3" }));
     await waitFor(() => expect(api.retryIssueAgentSessionEvent).toHaveBeenCalledWith("issue", "session", "event"));
+  });
+
+  it("clears the previous retry error while retrying the same event again", async () => {
+    let finishRetry!: () => void;
+    vi.mocked(api.retryIssueAgentSessionEvent)
+      .mockRejectedValueOnce(new Error("retry failed"))
+      .mockReturnValueOnce(new Promise<void>((resolve) => { finishRetry = resolve; }));
+    render([session()]);
+    fireEvent.click(screen.getByRole("button", { name: "Retry event 3" }));
+    expect(await screen.findByText("Cannot retry this event.")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Retry event 3" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Retry event 3" })).toBeDisabled());
+    expect(screen.queryByText("Cannot retry this event.")).not.toBeInTheDocument();
+    expect(api.retryIssueAgentSessionEvent).toHaveBeenNthCalledWith(1, "issue", "session", "event");
+    expect(api.retryIssueAgentSessionEvent).toHaveBeenNthCalledWith(2, "issue", "session", "event");
+
+    await act(async () => finishRetry());
+    await waitFor(() => expect(screen.getByRole("button", { name: "Retry event 3" })).toBeEnabled());
+    expect(screen.queryByText("Cannot retry this event.")).not.toBeInTheDocument();
   });
 
   it("can resume a blocked session from its first pending event", async () => {

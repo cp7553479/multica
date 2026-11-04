@@ -33,7 +33,6 @@ type IssueSessionEvent struct {
 }
 
 type issueSessionTransport struct {
-	SessionID    string
 	Initial      []IssueSessionEvent
 	AckedInitial *atomic.Int32
 	PinReady     <-chan struct{}

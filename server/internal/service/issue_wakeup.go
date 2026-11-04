@@ -849,12 +849,11 @@ func (s *IssueWakeupService) dispatchFromTick(ctx context.Context, w db.IssueWak
 
 // logTick reports one global pass: how many rules each lane visited, how long
 // the pass took and why it stopped, plus the age of the oldest input the
-// scheduler could act on and how many inputs a run is holding. It logs at
+// scheduler could act on. It logs at
 // warn level when a limit cut the pass short, a dispatch failed, an
 // actionable input has waited longer than wakeupPendingWarnAge, or the
 // pending scan could not finish (pending_scan=incomplete: the age may be
 // missing or too young, so silence must not be read as "no backlog").
-// Held inputs never warn on their own.
 func (s *IssueWakeupService) logTick(ctx context.Context, start time.Time, inputs, due int, stop string, failures int) {
 	attrs := []any{"input_rules", inputs, "due_rules", due, "duration_ms", time.Since(start).Milliseconds(), "stopped", stop, "failures", failures}
 	level := slog.LevelInfo
@@ -864,7 +863,6 @@ func (s *IssueWakeupService) logTick(ctx context.Context, start time.Time, input
 	pendingCtx, cancel := context.WithTimeout(ctx, wakeupPendingScanBudget)
 	pending, err := s.pendingInputs(pendingCtx, nil, wakeupPendingScanPage)
 	cancel()
-	attrs = append(attrs, "held_inputs", pending.Held)
 	if err != nil {
 		attrs = append(attrs, "pending_scan", "incomplete", "pending_scan_error", err.Error())
 		level = slog.LevelWarn
@@ -887,11 +885,9 @@ const (
 	wakeupPendingScanPage   = 1000
 )
 
-// pendingInputSummary splits unprocessed inputs into those a run is holding
-// on purpose and the backlog the scheduler could act on.
+// pendingInputSummary records the oldest input awaiting inbox transfer.
 type pendingInputSummary struct {
 	OldestReady pgtype.Timestamptz
-	Held        int
 }
 
 // age is how long the oldest actionable input has waited, if there is one.
@@ -902,11 +898,7 @@ func (p pendingInputSummary) age(now time.Time) (time.Duration, bool) {
 	return now.Sub(p.OldestReady.Time), true
 }
 
-// pendingInputs classifies every unprocessed input the way dispatch treats
-// it (see ListPendingWakeupInputGroups), paging until the groups run out. For
-// a platform rule an input is held only while a run of the issue's current
-// target agent, run as the person the platform rule's run would run as, waits
-// to start: the same check dispatchSystem makes before keeping its inputs.
+// pendingInputs reads every unprocessed input group, paging until they run out.
 //
 // On an error, including ctx running out, it returns what it read so far
 // with the error: the summary is then a lower bound, not the answer.
@@ -920,11 +912,7 @@ func (s *IssueWakeupService) pendingInputs(ctx context.Context, workspaceIDs []p
 			return out, fmt.Errorf("list pending wakeup inputs: %w", err)
 		}
 		for _, g := range groups {
-			held := false
-			switch {
-			case held:
-				out.Held += int(g.Inputs)
-			case !out.OldestReady.Valid || g.Oldest.Time.Before(out.OldestReady.Time):
+			if !out.OldestReady.Valid || g.Oldest.Time.Before(out.OldestReady.Time) {
 				out.OldestReady = g.Oldest
 			}
 		}
@@ -932,7 +920,7 @@ func (s *IssueWakeupService) pendingInputs(ctx context.Context, workspaceIDs []p
 			return out, nil
 		}
 		last := groups[len(groups)-1]
-		params.AfterOldest, params.AfterWakeupID, params.AfterReserved = last.Oldest, last.WakeupID, last.Reserved
+		params.AfterOldest, params.AfterWakeupID = last.Oldest, last.WakeupID
 	}
 }
 

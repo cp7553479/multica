@@ -4296,34 +4296,6 @@ func (q *Queries) GetLatestChatTaskRolloutMissing(ctx context.Context, arg GetLa
 	return session_rollout_missing, err
 }
 
-const getLatestTaskRoleForIssueAndAgent = `-- name: GetLatestTaskRoleForIssueAndAgent :one
-SELECT is_leader_task, squad_id FROM agent_task_queue
-WHERE issue_id = $1 AND agent_id = $2
-ORDER BY created_at DESC
-LIMIT 1
-`
-
-type GetLatestTaskRoleForIssueAndAgentParams struct {
-	IssueID pgtype.UUID `json:"issue_id"`
-	AgentID pgtype.UUID `json:"agent_id"`
-}
-
-type GetLatestTaskRoleForIssueAndAgentRow struct {
-	IsLeaderTask bool        `json:"is_leader_task"`
-	SquadID      pgtype.UUID `json:"squad_id"`
-}
-
-// Returns the role markers from the agent's most recent task on this issue.
-// Used by the squad-leader self-trigger guard to tell apart leader tasks,
-// same-squad worker tasks, and generic agent tasks such as direct mentions or
-// thread-parent replies.
-func (q *Queries) GetLatestTaskRoleForIssueAndAgent(ctx context.Context, arg GetLatestTaskRoleForIssueAndAgentParams) (GetLatestTaskRoleForIssueAndAgentRow, error) {
-	row := q.db.QueryRow(ctx, getLatestTaskRoleForIssueAndAgent, arg.IssueID, arg.AgentID)
-	var i GetLatestTaskRoleForIssueAndAgentRow
-	err := row.Scan(&i.IsLeaderTask, &i.SquadID)
-	return i, err
-}
-
 const getLatestTaskRolloutMissing = `-- name: GetLatestTaskRolloutMissing :one
 SELECT COALESCE(session_rollout_missing, FALSE) FROM agent_task_queue
 WHERE agent_id = $1 AND issue_id = $2

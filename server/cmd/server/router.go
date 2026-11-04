@@ -507,7 +507,6 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 			h.DaemonPendingWork = notifier
 		}
 		if notifier, ok := opts.DaemonWakeup.(handler.DaemonTaskSupplementNotifier); ok {
-			h.DaemonTaskSupplement = notifier
 			h.TaskService.IssueSessionWakeup = notifier
 		}
 		if notifier, ok := opts.DaemonWakeup.(handler.RuntimeGoneNotifier); ok {
