@@ -2839,7 +2839,7 @@ export function IssueDetail({ issueId, onDelete, onDone, defaultSidebarOpen = tr
           draft.attachmentIds.length > 0 ? draft.attachmentIds : undefined,
       },
       {
-        onSuccess: (serverIssue) => {
+        onSuccess: () => {
           if (editorSaveIssueIdRef.current !== id) return;
           descriptionSaveInFlightRef.current = false;
           const pending = pendingDescriptionSaveRef.current;
@@ -2849,10 +2849,7 @@ export function IssueDetail({ issueId, onDelete, onDone, defaultSidebarOpen = tr
             // the server appended late channel media, keep the submitted body
             // as the next editor baseline: the server can recognize that the
             // only delta is media the editor never saw and preserve it again.
-            const nextBase = serverIssue.description === draft.markdown
-              ? serverIssue.description
-              : draft.markdown;
-            persistDescriptionSave({ ...pending, baseMarkdown: nextBase });
+            persistDescriptionSave({ ...pending, baseMarkdown: draft.markdown });
           } else {
             const canonical = queryClient.getQueryData<Issue>(issueKeys.detail(wsId, id));
             setSuppressDescriptionDelivery(descriptionEditingRef.current
@@ -3618,7 +3615,7 @@ export function IssueDetail({ issueId, onDelete, onDone, defaultSidebarOpen = tr
                 && event.relatedTarget.closest('[contenteditable="true"]'))) {
                 descriptionEditingRef.current = false;
                 setSuppressDescriptionDelivery(descEditorRef.current?.getMarkdown() !== (issue.description ?? "")
-                  || descriptionSaveInFlightRef.current || pendingDescriptionSaveRef.current !== null);
+                  || descriptionSaveInFlightRef.current);
               }
             }}
           >

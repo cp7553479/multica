@@ -119,7 +119,7 @@ export function issueAgentDeliveriesOptions(
   });
 }
 
-export async function refreshIssueAgentDeliveries(client: QueryClient, wsId: string, issueId: string) {
+async function refreshIssueAgentDeliveries(client: QueryClient, wsId: string, issueId: string) {
   const queryKey = issueAgentDeliveryKeys.all(wsId, issueId);
   await client.cancelQueries({ queryKey });
   await Promise.all([

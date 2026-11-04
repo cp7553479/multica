@@ -210,6 +210,26 @@ fixture, not a complete live issue screen or a real-provider round trip.
 - [After ACK, desktop light](../assets/issue-agent-sessions/delivery-avatars-desktop-light.png)
 - [After ACK, 390px Chinese dark](../assets/issue-agent-sessions/delivery-avatars-mobile-dark-zh.png)
 
+## Delivery avatar simplification review
+
+A separate post-implementation review made three behavior-preserving changes:
+keep the receipt schema and refresh helper private to their files; replace a
+ternary whose two branches both equal the submitted description; and remove a
+blur check already implied by the existing in-flight save flag. The only
+non-null pending-description assignment occurs while that flag is true; reset,
+success and failure clear the pending value synchronously. No editor state,
+ACK/source-version fence, query, transport, permission gate or avatar component
+was replaced.
+
+Existing targeted regressions passed after the cleanup: four core files / 122
+tests, including schema, query refresh, canonical comment mutation and realtime
+scope; two views files / 124 tests, including description debounce/queued saves,
+true overlapping responses and conflicts. Core/views typechecks, changed-file
+ESLint and `git diff --check` passed. No new tests or generic abstraction were
+added. Backend and browser components were unchanged, so their preceding checks
+were not repeated. Full-application E2E, mobile UI and real-provider checks
+remain unrun.
+
 ## Browser checks and limits
 
 The real session panel and application styles were checked with synthetic API

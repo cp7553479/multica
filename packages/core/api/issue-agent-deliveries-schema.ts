@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-export const IssueDeliveryReceiptSchema = z.object({
+const IssueDeliveryReceiptSchema = z.object({
   event_id: z.string().uuid(),
   session_id: z.string().uuid(),
   agent_id: z.string().uuid(),
