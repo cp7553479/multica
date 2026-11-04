@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/multica-ai/multica/server/internal/testutil"
 )
 
 // createPrivateAgentOwnedBy inserts a private agent owned by ownerID and
@@ -33,23 +35,11 @@ func createPrivateAgentOwnedBy(t *testing.T, name, ownerID string) string {
 	return agentID
 }
 
-// TestAgentCreateOriginator_E2E_CreateAssignSquad_PrivateWorkerTriggered walks
-// the exact line failure shape from MUL-4305 end to end, deliberately NOT
-// re-testing the resolver in isolation but locking the real wiring between the
-// handler create stamp, the create-time squad gate, the squad-leader task's
-// stored originator, the comment source-task stamp, and the private-worker
-// invocation gate:
-//
-//	human H triggers agent A → A creates an issue via the ordinary
-//	`issue create` path AND assigns it to a squad whose leader is a private
-//	agent owned by H → the leader's assignment run @-mentions a *second*
-//	private agent J (also owned by H) → J must be triggered.
-//
-// Pre-fix, A's create left the issue unattributed, the leader task stored a
-// NULL originator, and the leader's mention of J failed canInvokeAgent — J
-// silently got 0 tasks. This asserts the leader task carries H and that J ends
-// up with a queued task whose originator is the original human H.
-func TestAgentCreateOriginator_E2E_CreateAssignSquad_PrivateWorkerTriggered(t *testing.T) {
+// Preserve the full authorization chain: human H → agent A creates a
+// squad-assigned issue → private leader L explicitly creates a worker subissue.
+// Both the ordinary create provenance and the worker's persistent session must
+// carry H; a mention alone cannot dispatch the private worker.
+func TestAgentCreateOriginator_E2E_ExplicitPrivateWorkerAssignment(t *testing.T) {
 	if testHandler == nil || testPool == nil {
 		t.Skip("database not available")
 	}
@@ -136,33 +126,46 @@ func TestAgentCreateOriginator_E2E_CreateAssignSquad_PrivateWorkerTriggered(t *t
 		t.Fatalf("squad-leader task originator = %q, want the original human H %q", leaderOriginator, ownerH)
 	}
 
-	// Step 2: the leader L, running its assignment task, posts a comment that
-	// @-mentions the private worker J. The comment stamps source_task_id = the
-	// leader task, so the originator chain resolves to H.
-	w = httptest.NewRecorder()
-	r = newRequest("POST", "/api/issues/"+created.ID+"/comments", map[string]any{
-		"content": "handing the private part to [@Worker](mention://agent/" + workerJID + ")",
+	// The leader now runs its explicitly assigned work for H.
+	dbfx.Exec(t, "UPDATE agent_task_queue SET status='running',started_at=now() WHERE id=$1", leaderTaskID)
+	comment := captureSessionComment(t, created.ID, map[string]any{
+		"content": "private work context [@Worker](mention://agent/" + workerJID + ")",
+	}, leaderID, leaderTaskID)
+	if comment.SourceTaskID == nil || *comment.SourceTaskID != leaderTaskID || len(comment.TriggerOutcomes) != 0 {
+		t.Fatalf("leader comment lost its trusted source or created a route: %+v", comment)
+	}
+	if n := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id=$1 AND agent_id=$2", created.ID, workerJID); n != 0 {
+		t.Fatalf("private worker received %d tasks from a mention", n)
+	}
+	// The explicit subissue assignment is the collaboration action.
+	r = newRequest(http.MethodPost, "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
+		"title": "Private worker explicitly assigned by leader", "parent_issue_id": created.ID,
+		"assignee_type": "agent", "assignee_id": workerJID,
 	})
 	r.Header.Set("X-Agent-ID", leaderID)
 	r.Header.Set("X-Task-ID", leaderTaskID)
-	r = withURLParam(r, "id", created.ID)
-	testHandler.CreateComment(w, r)
-	if w.Code != http.StatusCreated {
-		t.Fatalf("CreateComment (leader mentions worker): expected 201, got %d: %s", w.Code, w.Body.String())
+	r.Header.Set("X-Actor-Source", "task_token")
+	var child IssueResponse
+	testutil.Call(t, testHandler.CreateIssue, r).Want(http.StatusCreated).JSON(&child)
+	dbfx.Cleanup(t, "DELETE FROM issue WHERE id=$1", child.ID)
+	dbfx.Cleanup(t, "DELETE FROM agent_task_queue WHERE issue_id=$1", child.ID)
+	var parentIssueID, childOriginType, childOriginID string
+	dbfx.QueryRow(t, "SELECT parent_issue_id,origin_type,origin_id FROM issue WHERE id=$1", child.ID).Scan(&parentIssueID, &childOriginType, &childOriginID)
+	if parentIssueID != created.ID || childOriginType != "agent_create" || childOriginID != leaderTaskID {
+		t.Fatalf("worker subissue lost its parent or authoring run: parent=%s origin=%s/%s", parentIssueID, childOriginType, childOriginID)
+	}
+	sessions := captureIssueSessions(t, child.ID)
+	if len(sessions) != 1 || sessions[0].AgentID != workerJID || sessions[0].ActiveTaskID == nil || len(sessions[0].Events) != 1 || sessions[0].Events[0].Kind != "assigned" {
+		t.Fatalf("explicit private-worker assignment did not create its session: %+v", sessions)
+	}
+	workerTask, err := testHandler.Queries.GetAgentTask(ctx, parseUUID(*sessions[0].ActiveTaskID))
+	if err != nil || workerTask.Status != "queued" || uuidToString(workerTask.AgentID) != workerJID || uuidToString(workerTask.OriginatorUserID) != ownerH || uuidToString(workerTask.AccountableUserID) != ownerH {
+		t.Fatalf("worker session lost the original authorizing human: %+v, %v", workerTask, err)
+	}
+	if n := dbfx.Count(t, "SELECT count(*) FROM issue_agent_event WHERE session_id=$1 AND source_task_id=$2 AND originator_user_id=$3", sessions[0].ID, leaderTaskID, ownerH); n != 1 {
+		t.Fatalf("worker event failed to preserve leader-to-worker provenance: %d", n)
 	}
 
-	// Step 3: the private worker J must now have a queued task whose originator
-	// is the original human H — the whole point of the fix.
-	var queuedForHuman int
-	if err := testPool.QueryRow(ctx, `
-		SELECT count(*) FROM agent_task_queue
-		WHERE issue_id = $1 AND agent_id = $2 AND status = 'queued' AND originator_user_id = $3
-	`, created.ID, workerJID, ownerH).Scan(&queuedForHuman); err != nil {
-		t.Fatalf("count worker tasks: %v", err)
-	}
-	if queuedForHuman == 0 {
-		t.Fatalf("private worker got 0 queued tasks attributed to H; the A2A mention was denied (MUL-4305 regression)")
-	}
 }
 
 // TestAgentCreateOriginator_E2E_UpdateAssignSquad_HandlerGateAdmitsPrivateLeader

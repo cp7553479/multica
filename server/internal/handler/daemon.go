@@ -2055,11 +2055,10 @@ func (h *Handler) repairStaleCommentPlanIfNeeded(ctx context.Context, task *db.A
 		}
 		return true, &claimBuildFailure{outcome: "error_workspace", status: http.StatusInternalServerError, message: "task workspace isolation check failed"}
 	}
-	cancelled, cancelErr := h.TaskService.CancelTask(ctx, task.ID)
+	_, cancelErr := h.TaskService.CancelTask(ctx, task.ID)
 	if cancelErr != nil {
 		return true, &claimBuildFailure{outcome: "error_stale_comment_plan", status: http.StatusInternalServerError, message: "failed to repair stale comment task"}
 	}
-	h.retriggerCancelledTaskSurvivors(ctx, issue, []db.AgentTaskQueue{*cancelled}, pgtype.UUID{})
 	return true, nil
 }
 
@@ -3428,7 +3427,11 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 		}
 
 		// Resolve the prior agent session / workdir to resume.
-		if task.RerunOfTaskID.Valid && !service.IsFreshRerun(*task) {
+		if service.IsIssueAgentSessionTask(*task) {
+			if sessionFailure := h.applyIssueAgentSessionResume(r, task, &resp); sessionFailure != nil {
+				return resp, deliveredCommentIDs, issueSnapshot, agentSkillCount, builtinSkillCount, sessionFailure
+			}
+		} else if task.RerunOfTaskID.Valid && !service.IsFreshRerun(*task) {
 			// Manual retry: resume precisely from the source task the user
 			// clicked, NOT the most-recent (agent, issue) row — a parallel task
 			// on the same issue must never hijack the resume (MUL-4869). The
@@ -4201,19 +4204,6 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 		}
 	}
 
-	// Wakeup rules that waited for this run hand it their inputs now, after
-	// every gate passed, and only for a daemon that renders them; otherwise
-	// they keep their inputs and start their own run.
-	if requestHasClientCapability(r, protocol.DaemonCapabilityJoinedWakeupsV1) {
-		joined, err := (&service.IssueWakeupService{Tasks: h.TaskService}).JoinWaitingWakeups(r.Context(), *task)
-		if err != nil {
-			slog.Warn("daemon claim: waiting wakeups keep their inputs", "task_id", uuidToString(task.ID), "error", err)
-		} else {
-			task.Context = joined
-			resp.WakeupJoined = service.JoinedWakeupNotes(joined)
-		}
-	}
-
 	// Hydrate attribution only after every source/workspace/version gate has
 	// passed so a rejected claim cannot receive another user's profile data.
 	// The existing flat initiator fields carry the run's authorization human to
@@ -4226,6 +4216,12 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 		resp.InitiatorID = originator.ID
 		resp.InitiatorName = originator.Name
 		resp.InitiatorEmail = originator.Email
+	}
+
+	if service.IsIssueAgentSessionTask(*task) {
+		if sessionFailure := h.attachInitialIssueAgentEvents(r, task, &resp); sessionFailure != nil {
+			return resp, deliveredCommentIDs, issueSnapshot, agentSkillCount, builtinSkillCount, sessionFailure
+		}
 	}
 
 	return resp, deliveredCommentIDs, issueSnapshot, agentSkillCount, builtinSkillCount, nil
@@ -4656,7 +4652,15 @@ func (h *Handler) StartTask(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if service.IsIssueAgentSessionTask(startTask) && (!slices.Contains(req.Capabilities, protocol.DaemonCapabilityIssueSessionEventsV1) || !slices.Contains(req.Capabilities, protocol.DaemonCapabilityTaskSupplementV1)) {
+		writeErrorCode(w, http.StatusPreconditionFailed, "issue_session_capability_required", "this provider must support issue session events and live input")
+		return
+	}
 	legacy := req.RuntimeID == "" && req.DispatchedAt == ""
+	if service.IsIssueAgentSessionTask(startTask) && legacy {
+		writeError(w, http.StatusConflict, "issue session start requires its exact claim generation")
+		return
+	}
 	var claim db.LockAgentTaskStartClaimParams
 	if !legacy {
 		runtimeID, ok := parseUUIDOrBadRequest(w, req.RuntimeID, "runtime_id")
@@ -4957,15 +4961,8 @@ func (h *Handler) CompleteTask(w http.ResponseWriter, r *http.Request) {
 
 	h.emitIssueExecutedOnFirstCompletion(r, task)
 
-	// MUL-4195: guarantee at-least-once processing. If a member posted a
-	// deliberate comment while this run was executing (or one was merged into
-	// it after its context was built), schedule a single follow-up so the
-	// input is not silently dropped. Agent replays are restricted to explicit
-	// mentions and recorded worker inputs; see reconcileCommentsOnCompletion.
-	h.reconcileCommentsOnCompletion(r.Context(), task)
-	// The terminal transaction and completion reconciliation are committed.
-	// Wake the owning runtime now so queued work that was blocked by this
-	// task's agent capacity or serialization key is re-claimed immediately.
+	// The terminal transaction settles the session's event receipts and wakes
+	// any remaining inbox work. Completion never reinterprets comment history.
 	h.TaskService.NotifyTaskFinished(*task)
 
 	// Best-effort revoke of any agent task token minted at claim time.
@@ -5022,214 +5019,6 @@ func (h *Handler) emitIssueExecutedOnFirstCompletion(r *http.Request, task *db.A
 		taskContext.Provider,
 		durationMS,
 	))
-}
-
-// reconcileCommentsOnCompletion replays qualifying comments absent from this
-// run's delivered_comment_ids receipt. Planned/coalesced IDs do not prove the
-// provider received them, particularly with older daemons or deleted comments.
-//
-// Anchor at task creation and exclude the delivered set. A dispatch timestamp
-// would miss a comment whose pre-claim merge lost a race to claiming the task.
-// Replay chronologically through normal enqueue so comments coalesce into one
-// follow-up. That follow-up's later creation time and own receipt bound repetition.
-//
-// Preserve member routing and accepted explicit agent routes, current invocation
-// permissions, and self-trigger guards. Do not invent implicit agent conversation
-// routes or wake an unrelated agent from another agent's completion.
-func (h *Handler) reconcileCommentsOnCompletion(ctx context.Context, task *db.AgentTaskQueue) {
-	if task == nil || !task.IssueID.Valid || !task.AgentID.Valid || !task.CreatedAt.Valid {
-		return
-	}
-	plannedCommentIDs := append([]pgtype.UUID{}, task.CoalescedCommentIds...)
-	if task.TriggerCommentID.Valid {
-		plannedCommentIDs = append(plannedCommentIDs, task.TriggerCommentID)
-	}
-	comments, err := h.Queries.ListReconcilableCommentsForIssueSince(ctx, db.ListReconcilableCommentsForIssueSinceParams{
-		CommentThreadID:   task.CommentThreadID,
-		TaskID:            task.ID,
-		IssueID:           task.IssueID,
-		Since:             task.CreatedAt,
-		PlannedCommentIds: plannedCommentIDs,
-		AgentID:           task.AgentID,
-	})
-	if err != nil {
-		slog.Warn("reconcile comments on completion: list comments failed",
-			"issue_id", uuidToString(task.IssueID), "task_id", uuidToString(task.ID), "error", err)
-		return
-	}
-	if len(comments) == 0 {
-		return
-	}
-	// The delivered set is the claim-time receipt, not the enqueue-time plan.
-	// Legacy tasks backfill only the primary trigger, deliberately replaying
-	// coalesced inputs that their daemon may have ignored.
-	delivered := make(map[string]struct{}, len(task.DeliveredCommentIds))
-	for _, id := range task.DeliveredCommentIds {
-		if id.Valid {
-			delivered[uuidToString(id)] = struct{}{}
-		}
-	}
-	issue, err := h.Queries.GetIssue(ctx, task.IssueID)
-	if err != nil {
-		slog.Warn("reconcile comments on completion: load issue failed",
-			"issue_id", uuidToString(task.IssueID), "error", err)
-		return
-	}
-	agentID := uuidToString(task.AgentID)
-	// An agent comment bound to this run but never read took the place of
-	// the follow-up its trigger would have queued. It replays like an input
-	// this run had planned, which also covers an implicit route (a worker's
-	// reply reaching its leader) that a timestamp alone would not authorize.
-	unreadSteers := make(map[string]bool)
-	if ids, err := h.Queries.ListUndeliveredTaskSupplementCommentIDs(ctx, task.ID); err == nil {
-		for _, id := range ids {
-			unreadSteers[uuidToString(id)] = true
-		}
-	}
-	scheduled := 0
-	for i := range comments {
-		c := comments[i]
-		if _, ok := delivered[uuidToString(c.ID)]; ok {
-			// Already delivered to this run (trigger or pre-claim coalesced).
-			continue
-		}
-		if isNoteComment(c.Content) {
-			continue
-		}
-		// A delegated failure recovery signal is platform-authored and targets
-		// the exact source coordinator recorded by the failed task. It bypasses
-		// generic comment routing (which deliberately treats system authors as
-		// unattributed) and excludes this just-completed task from the coverage
-		// check because the signal was planned after claim, not delivered to it.
-		if service.IsDelegatedFailureRecoveryComment(c) {
-			if err := h.TaskService.DispatchDelegatedFailureRecoveryComment(ctx, c, task.ID); err != nil {
-				slog.Warn("reconcile comments on completion: delegated failure recovery replay failed",
-					"issue_id", uuidToString(task.IssueID),
-					"task_id", uuidToString(task.ID),
-					"comment_id", uuidToString(c.ID),
-					"error", err,
-				)
-			} else {
-				scheduled++
-			}
-			continue
-		}
-		var parentComment *db.Comment
-		if c.ParentID.Valid {
-			// Scope to the issue's workspace; a comment's parent is always in the
-			// same workspace, so this only fails closed against a stray foreign
-			// UUID rather than changing behavior (MUL-4252).
-			if parent, err := h.Queries.GetCommentInWorkspace(ctx, db.GetCommentInWorkspaceParams{
-				ID:          c.ParentID,
-				WorkspaceID: issue.WorkspaceID,
-			}); err == nil {
-				parentComment = &parent
-			}
-		}
-		// Compute what this comment would trigger, then keep ONLY the agent
-		// that just completed — never the full fan-out (that would re-wake
-		// unrelated `@other-agent` targets).
-		//
-		// The comment is routed under its OWN author_type. A member is its own
-		// originator. For an agent author, the originator is the human at the
-		// top of that agent's trigger chain (resolved from the comment's source
-		// task); canInvokeAgent judges an agent→agent (A2A) mention by that
-		// originator, not the immediate agent principal (MUL-3963).
-		actorType := c.AuthorType
-		actorID := uuidToString(c.AuthorID)
-		originatorUserID := actorID
-		if actorType != "member" {
-			originatorUserID = uuidToString(h.TaskService.ResolveOriginatorFromTriggerComment(ctx, issue.WorkspaceID, c.ID))
-		}
-		triggers, _ := h.computeCommentAgentTriggers(ctx, issue, c.Content, parentComment, actorType, actorID, commentTriggerComputeOptions{
-			ExcludeTriggerCommentID: c.ID,
-			AuthoringTaskID:         c.SourceTaskID,
-			OriginatorUserID:        originatorUserID,
-		})
-		// Agent replies discovered only by timestamp must not start a new
-		// conversation. Replay explicit mentions, or a worker reply that the
-		// creation path already accepted and recorded in this run's input plan.
-		// Recomputed routing still checks current permissions and the self guard.
-		if actorType != "member" {
-			triggers = keepReplayableAgentTriggers(triggers, slices.Contains(plannedCommentIDs, c.ID) || unreadSteers[uuidToString(c.ID)])
-		}
-		scoped := make([]commentAgentTrigger, 0, 1)
-		for _, trigger := range triggers {
-			if uuidToString(trigger.Agent.ID) == agentID {
-				scoped = append(scoped, trigger)
-			}
-		}
-		if len(scoped) == 0 {
-			continue
-		}
-		// The first qualifying comment enqueues the follow-up task; later ones
-		// find it AlreadyPending and merge in, so all undelivered comments end
-		// up covered by a single bounded run.
-		//
-		// A BLOCKED replay must not be discarded (#5914, Elon round 8): the slot
-		// can be held by a task that will never see this comment (it predates that
-		// task and is not in its planned ids), so dropping the failure here is
-		// exactly how a promised follow-up is lost. Hand the obligation to that
-		// blocker instead, keeping it alive until some run provably covers it.
-		res := h.enqueueCommentAgentTriggers(ctx, issue, c.ID, scoped)[agentID]
-		handled := res.status != DispatchBlocked
-		if res.status == DispatchBlocked {
-			headSha := h.TaskService.ResolveIssueReviewSHAParam(ctx, task.IssueID)
-			if h.propagateUncoveredCommentObligation(ctx, issue, scoped[0], c.ID, headSha) {
-				handled = true
-				slog.Info("reconcile comments on completion: replay blocked, obligation handed to the active task",
-					"issue_id", uuidToString(task.IssueID), "agent_id", agentID, "comment_id", uuidToString(c.ID))
-			} else {
-				// The slot is held by a DIFFERENT-head queued task: it can neither
-				// cover this comment nor accept it (merging would let an old-head
-				// run consume a new-head request — TEN-356). Today's schema has no
-				// safe place to park the obligation, so surface it loudly rather
-				// than let it disappear quietly.
-				slog.Error("reconcile comments on completion: replay blocked and obligation could not be handed off; comment needs a durable obligation record",
-					"issue_id", uuidToString(task.IssueID), "agent_id", agentID, "comment_id", uuidToString(c.ID),
-					"reason", res.reason)
-			}
-		}
-		// The replayed agent steer is now an ordinary input of the follow-up;
-		// its failed receipt would otherwise invite a member to resend it.
-		if handled && c.AuthorType == "agent" && unreadSteers[uuidToString(c.ID)] {
-			if n, err := h.Queries.DeleteUndeliveredTaskSupplementForRun(ctx, db.DeleteUndeliveredTaskSupplementForRunParams{
-				CommentID: c.ID, TaskID: task.ID,
-			}); err == nil && n > 0 {
-				h.publishCommentSupplementUpdate(ctx, issue.WorkspaceID, c.ID)
-			}
-		}
-		scheduled++
-	}
-	if scheduled > 0 {
-		slog.Info("reconcile comments on completion: scheduled follow-up",
-			"issue_id", uuidToString(task.IssueID),
-			"completed_task_id", uuidToString(task.ID),
-			"agent_id", agentID,
-			"undelivered_comments", scheduled)
-	}
-}
-
-// keepReplayableAgentTriggers preserves explicit mentions (MUL-4304) and
-// accepted worker replies recorded in the completing run's plan. A timestamp
-// alone never authorizes replay of an implicit agent route. Member comments
-// retain their full routing and do not pass through this filter.
-func keepReplayableAgentTriggers(triggers []commentAgentTrigger, planned bool) []commentAgentTrigger {
-	if len(triggers) == 0 {
-		return triggers
-	}
-	filtered := make([]commentAgentTrigger, 0, len(triggers))
-	for _, trigger := range triggers {
-		switch trigger.Source {
-		case commentTriggerSourceMentionAgent, commentTriggerSourceMentionSquadLeader:
-			filtered = append(filtered, trigger)
-		case commentTriggerSourceIssueAssignee, commentTriggerSourceThreadParent:
-			if planned && trigger.NonLeaderAgentReply {
-				filtered = append(filtered, trigger)
-			}
-		}
-	}
-	return filtered
 }
 
 // buildCoalescedCommentData loads the full detail of each comment that was

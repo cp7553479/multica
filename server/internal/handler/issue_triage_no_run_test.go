@@ -13,18 +13,9 @@ import (
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
-// Triage has no executor (MUL-7189 §2.3).
-//
-// Nothing may derive one from the issue — the assignee, its squad's leader, a
-// retry. A member naming an agent by hand is a conversation, not an executor,
-// and keeps working.
-//
-// Every entry point below runs TWICE against the same agent, squad and quick
-// action: once on an ordinary `todo` issue, where all of them must start a run,
-// and once in Triage, where only the named ones may. The todo half is not
-// redundant — a private agent, an unbound runtime or a missing allow-list row
-// also produce zero rows, and without a positive control the Triage half would
-// pass on a fixture that could never have enqueued anything.
+// Automatic issue inputs stay in the owner's inbox while Triage has no
+// executor. Accepting the issue releases that same session; text mentions never
+// select another executor. Explicit quick actions still obey the Triage gate.
 
 type triageRunFixture struct {
 	agentID   string
@@ -102,15 +93,12 @@ func commentsOn(t *testing.T, issueID string) int {
 	return dbfx.Count(t, `SELECT count(*) FROM comment WHERE issue_id = $1`, issueID)
 }
 
-// triageEntryPoints are the request-driven ways an issue reaches a run. The run
-// itself is counted from agent_task_queue, which is what the rule is about;
-// runsInTriage records which side of the line the entry point falls on.
+// Pair every Triage refusal with an ordinary-issue control. The retired rerun
+// endpoint is refused on both, so its positive control is the session inbox.
 type triageEntryPoint struct {
-	name string
-	// runsInTriage is true when a member named the agent, false when the
-	// executor was derived from the issue.
-	runsInTriage bool
-	call         func(t *testing.T, f triageRunFixture, issueID string) *testutil.Response
+	name                string
+	runsOnOrdinaryIssue bool
+	call                func(t *testing.T, f triageRunFixture, issueID string) *testutil.Response
 }
 
 func triageEntryPoints() []triageEntryPoint {
@@ -126,8 +114,7 @@ func triageEntryPoints() []triageEntryPoint {
 		{"comment mentioning a squad", true, func(t *testing.T, f triageRunFixture, issueID string) *testutil.Response {
 			return comment(t, issueID, "[@Squad](mention://squad/"+f.squadID+") please take a look")
 		}},
-		// A member replying to what the agent said is still that member naming
-		// it — the thread is the address.
+		// Reply placement does not change the owner-session address.
 		{"reply to an agent's comment", true, func(t *testing.T, f triageRunFixture, issueID string) *testutil.Response {
 			parentID := dbfx.Comment(t, issueID, "here is what I found", testutil.Cols{
 				"author_type": "agent", "author_id": f.agentID,
@@ -137,26 +124,20 @@ func triageEntryPoints() []triageEntryPoint {
 					"content": "thanks, what about the other case?", "parent_id": parentID,
 				}), "id", issueID))
 		}},
-		// No mention at all: the route is the issue's assignee, which in Triage
-		// is only a proposal.
-		{"plain comment routed to the assignee", false, func(t *testing.T, f triageRunFixture, issueID string) *testutil.Response {
+		{"plain comment routed to the assignee", true, func(t *testing.T, f triageRunFixture, issueID string) *testutil.Response {
 			return comment(t, issueID, "any progress?")
 		}},
 		{"manual rerun", false, func(t *testing.T, f triageRunFixture, issueID string) *testutil.Response {
 			return testutil.Call(t, testHandler.RerunIssue, withURLParam(
 				newRequest(http.MethodPost, "/api/issues/"+issueID+"/rerun", nil), "id", issueID))
 		}},
-		// A quick action carries its own target, so the rule would let it
-		// through; the first phase refuses it because it is an instruction to
-		// DO the action rather than an invitation to talk.
-		{"quick action", false, func(t *testing.T, f triageRunFixture, issueID string) *testutil.Response {
+		{"quick action", true, func(t *testing.T, f triageRunFixture, issueID string) *testutil.Response {
 			return testutil.Call(t, testHandler.RunQuickAction, testutil.WithURLParams(
 				newRequest(http.MethodPost, "/api/issues/"+issueID+"/quick-actions/"+f.actionID+"/run", nil),
 				"id", issueID, "quickActionId", f.actionID))
 		}},
-		// Reassigning is allowed in Triage (accept has not decided the owner
-		// yet), so it is the one issue write that still reaches the trigger.
-		{"reassignment", false, func(t *testing.T, f triageRunFixture, issueID string) *testutil.Response {
+		// Explicit squad assignment remains separate from automatic comments.
+		{"reassignment", true, func(t *testing.T, f triageRunFixture, issueID string) *testutil.Response {
 			return testutil.Call(t, testHandler.UpdateIssue, withURLParam(
 				newRequest(http.MethodPut, "/api/issues/"+issueID, map[string]any{
 					"assignee_type": "squad", "assignee_id": f.squadID,
@@ -165,32 +146,37 @@ func triageEntryPoints() []triageEntryPoint {
 	}
 }
 
-// The control: on an ordinary issue this fixture really does start runs.
-func TestTriageNoRunEntryPointsRunOnAnOrdinaryIssue(t *testing.T) {
+func TestTriageNoRunEntryPointsUseOrdinaryIssueSessions(t *testing.T) {
 	f := newTriageRunFixture(t)
 	for _, entry := range triageEntryPoints() {
 		t.Run(entry.name, func(t *testing.T) {
 			issueID := f.issueFor(t, "", "ordinary issue: "+entry.name)
-			entry.call(t, f, issueID).WantOneOf(http.StatusOK, http.StatusCreated, http.StatusAccepted)
+			response := entry.call(t, f, issueID)
+			if !entry.runsOnOrdinaryIssue {
+				if code := response.Want(http.StatusConflict).Map()["code"]; code != "issue_session_event_required" {
+					t.Fatalf("retired rerun code = %v, want issue_session_event_required", code)
+				}
+				if n := tasksOn(t, issueID); n != 0 {
+					t.Fatalf("retired rerun started %d executions", n)
+				}
+				return
+			}
+			response.WantOneOf(http.StatusOK, http.StatusCreated, http.StatusAccepted)
 			if n := tasksOn(t, issueID); n == 0 {
-				t.Fatalf("%s started no run on a todo issue, so the triage half of this test proves nothing", entry.name)
+				t.Fatalf("%s did not start work on an ordinary issue", entry.name)
 			}
 		})
 	}
 }
 
-func TestTriageRunsOnlyWhatAMemberNamed(t *testing.T) {
+func TestTriageInputsCannotStartExecutionsBeforeAcceptance(t *testing.T) {
 	f := newTriageRunFixture(t)
 	for _, entry := range triageEntryPoints() {
 		t.Run(entry.name, func(t *testing.T) {
 			issueID := f.issueFor(t, triagePending, "triage issue: "+entry.name)
-			entry.call(t, f, issueID)
-			n := tasksOn(t, issueID)
-			if entry.runsInTriage && n == 0 {
-				t.Fatalf("%s is a member naming an agent, but started no run in Triage", entry.name)
-			}
-			if !entry.runsInTriage && n != 0 {
-				t.Fatalf("%s derives its executor from the issue, but started %d run(s) in Triage", entry.name, n)
+			entry.call(t, f, issueID).WantOneOf(http.StatusOK, http.StatusCreated, http.StatusForbidden)
+			if n := tasksOn(t, issueID); n != 0 {
+				t.Fatalf("%s started %d executions before acceptance", entry.name, n)
 			}
 		})
 	}
@@ -226,46 +212,39 @@ func TestTriageRefusesRerunAndQuickActionWithAReason(t *testing.T) {
 	})
 }
 
-// The mention that used to be refused. A member @-ing an agent on a Triage
-// entry is a conversation, so it dispatches like anywhere else and reports a
-// normal queued outcome — no issue_in_triage, no silent nothing.
-func TestTriageCommentMentionDispatchesNormally(t *testing.T) {
+func TestTriageCommentMentionsWaitForOwnerAcceptance(t *testing.T) {
 	f := newTriageRunFixture(t)
-	issueID := f.issueFor(t, triagePending, "triage mention outcomes")
-
-	var body struct {
-		TriggerOutcomes []struct {
-			TargetType string `json:"target_type"`
-			TargetID   string `json:"target_id"`
-			Status     string `json:"status"`
-			ReasonCode string `json:"reason_code"`
-		} `json:"trigger_outcomes"`
+	issueID := f.issueFor(t, triagePending, "triage owner inbox")
+	content := "[@Agent](mention://agent/" + f.agentID + ") and [@Squad](mention://squad/" + f.squadID + ") please look"
+	comment := captureSessionComment(t, issueID, map[string]any{"content": content}, "", "")
+	if len(comment.TriggerOutcomes) != 1 || comment.TriggerOutcomes[0].TargetID != f.agentID || comment.TriggerOutcomes[0].Status != DispatchDeferred {
+		t.Fatalf("comment changed the pending owner receipt: %+v", comment.TriggerOutcomes)
 	}
-	testutil.Call(t, testHandler.CreateComment, withURLParam(
-		newRequest(http.MethodPost, "/api/issues/"+issueID+"/comments", map[string]any{
-			"content": "[@Agent](mention://agent/" + f.agentID + ") and " +
-				"[@Squad](mention://squad/" + f.squadID + ") please look",
-		}), "id", issueID)).Want(http.StatusCreated).JSON(&body)
-
-	if len(body.TriggerOutcomes) != 2 {
-		t.Fatalf("got %d trigger outcome(s), want one per named target: %+v", len(body.TriggerOutcomes), body.TriggerOutcomes)
+	if n := tasksOn(t, issueID); n != 0 {
+		t.Fatalf("triage comment started %d executions", n)
 	}
-	want := map[string]string{"agent": f.agentID, "squad": f.squadID}
-	for _, o := range body.TriggerOutcomes {
-		if o.Status != string(DispatchQueued) {
-			t.Errorf("%s outcome = (%s, %s), want queued", o.TargetType, o.Status, o.ReasonCode)
-		}
-		if want[o.TargetType] != o.TargetID {
-			t.Errorf("%s outcome names %q, want %q", o.TargetType, o.TargetID, want[o.TargetType])
-		}
-		delete(want, o.TargetType)
+	sessions := captureIssueSessions(t, issueID)
+	if len(sessions) != 1 || sessions[0].AgentID != f.agentID || sessions[0].State != "blocked" || sessions[0].FailureReason == nil || *sessions[0].FailureReason != "issue_not_ready" {
+		t.Fatalf("triage did not hold its owner inbox: %+v", sessions)
 	}
-	if len(want) != 0 {
-		t.Errorf("no outcome for %v", want)
+	if len(sessions[0].Events) != 2 || sessions[0].Events[1].SourceID == nil || *sessions[0].Events[1].SourceID != comment.ID || sessions[0].Events[1].Status != "pending" {
+		t.Fatalf("triage lost the durable input: %+v", sessions[0].Events)
 	}
-	// Both targets are the leader-vs-agent pair, so this is two distinct runs.
-	if n := tasksOn(t, issueID); n != 2 {
-		t.Errorf("mentions started %d run(s), want 2", n)
+	// Acceptance changes the gate, without replaying the comment or assigning
+	// the mentioned squad. Runtime polling releases the same inbox.
+	dbfx.Exec(t, `UPDATE issue SET triage_state=NULL WHERE id=$1`, issueID)
+	if _, err := testHandler.TaskService.WakeIssueAgentSessionsForRuntime(t.Context(), parseUUID(f.runtimeID), 32); err != nil {
+		t.Fatal(err)
+	}
+	accepted := captureIssueSessions(t, issueID)
+	if len(accepted) != 1 || accepted[0].ID != sessions[0].ID || accepted[0].ActiveTaskID == nil || len(accepted[0].Events) != 2 {
+		t.Fatalf("acceptance changed session identity or replayed input: %+v", accepted)
+	}
+	if n := tasksOn(t, issueID); n != 1 {
+		t.Fatalf("accepted input started %d executions, want only the owner", n)
+	}
+	if n := dbfx.Count(t, `SELECT count(*) FROM agent_task_queue WHERE issue_id=$1 AND agent_id<>$2`, issueID, f.agentID); n != 0 {
+		t.Fatalf("mentioned squad started %d unrelated executions", n)
 	}
 }
 
@@ -454,11 +433,18 @@ func TestRerunRefusesAHistoricalTriageTaskAfterAccept(t *testing.T) {
 			newRequest(http.MethodPost, "/api/issues/"+issueID+"/rerun", map[string]any{"task_id": taskID}), "id", issueID))
 	}
 
-	// The control: an ordinary historical task on this issue reruns.
+	ordinaryID := sourceTask(nil)
 	before := tasksOn(t, issueID)
-	rerun(sourceTask(nil)).Want(http.StatusAccepted)
-	if got := tasksOn(t, issueID); got != before+2 {
-		t.Fatalf("ordinary rerun left %d task(s), want the source plus a rerun", got-before)
+	if code := rerun(ordinaryID).Want(http.StatusConflict).Map()["code"]; code != "issue_session_event_required" {
+		t.Fatalf("ordinary source bypassed the session inbox: %v", code)
+	}
+	if got := tasksOn(t, issueID); got != before {
+		t.Fatalf("retired rerun added %d tasks", got-before)
+	}
+	// The accepted issue is runnable through its authorized event inbox.
+	captureSessionComment(t, issueID, map[string]any{"content": "continue accepted work"}, "", "")
+	if got := tasksOn(t, issueID); got != before+1 {
+		t.Fatalf("accepted input added %d tasks, want one owner execution", got-before)
 	}
 
 	triageID := sourceTask(testutil.Cols{"context": testutil.Raw(`'{"type":"triage"}'::jsonb`)})
@@ -471,15 +457,13 @@ func TestRerunRefusesAHistoricalTriageTaskAfterAccept(t *testing.T) {
 	}
 }
 
-// Rerun follows its source. Naming a discussion run repeats a conversation the
-// member started, so it is allowed even while the issue sits in Triage; naming
-// nothing means "run the assignee again", which is the derived executor Triage
-// does not have (covered by the queue-door test above).
-func TestRerunInTriageFollowsItsSource(t *testing.T) {
+// A historical discussion task cannot reopen the retired issue-run route;
+// naming an actual triage task retains its more specific refusal.
+func TestLegacyRerunCannotBypassTriageSessionEvents(t *testing.T) {
 	f := newTriageRunFixture(t)
 	issueID := f.issueFor(t, triagePending, "triage rerun by source")
 
-	// A discussion run: what a member's @mention leaves behind on a Triage entry.
+	// A discussion run persisted by an older server.
 	discussionID := dbfx.Task(t, f.agentID, testutil.Cols{
 		"runtime_id":   f.runtimeID,
 		"issue_id":     issueID,
@@ -488,11 +472,13 @@ func TestRerunInTriageFollowsItsSource(t *testing.T) {
 		"completed_at": testutil.Raw("now() - interval '1 minute'"),
 	})
 	before := tasksOn(t, issueID)
-	testutil.Call(t, testHandler.RerunIssue, withURLParam(
-		newRequest(http.MethodPost, "/api/issues/"+issueID+"/rerun", map[string]any{"task_id": discussionID}),
-		"id", issueID)).Want(http.StatusAccepted)
-	if got := tasksOn(t, issueID); got != before+1 {
-		t.Fatalf("rerunning a discussion run added %d task(s), want 1", got-before)
+	response := testutil.Call(t, testHandler.RerunIssue, withURLParam(
+		newRequest(http.MethodPost, "/api/issues/"+issueID+"/rerun", map[string]any{"task_id": discussionID}), "id", issueID))
+	if code := response.Want(http.StatusConflict).Map()["code"]; code != "issue_session_event_required" {
+		t.Fatalf("discussion rerun bypassed the session inbox: %v", code)
+	}
+	if got := tasksOn(t, issueID); got != before {
+		t.Fatalf("discussion rerun added %d tasks", got-before)
 	}
 
 	// The triage run itself is still refused, with its own reason.

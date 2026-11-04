@@ -106,7 +106,7 @@ export function RunConfirmModal({
 
   // Which footer action is in flight, so only the clicked button shows a
   // spinner (the write is not instant — the disabled-only state read as frozen).
-  const [pendingAction, setPendingAction] = useState<"go" | "suppress" | null>(null);
+  const [pendingAction, setPendingAction] = useState<"go" | "suppressSquad" | null>(null);
   const submitting = pendingAction !== null;
 
   const updateIssue = useUpdateIssue();
@@ -121,6 +121,7 @@ export function RunConfirmModal({
   // the issue, and re-sending the same assignee would turn a status write into
   // an assignee write on the server's side of the trigger predicate.
   const isPromote = d.mode === "promote" && !!d.status;
+  const canSuppressSquadRun = d.assigneeType === "squad";
 
   const applyTo = (extra: Partial<UpdateIssueRequest>) => {
     const base: UpdateIssueRequest = isPromote
@@ -138,10 +139,11 @@ export function RunConfirmModal({
     d.assigneeName ??
     getActorName(d.assigneeType === "squad" ? "squad" : "agent", d.assigneeId ?? "");
 
-  const submit = async (suppressRun: boolean) => {
+  const submit = async (action: "go" | "suppressSquad") => {
     if (issueIds.length === 0 || submitting) return;
-    setPendingAction(suppressRun ? "suppress" : "go");
-    const payload = applyTo(suppressRun ? { suppress_run: true } : {});
+    if (action === "suppressSquad" && !canSuppressSquadRun) return;
+    setPendingAction(action);
+    const payload = applyTo(action === "suppressSquad" ? { suppress_run: true } : {});
     try {
       // Completion is silent, exactly as before: the assignee and any run show
       // up through the issue's normal assignee / run-status updates, so there is
@@ -204,7 +206,7 @@ export function RunConfirmModal({
       e.target.closest("button") !== null;
     if (activatesFocusedButton) return;
     e.preventDefault();
-    void submit(false);
+    void submit("go");
   };
 
   // States the action, not a prediction: the write is certain, the run is
@@ -246,10 +248,12 @@ export function RunConfirmModal({
         {/* flex-wrap keeps a longer translation, or a larger text size, from
             bringing the scrollbar back: the actions stack instead. */}
         <DialogFooter className="sm:flex-wrap">
-          <Button type="button" variant="outline" disabled={submitting} onClick={() => submit(true)}>
-            {pendingAction === "suppress" ? <Spinner className="size-4" /> : t(($) => $.run_confirm.dont_start)}
-          </Button>
-          <Button type="button" disabled={submitting} onClick={() => submit(false)}>
+          {canSuppressSquadRun ? (
+            <Button type="button" variant="outline" disabled={submitting} onClick={() => submit("suppressSquad")}>
+              {pendingAction === "suppressSquad" ? <Spinner className="size-4" /> : t(($) => $.run_confirm.dont_start)}
+            </Button>
+          ) : null}
+          <Button type="button" disabled={submitting} onClick={() => submit("go")}>
             {pendingAction === "go" ? (
               <Spinner className="size-4" />
             ) : (

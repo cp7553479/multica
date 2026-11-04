@@ -272,11 +272,10 @@ func TestClaimTasksByRuntime_RequiresDaemonID(t *testing.T) {
 	}
 }
 
-// TestClaimTasksByRuntime_RepairsStaleCommentPlan pins the MUL-4257 review
-// must-fix: when a claimed task's trigger comment was deleted (only coalesced
-// survivors remain), the batch path must NOT finalize+dispatch it (which would
-// silently drop the surviving comment). Instead it cancels the stale task,
-// omits it from the batch, and replays the surviving comment as a fresh plan.
+// TestClaimTasksByRuntime_RepairsStaleCommentPlan preserves the legacy claim
+// safety boundary: a deleted trigger cannot lend its tool authority to a
+// generic issue run. The stale auxiliary plan is cancelled without minting a
+// token or replaying comments as tasks; the surviving comment stays readable.
 func TestClaimTasksByRuntime_RepairsStaleCommentPlan(t *testing.T) {
 	if testHandler == nil || testPool == nil {
 		t.Skip("database not available")
@@ -284,10 +283,6 @@ func TestClaimTasksByRuntime_RepairsStaleCommentPlan(t *testing.T) {
 	ctx := context.Background()
 	rt := createClaimReclaimRuntime(t, ctx, "Stale plan rt")
 	agentID, issueID := createClaimReclaimAgentAndIssue(t, ctx, rt, "Stale plan agent")
-	// Assign the issue to the agent so the surviving comment re-routes to it.
-	if _, err := testPool.Exec(ctx, `UPDATE issue SET assignee_type='agent', assignee_id=$1 WHERE id=$2`, agentID, issueID); err != nil {
-		t.Fatalf("assign issue: %v", err)
-	}
 
 	// A surviving member comment on the issue.
 	var survivorID string
@@ -334,16 +329,19 @@ func TestClaimTasksByRuntime_RepairsStaleCommentPlan(t *testing.T) {
 	if status != "cancelled" {
 		t.Fatalf("stale task status = %s, want cancelled", status)
 	}
-	// (3) The surviving comment was rebuilt into a fresh plan (a new task with
-	// the survivor as its trigger).
-	var rebuilt int
-	if err := testPool.QueryRow(ctx, `
-		SELECT count(*) FROM agent_task_queue
-		WHERE issue_id = $1 AND trigger_comment_id = $2 AND id <> $3
-	`, issueID, survivorID, staleID).Scan(&rebuilt); err != nil {
-		t.Fatalf("count rebuilt: %v", err)
+	// No credentials or new per-comment execution may escape the stale plan.
+	var tokens, successors int
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM task_token WHERE task_id=$1`, staleID).Scan(&tokens); err != nil {
+		t.Fatalf("count stale task tokens: %v", err)
 	}
-	if rebuilt < 1 {
-		t.Fatalf("expected the surviving comment rebuilt into a new trigger task, found %d", rebuilt)
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM agent_task_queue WHERE issue_id=$1 AND id<>$2`, issueID, staleID).Scan(&successors); err != nil {
+		t.Fatalf("count successor tasks: %v", err)
+	}
+	if tokens != 0 || successors != 0 {
+		t.Fatalf("stale plan minted tokens or replayed a comment: tokens=%d successors=%d", tokens, successors)
+	}
+	var content string
+	if err := testPool.QueryRow(ctx, `SELECT content FROM comment WHERE id=$1 AND deleted_at IS NULL`, survivorID).Scan(&content); err != nil || content != "please still handle this" {
+		t.Fatalf("surviving comment was lost: content=%q error=%v", content, err)
 	}
 }

@@ -188,6 +188,12 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 	go func() {
 		if supplements != nil {
 			if initErr := supplements.initialize(inputWriter, opts.HandshakeTimeout); initErr != nil {
+				if opts.StrictSessionResume {
+					closeStdin()
+					cancel()
+					writeDone <- fmt.Errorf("persistent issue session live delivery unavailable: %w", initErr)
+					return
+				}
 				b.cfg.Logger.Warn("Claude additional messages unavailable; continuing normally", "error", initErr)
 				supplements.end()
 			}
@@ -217,6 +223,9 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 		resultIsError := false
 		terminalReasonError := ""
 		var sessionID string
+		var persistentSessionError string
+		var sessionPersistenceError string
+		sessionPersisted := false
 		var lastUsageResult *claudeSDKMessage
 		sawAsyncLaunch := false
 		usage := make(map[string]TokenUsage)
@@ -293,6 +302,7 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 
 		scanner := newAgentStreamScanner(stdout)
 
+	scanLoop:
 		for scanner.Scan() {
 			line := strings.TrimSpace(scanner.Text())
 			if line == "" {
@@ -305,6 +315,59 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 				continue
 			}
 			eventCount++
+			if opts.StrictSessionResume && opts.ResumeSessionID != "" && msg.SessionID != "" && msg.SessionID != opts.ResumeSessionID {
+				persistentSessionError = "claude persistent session identity changed; refusing replacement"
+				cancel()
+				break scanLoop
+			}
+			if opts.PersistSession != nil {
+				sid := msg.SessionID
+				if msg.Type == "control_request" && msg.ParentToolUseID == "" {
+					var hook struct {
+						Subtype string `json:"subtype"`
+						Input   struct {
+							SessionID string `json:"session_id"`
+							AgentID   string `json:"agent_id"`
+						} `json:"input"`
+					}
+					if json.Unmarshal(msg.Request, &hook) == nil && hook.Subtype == "hook_callback" && hook.Input.AgentID == "" {
+						if sid == "" {
+							sid = hook.Input.SessionID
+						}
+					}
+				}
+				if sid != "" {
+					if (sessionID != "" && sid != sessionID) || (opts.StrictSessionResume && opts.ResumeSessionID != "" && sid != opts.ResumeSessionID) {
+						persistentSessionError = "claude persistent session identity changed; refusing replacement"
+						cancel()
+						break scanLoop
+					}
+					if !sessionPersisted {
+						sessionID = sid
+						if err := opts.PersistSession(runCtx, sid); err != nil {
+							sessionPersistenceError = fmt.Sprintf("claude persist provider session: %v", err)
+							cancel()
+							break scanLoop
+						}
+						sessionPersisted = true
+						select {
+						case msgCh <- Message{Type: MessageStatus, Status: "running", SessionID: sid}:
+						case <-runCtx.Done():
+							break scanLoop
+						}
+					}
+				}
+				if msg.Type == "control_request" && msg.ParentToolUseID == "" && !sessionPersisted {
+					sessionPersistenceError = "claude provider session identity unavailable before control boundary"
+					cancel()
+					break scanLoop
+				}
+				if !sessionPersisted && (msg.Type == "assistant" || msg.Type == "user" || msg.Type == "result") {
+					sessionPersistenceError = "claude provider session identity unavailable before model output"
+					cancel()
+					break scanLoop
+				}
+			}
 
 			switch msg.Type {
 			case "assistant":
@@ -329,7 +392,9 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 				finalResultText = msg.ResultText
 				resultIsError = msg.IsError
 				terminalReasonError = claudeTerminalReasonFailure(msg.TerminalReason, msg.ResultText)
-				sessionID = msg.SessionID
+				if msg.SessionID != "" {
+					sessionID = msg.SessionID
+				}
 				// A resume whose baseline capture failed cannot trust the
 				// result's modelUsage: newer Claude Code restores the session's
 				// cumulative counters on resume, so the reported total may span
@@ -470,6 +535,17 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 			completionGuardError,
 		)
 
+		if persistentSessionError != "" {
+			finalStatus = "failed"
+			finalError = persistentSessionError
+			if opts.ResumeSessionID != "" {
+				sessionID = opts.ResumeSessionID
+			}
+		}
+		if sessionPersistenceError != "" {
+			finalStatus, finalError = "failed", sessionPersistenceError
+		}
+
 		// cmd.Wait() has returned — os/exec's stderr copy goroutine has
 		// observed every byte claude wrote to stderr before exiting, so
 		// stderrBuf.Tail() is safe to sample now. Attach the tail to any
@@ -503,6 +579,9 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 		// "no conversation found" is printed to stderr. Check both.
 		resumeRejected := resumeWasRejected(opts.ResumeSessionID, sessionID, finalStatus == "failed", finalError, stderrTail)
 		reportedSessionID := resolveSessionID(opts.ResumeSessionID, sessionID, finalStatus == "failed", finalError, stderrTail)
+		if opts.PersistSession != nil {
+			reportedSessionID, resumeRejected = sessionID, false
+		}
 		if resumeRejected {
 			// A rejected resume may emit usage for a newly-created session. Its
 			// totals do not share the requested session's baseline.

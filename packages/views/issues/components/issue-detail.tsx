@@ -114,6 +114,7 @@ import { collectThreadParticipants, collectThreadReplies, deriveThreadResolution
 import { IssueAgentHeaderChip } from "./issue-agent-header-chip";
 import { IssueWakeupHeaderChip } from "./issue-wakeup-header-chip";
 import { ExecutionLogSection } from "./execution-log-section";
+import { IssueAgentSessions } from "./issue-agent-sessions";
 import { WakeupsSection } from "./wakeups-section";
 import { QuickActionsSection } from "./quick-actions-section";
 import { PluginPanelSection } from "../../plugins";
@@ -3078,6 +3079,8 @@ export function IssueDetail({ issueId, onDelete, onDone, defaultSidebarOpen = tr
       {/* Deliverables — the files this issue's comments delivered. Hidden
           while there are none. */}
       <DeliverablesSection files={deliverableFiles} onOpenOverview={openOverview} />
+
+      <IssueAgentSessions issueId={id} />
 
       {/* Execution summary owns its query, realtime updates and disclosure. */}
       <ExecutionLogSection issueId={id} identifier={issue.identifier} issueTitle={issue.title} />

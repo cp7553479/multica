@@ -244,7 +244,6 @@ describe("comment edit — content conflict", () => {
         "comment-1",
         "My local edit",
         [],
-        undefined,
         "Original body",
       ),
     );
@@ -406,7 +405,7 @@ describe("comment thread — selection reply", () => {
     expect(screen.queryByRole("button", { name: "Preview reply" })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Send" }));
     await waitFor(() => expect(onReply).toHaveBeenCalledTimes(1));
-    expect(onReply).toHaveBeenCalledWith("agent-child", "> Selected agent text\n\nReply-specific note", undefined, undefined, undefined);
+    expect(onReply).toHaveBeenCalledWith("agent-child", "> Selected agent text\n\nReply-specific note", undefined);
     await waitFor(() => {
       expect(useCommentDraftStore.getState().getAnnotations("reply:issue-1:comment-1")).toHaveLength(0);
       expect(document.querySelector("[data-reply-annotation-overlay]")).not.toBeInTheDocument();

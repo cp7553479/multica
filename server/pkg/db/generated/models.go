@@ -868,6 +868,46 @@ type Issue struct {
 	DuplicateOfIssueID pgtype.UUID        `json:"duplicate_of_issue_id"`
 }
 
+type IssueAgentEvent struct {
+	ID               pgtype.UUID        `json:"id"`
+	WorkspaceID      pgtype.UUID        `json:"workspace_id"`
+	SessionID        pgtype.UUID        `json:"session_id"`
+	Sequence         int64              `json:"sequence"`
+	EventKey         string             `json:"event_key"`
+	Kind             string             `json:"kind"`
+	SourceID         pgtype.UUID        `json:"source_id"`
+	SourceRevision   int64              `json:"source_revision"`
+	ActorType        string             `json:"actor_type"`
+	ActorID          pgtype.UUID        `json:"actor_id"`
+	OriginatorUserID pgtype.UUID        `json:"originator_user_id"`
+	SourceTaskID     pgtype.UUID        `json:"source_task_id"`
+	Payload          []byte             `json:"payload"`
+	Status           string             `json:"status"`
+	DeliveryTaskID   pgtype.UUID        `json:"delivery_task_id"`
+	AttemptCount     int32              `json:"attempt_count"`
+	FailureReason    pgtype.Text        `json:"failure_reason"`
+	DeliveredAt      pgtype.Timestamptz `json:"delivered_at"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt        pgtype.Timestamptz `json:"updated_at"`
+}
+
+type IssueAgentSession struct {
+	ID                pgtype.UUID        `json:"id"`
+	WorkspaceID       pgtype.UUID        `json:"workspace_id"`
+	IssueID           pgtype.UUID        `json:"issue_id"`
+	AgentID           pgtype.UUID        `json:"agent_id"`
+	RuntimeID         pgtype.UUID        `json:"runtime_id"`
+	ProviderSessionID pgtype.Text        `json:"provider_session_id"`
+	WorkDir           pgtype.Text        `json:"work_dir"`
+	ActiveTaskID      pgtype.UUID        `json:"active_task_id"`
+	WakeAfter         pgtype.Timestamptz `json:"wake_after"`
+	State             string             `json:"state"`
+	FailureReason     pgtype.Text        `json:"failure_reason"`
+	NextSequence      int64              `json:"next_sequence"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
+}
+
 type IssueChildEvent struct {
 	ID           pgtype.UUID        `json:"id"`
 	WorkspaceID  pgtype.UUID        `json:"workspace_id"`

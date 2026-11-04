@@ -38,9 +38,8 @@ import { api, dispatchReasonCode, errorCode } from "@multica/core/api";
 import { ReplyInput } from "./reply-input";
 import { CommentTriggerChips } from "./comment-trigger-chips";
 import { useCommentTriggerPreview } from "../hooks/use-comment-trigger-preview";
-import { useRecipientActions } from "../hooks/use-recipient-actions";
 import { SteerBadge, SteerReceipts } from "./steer-receipts";
-import type { AgentTask, TimelineEntry, Attachment } from "@multica/core/types";
+import type { TimelineEntry, Attachment } from "@multica/core/types";
 import { contentReferencesAttachment } from "@multica/core/types";
 import { isDeletedComment } from "@multica/core/issues/comment-deletion";
 import { commentSupplementReceipts, isSupplementInFlight } from "@multica/core/issues/run-steering";
@@ -133,9 +132,9 @@ interface CommentCardProps {
    * `CommentRow` has to rerun the rule per row.
    */
   canModerate?: boolean;
-  onReply: (parentId: string, content: string, attachmentIds?: string[], suppressAgentIds?: string[], steerTaskIds?: string[]) => Promise<string | boolean>;
+  onReply: (parentId: string, content: string, attachmentIds?: string[]) => Promise<string | boolean>;
   onReplyAccepted?: (commentId: string) => void;
-  onEdit: (commentId: string, content: string, attachmentIds: string[], suppressAgentIds?: string[], contentBase?: string) => Promise<void>;
+  onEdit: (commentId: string, content: string, attachmentIds: string[], contentBase?: string) => Promise<void>;
   onDelete: (commentId: string) => void;
   onToggleReaction: (commentId: string, emoji: string) => void;
   onCreateSubIssue?: (commentId: string) => void;
@@ -356,12 +355,10 @@ function TaskCommentRetryButton({
 
 // Shared edit-attachment state hook
 
-const NEVER_STEER = () => false;
-
 function useEditAttachmentState(
   issueId: string,
   entry: TimelineEntry,
-  onEdit: (commentId: string, content: string, attachmentIds: string[], suppressAgentIds?: string[], contentBase?: string) => Promise<void>,
+  onEdit: (commentId: string, content: string, attachmentIds: string[], contentBase?: string) => Promise<void>,
 ) {
   const { t } = useT("issues");
   const { t: tEditor } = useT("editor");
@@ -390,14 +387,6 @@ function useEditAttachmentState(
     editingCommentId: entry.id,
     content: editing ? content : "",
   });
-  // An edit neither steers nor stops a run: it can only skip a recipient.
-  const { recipients, routing, setAction: setRecipientAction, reset: resetRecipients } = useRecipientActions({
-    issueId,
-    agents: triggerPreview.agents,
-    allowSteer: false,
-    steerByDefault: NEVER_STEER,
-    resetKey: `${issueId}:${entry.id}:${entry.parent_id ?? ""}`,
-  });
 
   const editorAttachments = pendingAttachments.length > 0
     ? [...(entry.attachments ?? []), ...pendingAttachments]
@@ -424,7 +413,6 @@ function useEditAttachmentState(
     setEditing(false);
     setRevisionConflict(false);
     setContent(entry.content ?? "");
-    resetRecipients();
     setRetainedStandaloneIds(null);
     // clearDraft drops both the edit text and its pending attachments.
     clearDraft(draftKey);
@@ -499,13 +487,11 @@ function useEditAttachmentState(
       if (trimmed === (entry.content ?? "").trim() && !attachmentsChanged) {
         return true;
       }
-      const { suppressAgentIds } = routing;
       try {
         await onEdit(
           entry.id,
           trimmed,
           activeIds,
-          suppressAgentIds.length > 0 ? suppressAgentIds : undefined,
           initialContentBase,
         );
         setRevisionConflict(false);
@@ -556,8 +542,6 @@ function useEditAttachmentState(
     dropZoneProps,
     triggerPreview,
     content,
-    recipients,
-    setRecipientAction,
     draftKey,
     setDraft,
     setContent,
@@ -654,7 +638,7 @@ function CommentRow({
   hasReplies?: boolean;
   /** True when this row is the deep-link target currently being highlighted. */
   isHighlighted?: boolean;
-  onEdit: (commentId: string, content: string, attachmentIds: string[], suppressAgentIds?: string[], contentBase?: string) => Promise<void>;
+  onEdit: (commentId: string, content: string, attachmentIds: string[], contentBase?: string) => Promise<void>;
   onDelete: (commentId: string) => void;
   onToggleReaction: (commentId: string, emoji: string) => void;
   onCreateSubIssue?: (commentId: string) => void;
@@ -872,11 +856,10 @@ function CommentRow({
           <div className="flex items-center justify-between gap-2 mt-2">
             <div className="min-w-0 flex-1">
               <CommentTriggerChips
-                recipients={edit.recipients}
+                recipients={edit.triggerPreview.agents}
                 blocked={edit.triggerPreview.blocked}
                 hasAllMembersMention={edit.triggerPreview.hasAllMembersMention}
                 draftContent={edit.content}
-                onActionChange={edit.setRecipientAction}
               />
             </div>
             <div className="flex shrink-0 items-center gap-2">
@@ -1065,12 +1048,6 @@ function CommentCardImpl({
   const canEditEntry = receipts.length === 0 && (isOwn || (canModerate && entry.actor_type === "member"));
   const canDeleteEntry = !receipts.some(isSupplementInFlight) && (isOwn || canModerate);
   const [confirmDelete, setConfirmDelete] = useState(false);
-  // A reply here goes into the running turn of a run that belongs to this
-  // thread by default; another thread's turn is only reached by choice.
-  const steerThreadRunByDefault = useCallback(
-    (task: AgentTask) => runs.some((run) => run.task.id === task.id),
-    [runs],
-  );
 
   const allNestedReplies = replies;
   // What the thread shows. Tombstones are excluded from display and counts but
@@ -1422,11 +1399,10 @@ function CommentCardImpl({
                         />
                       )}
                     <CommentTriggerChips
-                      recipients={edit.recipients}
+                      recipients={edit.triggerPreview.agents}
                       blocked={edit.triggerPreview.blocked}
                       hasAllMembersMention={edit.triggerPreview.hasAllMembersMention}
                       draftContent={edit.content}
-                      onActionChange={edit.setRecipientAction}
                     />
                     <FileUploadButton
                       size="sm"
@@ -1532,8 +1508,7 @@ function CommentCardImpl({
                   avatarId={currentUserId ?? ""}
                   draftKey={`reply:${issueId}:${entry.id}`}
                   onEditAnnotation={(id) => annotation.editAnnotation(id, true)}
-                  steerByDefault={steerThreadRunByDefault}
-                  onSubmit={(content, attachmentIds, suppressAgentIds, steerTaskIds) => replyTargetMissing ? Promise.resolve(false) : onReply(replyTargetId, content, attachmentIds, suppressAgentIds, steerTaskIds)}
+                  onSubmit={(content, attachmentIds) => replyTargetMissing ? Promise.resolve(false) : onReply(replyTargetId, content, attachmentIds)}
                   onAccepted={onReplyAccepted}
                 />
               </div>

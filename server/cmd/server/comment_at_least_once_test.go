@@ -2,7 +2,7 @@ package main
 
 import (
 	"context"
-	"fmt"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -44,56 +44,61 @@ func containsID(ids []string, want string) bool {
 	return false
 }
 
-// TestConsecutiveCommentsMergeNotDropped is the MUL-4195 regression test.
-//
-// Before the fix, a second/third comment posted while the agent already had a
-// queued task was silently DROPPED by the HasPendingTaskForIssueAndAgent dedup:
-// only the first comment survived and the later instructions were lost. The fix
-// folds each new comment into the pending task instead — still one task (no
-// concurrent runs), but every deliberate comment is preserved: the trigger is
-// repointed to the newest comment and the earlier ones are recorded in
-// coalesced_comment_ids so the single run must address them all.
+// Every HTTP comment becomes its own immutable input in one owner inbox.
+// Replaying capture for the same source revision must not duplicate that input.
 func TestConsecutiveCommentsMergeNotDropped(t *testing.T) {
-	if testPool == nil {
-		t.Skip("no database connection")
+	issueID, agentID := newHTTPCommentOwner(t, "Ordered comments HTTP regression")
+	initial := readHTTPCommentSession(t, issueID)
+	if initial.AgentID != agentID || initial.ActiveTaskID == nil || len(initial.Events) != 1 || initial.Events[0].Kind != "assigned" {
+		t.Fatalf("assigned owner did not receive its initial execution: %+v", initial)
 	}
-	agentID := getAgentID(t)
-	issueID := createIssueAssignedToAgent(t, "Merge-not-drop test", agentID)
-	clearTasks(t, issueID) // drop the assignment task so we start clean
-	t.Cleanup(func() {
-		clearTasks(t, issueID)
-		resp := authRequest(t, "DELETE", "/api/issues/"+issueID, nil)
-		resp.Body.Close()
-	})
-
-	// Three explicit instructions in the same thread, before any run starts.
-	mention := fmt.Sprintf("[@Agent](mention://agent/%s) ", agentID)
-	cidA := postComment(t, issueID, mention+"First instruction", nil)
-	cidB := postComment(t, issueID, mention+"Second, correcting the first", &cidA)
-	cidC := postComment(t, issueID, mention+"Third, one more detail", &cidA)
-
-	// Still exactly one pending task for this (issue, agent, thread).
+	contents := []string{"First instruction", "Second, correcting the first", "Third, one more detail"}
+	first := postComment(t, issueID, contents[0], nil)
+	second := postComment(t, issueID, contents[1], &first)
+	third := postComment(t, issueID, contents[2], &first)
+	commentIDs := []string{first, second, third}
+	session := readHTTPCommentSession(t, issueID)
+	if session.ID != initial.ID || session.ActiveTaskID == nil || *session.ActiveTaskID != *initial.ActiveTaskID || len(session.Events) != 4 {
+		t.Fatalf("consecutive comments changed the session/execution or lost input: %+v", session)
+	}
+	for i, event := range session.Events[1:] {
+		var payload struct {
+			Content  string  `json:"content"`
+			ParentID *string `json:"parent_comment_id"`
+		}
+		if err := json.Unmarshal(event.Payload, &payload); err != nil {
+			t.Fatal(err)
+		}
+		if event.Kind != "comment.created" || event.SourceID == nil || *event.SourceID != commentIDs[i] || event.Sequence != session.Events[0].Sequence+int64(i)+1 || payload.Content != contents[i] || event.ActorType != "member" || event.ActorID == nil || *event.ActorID != testUserID {
+			t.Fatalf("input %d lost order, identity, or original content: %+v payload=%+v", i, event, payload)
+		}
+		if (i == 0 && payload.ParentID != nil) || (i > 0 && (payload.ParentID == nil || *payload.ParentID != first)) {
+			t.Fatalf("input %d lost its explicit comment parent: %+v", i, payload)
+		}
+		for replay := 0; replay < 2; replay++ {
+			if _, err := testPool.Exec(t.Context(), `SELECT append_issue_agent_event($1,'comment.created',$2,$3,'member',$4,NULL,'{}'::jsonb)`, issueID, commentIDs[i], event.SourceRevision, testUserID); err != nil {
+				t.Fatalf("replay captured input: %v", err)
+			}
+		}
+	}
+	replayed := readHTTPCommentSession(t, issueID)
+	if len(replayed.Events) != len(session.Events) {
+		t.Fatalf("replayed sources created %d inputs, want %d", len(replayed.Events), len(session.Events))
+	}
+	for i, event := range replayed.Events {
+		if event.ID != session.Events[i].ID || event.Sequence != session.Events[i].Sequence || string(event.Payload) != string(session.Events[i].Payload) {
+			t.Fatalf("replayed source changed immutable input %d: before=%+v after=%+v", i, session.Events[i], event)
+		}
+	}
 	if n := countPendingTasksForAgent(t, issueID, agentID); n != 1 {
-		t.Fatalf("expected exactly 1 pending task after 3 comments, got %d", n)
+		t.Fatalf("consecutive comments created %d pending executions, want the original owner execution", n)
 	}
-
-	// The trigger points at the NEWEST comment so the injected prompt shows the
-	// latest deliberate instruction.
-	if got := latestTriggerCommentID(t, issueID); got != cidC {
-		t.Errorf("expected trigger_comment_id to be repointed to newest comment %s, got %s", cidC, got)
+	var executions int
+	if err := testPool.QueryRow(t.Context(), `SELECT count(*) FROM agent_task_queue WHERE issue_id=$1 AND context->>'type'='issue_session' AND trigger_comment_id IS NULL`, issueID).Scan(&executions); err != nil {
+		t.Fatal(err)
 	}
-
-	// The earlier comments are preserved (not dropped) as coalesced comments.
-	coalesced := coalescedCommentIDs(t, issueID)
-	if !containsID(coalesced, cidA) {
-		t.Errorf("expected coalesced_comment_ids to preserve first comment %s; got %v", cidA, coalesced)
-	}
-	if !containsID(coalesced, cidB) {
-		t.Errorf("expected coalesced_comment_ids to preserve second comment %s; got %v", cidB, coalesced)
-	}
-	// The current trigger must not also appear in the coalesced set.
-	if containsID(coalesced, cidC) {
-		t.Errorf("newest comment %s should be the trigger, not a coalesced entry; got %v", cidC, coalesced)
+	if executions != 1 {
+		t.Fatalf("inputs used %d session executions, want one without a triggering comment", executions)
 	}
 }
 

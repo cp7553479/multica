@@ -730,34 +730,32 @@ func TestGetLastTaskSessionKeepsBenignAgentErrorWithSession(t *testing.T) {
 	}
 }
 
-// TestRerunIssueSetsForceFreshSession asserts the manual rerun flow flags
-// the new task so the daemon claim handler skips the resume lookup. This
-// is the call-site half of the fix: even if the SQL filter ever misses a
-// poisoned classifier, manual rerun never resumes.
-func TestRerunIssueSetsForceFreshSession(t *testing.T) {
+// TestRerunIssueAssignedSessionRequiresEvent ensures installed clients cannot
+// bypass a persistent issue session by requesting a separate or fresh run.
+func TestRerunIssueAssignedSessionRequiresEvent(t *testing.T) {
 	if testPool == nil {
 		t.Skip("no database connection")
 	}
 
 	issueID, _, _ := setupRerunTestFixture(t)
 	t.Cleanup(func() { cleanupRerunFixture(t, issueID) })
-
 	ctx := context.Background()
 	queries := db.New(testPool)
 	hub := realtime.NewHub()
 	go hub.Run()
-	bus := events.New()
-	taskService := service.NewTaskService(queries, nil, hub, bus)
-
-	task, err := taskService.RerunIssue(ctx, pgtype.UUID{Bytes: parseUUIDBytes(issueID), Valid: true}, pgtype.UUID{}, pgtype.UUID{}, pgtype.UUID{}, false, nil)
-	if err != nil {
-		t.Fatalf("RerunIssue failed: %v", err)
+	taskService := service.NewTaskService(queries, nil, hub, events.New())
+	for _, fresh := range []bool{false, true} {
+		task, err := taskService.RerunIssue(ctx, util.MustParseUUID(issueID), pgtype.UUID{}, pgtype.UUID{}, pgtype.UUID{}, fresh, nil)
+		if task != nil || !errors.Is(err, service.ErrIssueSessionRerunRequiresEvent) {
+			t.Fatalf("fresh=%t: assigned issue bypassed its inbox: task=%v error=%v", fresh, task, err)
+		}
 	}
-	if task == nil {
-		t.Fatal("RerunIssue returned nil task")
+	var tasks int
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM agent_task_queue WHERE issue_id=$1`, issueID).Scan(&tasks); err != nil {
+		t.Fatalf("count issue executions: %v", err)
 	}
-	if !task.ForceFreshSession {
-		t.Fatal("expected manual rerun to set force_fresh_session=true")
+	if tasks != 0 {
+		t.Fatalf("refused rerun created %d separate executions", tasks)
 	}
 }
 
@@ -776,11 +774,16 @@ func TestRerunIssueTargetsSourceTaskAgent(t *testing.T) {
 	t.Cleanup(func() { cleanupRerunFixture(t, issueID) })
 
 	ctx := context.Background()
+	// This historical execution is now auxiliary work on an unassigned issue.
+	// Agent-owned issues continue only through their persistent event inbox.
+	if _, err := testPool.Exec(ctx, `UPDATE issue SET assignee_type=NULL,assignee_id=NULL WHERE id=$1`, issueID); err != nil {
+		t.Fatalf("prepare auxiliary rerun scope: %v", err)
+	}
 
 	// Create a second agent in the same workspace + runtime so we can stand
 	// in as a "row whose agent is no longer the issue assignee" — e.g. a
-	// squad worker or an @-mentioned agent. The issue's assignee is still
-	// the primary agent; the rerun must target this secondary one because
+	// squad worker or an @-mentioned agent. The issue is now unassigned;
+	// the rerun must target this historical secondary agent because
 	// that's whose task row the user clicked.
 	var secondaryAgentID string
 	if err := testPool.QueryRow(ctx, `
@@ -837,7 +840,7 @@ func TestRerunIssueTargetsSourceTaskAgent(t *testing.T) {
 
 	gotAgent := util.UUIDToString(task.AgentID)
 	if gotAgent != secondaryAgentID {
-		t.Fatalf("rerun targeted wrong agent: got %s, want %s (issue assignee is %s — must not be picked)",
+		t.Fatalf("rerun targeted wrong agent: got %s, want %s (original assignee %s must not replace the source agent)",
 			gotAgent, secondaryAgentID, primaryAgentID)
 	}
 	if !task.ForceFreshSession {
@@ -923,6 +926,11 @@ func TestRerunIssueInheritsTriggerCommentFromSourceTask(t *testing.T) {
 	t.Cleanup(func() { cleanupRerunFixture(t, issueID) })
 
 	ctx := context.Background()
+	// This historical execution is now auxiliary work on an unassigned issue.
+	// Agent-owned issues continue only through their persistent event inbox.
+	if _, err := testPool.Exec(ctx, `UPDATE issue SET assignee_type=NULL,assignee_id=NULL WHERE id=$1`, issueID); err != nil {
+		t.Fatalf("prepare auxiliary rerun scope: %v", err)
+	}
 
 	// Create a comment to stand in as the original mention / reply trigger.
 	var triggerCommentID string

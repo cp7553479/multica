@@ -6,6 +6,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
@@ -20,6 +21,8 @@ type IssueContentPatch struct {
 	Title            *string
 	Description      *string
 	ExpectedRevision *int64
+	ActorType        string
+	ActorID          pgtype.UUID
 }
 
 // UpdateContent updates only the low-risk issue content fields exposed in the
@@ -47,9 +50,20 @@ func (s *IssueService) UpdateContent(ctx context.Context, issue db.Issue, patch 
 		params.Description = pgtype.Text{String: *patch.Description, Valid: true}
 	}
 
-	updated, err := s.Queries.UpdateIssue(ctx, params)
+	tx, err := s.TxStarter.Begin(ctx)
+	if err != nil {
+		return db.Issue{}, err
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `SELECT set_config('multica.actor_type',$1,true),set_config('multica.actor_id',$2,true)`, patch.ActorType, util.UUIDToString(patch.ActorID)); err != nil {
+		return db.Issue{}, err
+	}
+	updated, err := s.Queries.WithTx(tx).UpdateIssue(ctx, params)
 	if patch.ExpectedRevision != nil && errors.Is(err, pgx.ErrNoRows) {
 		return db.Issue{}, ErrIssueRevisionConflict
 	}
-	return updated, err
+	if err != nil {
+		return db.Issue{}, err
+	}
+	return updated, tx.Commit(ctx)
 }

@@ -102,11 +102,8 @@ func TestCompleteTaskEmptyOutputAfterCrossIssueReportPostsNothingOnSource(t *tes
 	}
 }
 
-// The fallback guard only looks at the source issue, so a non-empty output
-// still becomes a comment on A even after an explicit report on B. This pins
-// the existing contract: there is no destination or suppression field, and
-// the adapter fix does not add one.
-func TestCompleteTaskNonEmptyOutputAfterCrossIssueReportStillFallsBackToSource(t *testing.T) {
+// A completed turn preserves its output without publishing another comment.
+func TestCompleteTaskNonEmptyOutputAfterCrossIssueReportDoesNotPublishToSource(t *testing.T) {
 	d := newDeliveryFixture(t)
 	task := d.runningTask(t, nil)
 	d.reportOnTarget(t)
@@ -114,8 +111,8 @@ func TestCompleteTaskNonEmptyOutputAfterCrossIssueReportStillFallsBackToSource(t
 	if !d.complete(t, task, "Final answer text.") {
 		t.Fatal("the first completion callback did not transition the task")
 	}
-	if got := d.f.Count(t, "SELECT count(*) FROM comment WHERE issue_id=$1 AND source_task_id=$2", d.source, task); got != 1 {
-		t.Fatalf("source issue got %d fallback comments, want 1 under the current contract", got)
+	if got := d.f.Count(t, "SELECT count(*) FROM comment WHERE issue_id=$1 AND source_task_id=$2", d.source, task); got != 0 {
+		t.Fatalf("source issue got %d implicit comments, want none without an explicit tool call", got)
 	}
 	if got := d.agentComments(t, d.target); got != 1 {
 		t.Fatalf("target issue has %d agent comments, want exactly the report", got)
@@ -123,8 +120,8 @@ func TestCompleteTaskNonEmptyOutputAfterCrossIssueReportStillFallsBackToSource(t
 }
 
 // A replayed terminal callback (the daemon retries until acknowledged) is an
-// idempotent no-op: one completion, one result comment, no new task.
-func TestCompleteTaskRepeatedCallbackPostsOneResult(t *testing.T) {
+// idempotent no-op: one completion, no implicit comment, no new task.
+func TestCompleteTaskRepeatedCallbackDoesNotPublish(t *testing.T) {
 	d := newDeliveryFixture(t)
 
 	for _, tc := range []struct {
@@ -132,7 +129,7 @@ func TestCompleteTaskRepeatedCallbackPostsOneResult(t *testing.T) {
 		output       string
 		wantComments int
 	}{
-		{name: "non-empty output", output: "Final answer text.", wantComments: 1},
+		{name: "non-empty output", output: "Final answer text.", wantComments: 0},
 		{name: "empty output", output: "", wantComments: 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

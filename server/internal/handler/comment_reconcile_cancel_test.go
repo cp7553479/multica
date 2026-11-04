@@ -12,10 +12,8 @@ import (
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
-// TestCompleteTask_CancelledCommentDoesNotReplayQueuedInput exercises the
-// same shape as the production wakeup race: a comment is planned into a
-// queued follow-up while the prior task is running, the follow-up is cancelled
-// through the user handler, and the prior task completes afterwards.
+// Stored comment tasks remain readable and cancellable, but their completion
+// cannot recreate the retired comment queue. New input uses the session inbox.
 func TestCompleteTask_CancelledCommentDoesNotReplayQueuedInput(t *testing.T) {
 	for _, inputType := range []string{"member", "agent"} {
 		t.Run(inputType, func(t *testing.T) {
@@ -101,10 +99,9 @@ func TestCompleteTask_CancelledCommentDoesNotReplayQueuedInput(t *testing.T) {
 	}
 }
 
-// TestCompleteTask_CancelledCommentFromAutomaticCancellationReconciles preserves the
-// recovery path: a system cancellation has no actor id and must remain
-// replayable by completion reconciliation.
-func TestCompleteTask_CancelledCommentFromAutomaticCancellationReconciles(t *testing.T) {
+// Historical task completion must not recreate the retired comment queue, even
+// when the cancelled successor has no explicit cancellation actor.
+func TestCompleteTask_AutomaticallyCancelledHistoricalCommentDoesNotReplay(t *testing.T) {
 	if testHandler == nil {
 		t.Skip("database not available")
 	}
@@ -144,14 +141,17 @@ func TestCompleteTask_CancelledCommentFromAutomaticCancellationReconciles(t *tes
 	if w := completeTaskViaHandler(t, runningTaskID, "done"); w.Code != http.StatusOK {
 		t.Fatalf("CompleteTask: expected 200, got %d: %s", w.Code, w.Body.String())
 	}
-	if n := pendingTaskCountForAgentIssue(t, issueID, agentID); n != 1 {
-		t.Fatalf("automatic cancellation recovery created %d pending task(s), want 1", n)
+	if n := pendingTaskCountForAgentIssue(t, issueID, agentID); n != 0 {
+		t.Fatalf("historical completion replayed automatically cancelled input into %d task(s)", n)
+	}
+	var status string
+	dbfx.QueryRow(t, `SELECT status FROM agent_task_queue WHERE id=$1`, cancelledTaskID).Scan(&status)
+	if status != "cancelled" {
+		t.Fatalf("historical cancellation was overwritten: %s", status)
 	}
 }
 
-// TestCompleteTask_CancelledCommentEditStillReconciles ensures the cancel
-// acknowledgement applies only to the version that existed at cancellation.
-func TestCompleteTask_CancelledCommentEditStillReconciles(t *testing.T) {
+func TestCompleteTask_CancelledHistoricalCommentEditEntersSessionInbox(t *testing.T) {
 	if testHandler == nil {
 		t.Skip("database not available")
 	}
@@ -200,7 +200,13 @@ func TestCompleteTask_CancelledCommentEditStillReconciles(t *testing.T) {
 		t.Fatalf("CompleteTask: expected 200, got %d: %s", w.Code, w.Body.String())
 	}
 	if n := pendingTaskCountForAgentIssue(t, issueID, agentID); n != 1 {
-		t.Fatalf("edited cancelled comment created %d pending task(s), want 1", n)
+		t.Fatalf("edited historical comment has %d pending session execution(s), want 1", n)
+	}
+	if n := dbfx.Count(t, `SELECT count(*) FROM issue_agent_event e JOIN issue_agent_session s ON s.id=e.session_id WHERE s.issue_id=$1 AND s.agent_id=$2 AND e.source_id=$3 AND e.kind='comment.updated'`, issueID, agentID, commentID); n != 1 {
+		t.Fatalf("edited historical comment produced %d session input(s), want one", n)
+	}
+	if n := dbfx.Count(t, `SELECT count(*) FROM agent_task_queue WHERE issue_id=$1 AND agent_id=$2 AND status='queued' AND trigger_comment_id IS NOT NULL`, issueID, agentID); n != 0 {
+		t.Fatalf("edited historical comment recreated %d old comment task(s)", n)
 	}
 }
 

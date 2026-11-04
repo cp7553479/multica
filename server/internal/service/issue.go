@@ -132,10 +132,9 @@ type IssueCreateOpts struct {
 	// metadata at the handler layer.
 	Platform string
 
-	// AssignedAgentRunFireAt creates the automatic assigned-agent task in a
-	// durable deferred state. Channel /issue uses this while detached media is
-	// still resolving, then promotes the returned task after attachment binding.
-	// Zero preserves the ordinary immediate enqueue path.
+	// AssignedAgentRunFireAt delays the assigned-agent session while detached
+	// channel media resolves. Events are captured immediately; attachment binding
+	// releases the session. Zero allows immediate wakeup.
 	AssignedAgentRunFireAt time.Time
 }
 
@@ -197,9 +196,11 @@ var ErrSourceContextAlreadyAttached = errors.New("source context is already atta
 type IssueCreateResult struct {
 	Issue       db.Issue
 	Attachments []db.Attachment
-	// AssignedTaskID is populated when Create enqueues the automatic task for
-	// an agent assignee, including a task deferred by AssignedAgentRunFireAt.
+	// AssignedTaskID identifies an execution created by an immediate wakeup.
 	AssignedTaskID pgtype.UUID
+	// AssignedSessionID identifies the durable assigned-agent inbox, including
+	// when media preparation delays its first execution.
+	AssignedSessionID pgtype.UUID
 	// Labels is the authoritative set of labels attached to the new issue in
 	// the create transaction (empty when none were requested). Callers echo it
 	// on the create response + issue:created event so every client renders the
@@ -374,7 +375,6 @@ func (s *IssueService) Create(ctx context.Context, p IssueCreateParams, opts Iss
 	}
 
 	var issue db.Issue
-	var assignedTask db.AgentTaskQueue
 	if p.OriginType.Valid {
 		issue, err = qtx.CreateIssueWithOrigin(ctx, db.CreateIssueWithOriginParams{
 			ID:            dbid.NewV7(),
@@ -501,17 +501,23 @@ func (s *IssueService) Create(ctx context.Context, p IssueCreateParams, opts Iss
 		}
 	}
 
-	if !opts.AssignedAgentRunFireAt.IsZero() && s.shouldEnqueueAgentTaskWithQueries(ctx, qtx, issue) {
-		// The issue must never become visible without its media-gated assigned
-		// task. Inserting both rows through qtx makes the unique-index winner
-		// deterministic: any observer that can discover the committed issue also
-		// sees the inert deferred task and must merge into it.
-		assignedTask, err = s.TaskService.createDeferredChannelIssueTaskWithQueries(ctx, qtx, issue, opts.AssignedAgentRunFireAt)
+	var assignedSessionID pgtype.UUID
+	if issue.AssigneeType.String == "agent" && issue.AssigneeID.Valid {
+		session, err := qtx.GetIssueAgentSessionForPair(ctx, db.GetIssueAgentSessionForPairParams{
+			WorkspaceID: issue.WorkspaceID, IssueID: issue.ID, AgentID: issue.AssigneeID,
+		})
 		if err != nil {
-			return IssueCreateResult{}, fmt.Errorf("create deferred channel issue task: %w", err)
+			return IssueCreateResult{}, fmt.Errorf("load assigned issue session: %w", err)
+		}
+		assignedSessionID = session.ID
+		if !opts.AssignedAgentRunFireAt.IsZero() {
+			if _, err := qtx.DeferIssueAgentSessionUntil(ctx, db.DeferIssueAgentSessionUntilParams{
+				ID: session.ID, WakeAfter: pgtype.Timestamptz{Time: opts.AssignedAgentRunFireAt, Valid: true},
+			}); err != nil {
+				return IssueCreateResult{}, fmt.Errorf("defer assigned issue session: %w", err)
+			}
 		}
 	}
-
 	if err := tx.Commit(ctx); err != nil {
 		return IssueCreateResult{}, fmt.Errorf("commit: %w", err)
 	}
@@ -524,43 +530,19 @@ func (s *IssueService) Create(ctx context.Context, p IssueCreateParams, opts Iss
 	}
 
 	var assignedTaskID pgtype.UUID
-	if !opts.AssignedAgentRunFireAt.IsZero() {
-		assignedTaskID = assignedTask.ID
-		if assignedTaskID.Valid {
-			// The deferred task became durable with the issue at commit. Refresh the
-			// daemon's schedule only now so a wakeup can never race uncommitted data.
-			s.TaskService.notifyRuntimeMayHaveWork(assignedTask.RuntimeID, "")
-			if err := s.TaskService.hydrateDeferredChannelIssueTaskOverlay(ctx, assignedTask); err != nil {
-				// Runtime overlays are best-effort on every enqueue path. The task is
-				// already durable and safely deferred, so an optional integration
-				// failure must not turn a committed issue into a retry duplicate.
-				slog.Warn("hydrate deferred channel issue task overlay failed",
-					"issue_id", util.UUIDToString(issue.ID),
-					"task_id", util.UUIDToString(assignedTask.ID),
-					"error", err)
-			}
-		} else if s.shouldEnqueueSquadLeaderOnAssign(ctx, issue) {
-			// AssignedAgentRunFireAt currently belongs to channel /issue, which
-			// always resolves an agent assignee. Preserve the ordinary squad path
-			// for any future caller that supplies the option with a squad.
-			s.enqueueSquadLeaderTask(ctx, issue, pgtype.UUID{}, p.CreatorType, actorID)
-		}
-	}
 
 	s.publishIssueCreated(issue, attachments, labels, p.CreatorType, actorID, opts)
 	s.captureCreatedAnalytics(issue, p.CreatorType, actorID, opts)
-	if opts.AssignedAgentRunFireAt.IsZero() {
-		assignedTaskID = s.maybeEnqueueOnAssign(ctx, issue, p.CreatorType, actorID, opts.AssignedAgentRunFireAt)
-	}
+	assignedTaskID = s.maybeEnqueueOnAssign(ctx, issue, p.CreatorType, actorID, opts.AssignedAgentRunFireAt)
 	// Creating an issue already assigned to an agent is the member delegating
 	// work. The run itself is attributed through the creator fallback, which
 	// system wakeups share, so record the action here, at the create, for both
 	// the immediate and the deferred (channel media) path.
-	if assignedTaskID.Valid && p.CreatorType == "member" {
+	if assignedSessionID.Valid && p.CreatorType == "member" && s.TaskService != nil {
 		s.TaskService.RecordHumanDelegation(ctx, attribution.DirectHumanRun(p.CreatorID, attribution.EvidenceIssueAssignment, issue.ID))
 	}
 
-	return IssueCreateResult{Issue: issue, Attachments: attachments, Labels: labels, AssignedTaskID: assignedTaskID}, nil
+	return IssueCreateResult{Issue: issue, Attachments: attachments, Labels: labels, AssignedTaskID: assignedTaskID, AssignedSessionID: assignedSessionID}, nil
 }
 
 // validateIssueCreateProperties returns the canonical JSONB bag to put on the
@@ -888,20 +870,15 @@ func (s *IssueService) maybeEnqueueOnAssign(ctx context.Context, issue db.Issue,
 		// business deciding whether the issue itself commits.
 		s.noteRuntimeUnusable(ctx, issue, verdict)
 	}
-	if admitted {
-		var task db.AgentTaskQueue
-		var err error
-		if agentRunFireAt.IsZero() {
-			task, err = s.TaskService.EnqueueTaskForIssue(ctx, issue)
-		} else {
-			task, err = s.TaskService.EnqueueDeferredChannelIssueTask(ctx, issue, agentRunFireAt)
+	if admitted && issue.AssigneeType.String == "agent" {
+		agent, err := s.Queries.GetAgentInWorkspace(ctx, db.GetAgentInWorkspaceParams{ID: issue.AssigneeID, WorkspaceID: issue.WorkspaceID})
+		if err == nil && agent.RuntimeID.Valid {
+			if _, err := s.TaskService.WakeIssueAgentSessionsForRuntime(ctx, agent.RuntimeID, 32); err != nil {
+				slog.Warn("wake assigned issue session failed; inbox remains durable", "issue_id", util.UUIDToString(issue.ID), "error", err)
+			}
 		}
-		if err != nil {
-			slog.Warn("enqueue agent task on create failed",
-				"issue_id", util.UUIDToString(issue.ID),
-				"error", err)
-		} else {
-			return task.ID
+		if session, err := s.Queries.GetIssueAgentSessionForPair(ctx, db.GetIssueAgentSessionForPairParams{WorkspaceID: issue.WorkspaceID, IssueID: issue.ID, AgentID: issue.AssigneeID}); err == nil {
+			return session.ActiveTaskID
 		}
 	}
 	if s.shouldEnqueueSquadLeaderOnAssign(ctx, issue) {

@@ -356,7 +356,7 @@ func buildPromptBody(task Task, provider string) string {
 			fmt.Fprintf(&b, "Inspect this configuration with `multica issue wakeup get %s %s --output json`. If recurring work is no longer needed, disable it with `multica issue wakeup disable %s %s`.\n", task.IssueID, task.WakeupID, task.IssueID, task.WakeupID)
 		}
 		if task.TriggerCommentID != "" {
-			fmt.Fprintf(&b, "Post your result using `multica issue comment add %s --parent %s --content-file ./reply.md --output table && rm ./reply.md`. This is the original delivery thread, not a new comment trigger.\n", task.IssueID, task.TriggerCommentID)
+			fmt.Fprintf(&b, "If a reply to the original comment is useful, use `multica issue comment add %s --parent %s --content-file ./reply.md --output table && rm ./reply.md`. You may instead publish a top-level comment without --parent or update the issue explicitly; turn completion does not publish a comment.\n", task.IssueID, task.TriggerCommentID)
 		}
 		return b.String()
 	}
@@ -487,9 +487,8 @@ func buildQuickCreatePrompt(task Task) string {
 // buildCommentPrompt constructs a prompt for comment-triggered tasks.
 // The triggering comment content is embedded directly so the agent cannot
 // miss it, even when stale output files exist in a reused workdir.
-// The reply instructions (including the current TriggerCommentID as --parent)
-// are re-emitted on every turn so resumed sessions cannot carry forward a
-// previous turn's --parent UUID.
+// Optional reply targets are re-emitted so an explicit reply cannot accidentally
+// inherit a previous event's parent.
 func buildCommentPrompt(task Task, provider string) string {
 	var b strings.Builder
 	b.WriteString("You are running as a local coding agent for a Multica workspace.\n\n")
@@ -668,11 +667,8 @@ func buildCommentPrompt(task Task, provider string) string {
 	} else {
 		fmt.Fprintf(&b, "Read the discussion: scan with `multica issue comment list %s --roots-only --summary --compact --output json`, then expand what matters with `--thread <thread-id> --tail 30`.\n\n", task.IssueID)
 	}
-	// Reply routing. When this run coalesced comments spanning MORE THAN ONE
-	// root thread, answer each thread in its own thread instead of dumping one
-	// merged comment (MUL-4348). Same-thread follow-ups collapse to a single
-	// group upstream, so they keep the ordinary single-parent path below and can
-	// never be split into duplicate replies.
+	// Preserve source thread identifiers as optional reply targets. The agent
+	// chooses its public actions independently of the event that woke the session.
 	if targets := commentReplyThreads(task); len(targets) >= 2 {
 		b.WriteString(execenv.BuildMultiThreadCommentReplyInstructions(task.IssueID, targets, taskIsSquadLeader(task)))
 	} else {

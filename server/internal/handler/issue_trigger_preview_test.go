@@ -9,7 +9,9 @@ import (
 	"testing"
 
 	"github.com/multica-ai/multica/server/internal/daemon"
+	"github.com/multica-ai/multica/server/internal/service"
 	"github.com/multica-ai/multica/server/internal/util"
+	"github.com/multica-ai/multica/server/pkg/protocol"
 )
 
 // seededReadyAgentID returns a workspace agent that has a runtime bound (the
@@ -189,44 +191,64 @@ func TestPreviewIssueTrigger_MatchesWritePath(t *testing.T) {
 	}
 }
 
-// TestUpdateIssueSuppressRunSkipsEnqueue verifies suppress_run applies the
-// assignee change but starts no run, while the same write without it does.
-func TestUpdateIssueSuppressRunSkipsEnqueue(t *testing.T) {
+func TestUpdateIssueSuppressRunCannotSuppressAgentSession(t *testing.T) {
 	agentID := seededReadyAgentID(t)
-
-	// Suppressed assign: assignee set, no task.
-	suppressed := createIssueForTest(t, map[string]any{"title": "suppress on", "status": "todo"})
-	w := httptest.NewRecorder()
-	req := withURLParam(newRequest("PUT", "/api/issues/"+suppressed.ID, map[string]any{
-		"assignee_type": "agent", "assignee_id": agentID, "suppress_run": true,
-	}), "id", suppressed.ID)
-	testHandler.UpdateIssue(w, req)
-	if w.Code != http.StatusOK {
-		t.Fatalf("UpdateIssue suppressed: %d %s", w.Code, w.Body.String())
-	}
-	if got := taskCountFor(t, suppressed.ID, agentID); got != 0 {
-		t.Fatalf("suppress_run=true should not enqueue, got %d tasks", got)
-	}
-
-	// Control: same write without suppress_run enqueues.
-	control := createIssueForTest(t, map[string]any{"title": "suppress off", "status": "todo"})
-	w2 := httptest.NewRecorder()
-	req2 := withURLParam(newRequest("PUT", "/api/issues/"+control.ID, map[string]any{
-		"assignee_type": "agent", "assignee_id": agentID,
-	}), "id", control.ID)
-	testHandler.UpdateIssue(w2, req2)
-	if w2.Code != http.StatusOK {
-		t.Fatalf("UpdateIssue control: %d %s", w2.Code, w2.Body.String())
-	}
-	if got := taskCountFor(t, control.ID, agentID); got == 0 {
-		t.Fatalf("control (no suppress_run) should enqueue, got 0 tasks")
+	squadID := dbfx.Squad(t, "Explicit dispatch suppression", agentID)
+	for _, ownerType := range []string{"agent", "squad"} {
+		for _, suppress := range []bool{true, false} {
+			name := ownerType + "/normal"
+			if suppress {
+				name = ownerType + "/retired_suppression"
+			}
+			t.Run(name, func(t *testing.T) {
+				ownerID := agentID
+				if ownerType == "squad" {
+					ownerID = squadID
+				}
+				issue := createIssueForTest(t, map[string]any{"title": "suppression boundary " + name, "status": "todo"})
+				response := httptest.NewRecorder()
+				request := withURLParam(newRequest(http.MethodPut, "/api/issues/"+issue.ID, map[string]any{
+					"assignee_type": ownerType, "assignee_id": ownerID, "suppress_run": suppress,
+				}), "id", issue.ID)
+				testHandler.UpdateIssue(response, request)
+				if response.Code != http.StatusOK {
+					t.Fatalf("UpdateIssue: %d %s", response.Code, response.Body.String())
+				}
+				stored, err := testHandler.Queries.GetIssue(t.Context(), util.MustParseUUID(issue.ID))
+				if err != nil || stored.AssigneeType.String != ownerType || uuidToString(stored.AssigneeID) != ownerID {
+					t.Fatalf("assignment was suppressed: issue=%+v err=%v", stored, err)
+				}
+				want := 1
+				// Squad assignment remains an explicit dispatch surface. The
+				// old parameter may suppress it, but cannot erase an agent's
+				// transactional inbox or switch that inbox to a legacy route.
+				if ownerType == "squad" && suppress {
+					want = 0
+				}
+				if got := taskCountFor(t, issue.ID, agentID); got != want {
+					t.Fatalf("execution count=%d, want %d", got, want)
+				}
+				sessions := captureIssueSessions(t, issue.ID)
+				if ownerType == "agent" {
+					if len(sessions) != 1 || sessions[0].AgentID != agentID || len(sessions[0].Events) != 1 || sessions[0].Events[0].Kind != "assigned" {
+						t.Fatalf("retired suppression removed the assigned input: %+v", sessions)
+					}
+					var kind string
+					dbfx.QueryRow(t, `SELECT context->>'type' FROM agent_task_queue WHERE issue_id=$1`, issue.ID).Scan(&kind)
+					if kind != "issue_session" {
+						t.Fatalf("assignment used %q instead of the session inbox", kind)
+					}
+				} else if len(sessions) != 0 {
+					t.Fatalf("squad assignment acquired an agent-owner session: %+v", sessions)
+				}
+			})
+		}
 	}
 }
 
-// TestLegacyV0438HandoffPayloadReachesTaskPrompt is the cross-version guard
-// for installed clients: the v0.4.38 update payload must survive the current
-// API, task queue, claim wire shape, and daemon prompt rendering.
-func TestLegacyV0438HandoffPayloadReachesTaskPrompt(t *testing.T) {
+// Installed clients' handoff notes enter the same durable inbox as current
+// issue writes, and survive the daemon claim wire shape.
+func TestLegacyV0438HandoffPayloadReachesIssueSessionInbox(t *testing.T) {
 	agentID := seededReadyAgentID(t)
 	note := "Only touch the login flow."
 	issue := createIssueForTest(t, map[string]any{
@@ -253,7 +275,23 @@ func TestLegacyV0438HandoffPayloadReachesTaskPrompt(t *testing.T) {
 		t.Fatalf("legacy handoff update queued %d tasks, want 1", len(tasks))
 	}
 
-	claimJSON, err := json.Marshal(taskToResponse(tasks[0], testWorkspaceID))
+	if !service.IsIssueAgentSessionTask(tasks[0]) || tasks[0].HandoffNote.Valid {
+		t.Fatalf("handoff did not use its session event: %+v", tasks[0])
+	}
+	dbfx.Exec(t, `UPDATE agent_task_queue SET status='dispatched',dispatched_at=now() WHERE id=$1`, tasks[0].ID)
+	task, err := testHandler.Queries.GetAgentTask(context.Background(), tasks[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := taskToResponse(task, testWorkspaceID)
+	req.Header.Set("X-Client-Capabilities", protocol.DaemonCapabilityIssueSessionEventsV1)
+	if failure := testHandler.applyIssueAgentSessionResume(req, &task, &claim); failure != nil {
+		t.Fatalf("session claim rejected: %+v", failure)
+	}
+	if failure := testHandler.attachInitialIssueAgentEvents(req, &task, &claim); failure != nil {
+		t.Fatalf("session events rejected: %+v", failure)
+	}
+	claimJSON, err := json.Marshal(claim)
 	if err != nil {
 		t.Fatalf("marshal claim response: %v", err)
 	}
@@ -261,11 +299,8 @@ func TestLegacyV0438HandoffPayloadReachesTaskPrompt(t *testing.T) {
 	if err := json.Unmarshal(claimJSON, &claimed); err != nil {
 		t.Fatalf("decode daemon task: %v", err)
 	}
-	if claimed.HandoffNote != note {
-		t.Fatalf("claimed handoff note = %q, want %q", claimed.HandoffNote, note)
-	}
-	if prompt := daemon.BuildPrompt(claimed, "codex"); !strings.Contains(prompt, note) {
-		t.Fatalf("daemon prompt dropped legacy handoff note:\n%s", prompt)
+	if len(claimed.IssueSessionEvents) != 1 || !strings.Contains(string(claimed.IssueSessionEvents[0].Payload), note) {
+		t.Fatalf("daemon inbox dropped handoff note: %+v", claimed.IssueSessionEvents)
 	}
 }
 

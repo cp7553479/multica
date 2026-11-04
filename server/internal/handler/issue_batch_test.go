@@ -293,11 +293,11 @@ func TestBatchChildDoneCrossStage_OneWake(t *testing.T) {
 	assertFinal := func(t *testing.T, parentID, agentID string) {
 		t.Helper()
 		entries := childDoneEntries(t, parentID)
-		if len(entries) != 1 || entries[0].Stage != nil || entries[0].Total != 4 || entries[0].Outcome != "woke" {
+		if len(entries) != 1 || entries[0].Stage != nil || entries[0].Total != 4 || entries[0].Outcome != "queued" {
 			t.Fatalf("entries = %+v, want one wrap-up wake", entries)
 		}
 		runs := childDoneRuns(t, parentID)
-		if len(runs) != 1 || runs[0].ID != entries[0].TaskID || strings.Contains(runs[0].Note, "next_stage") || !strings.Contains(runs[0].Note, `"all":true`) {
+		if len(runs) != 1 || runs[0].SessionID != entries[0].SessionID || runs[0].EventID != entries[0].EventID || entries[0].TaskID != "" || strings.Contains(runs[0].Note, "next_stage") || !strings.Contains(runs[0].Note, `"all":true`) {
 			t.Fatalf("runs = %+v, want one run for the final state", runs)
 		}
 		if got := countPendingTasksForAgent(t, parentID, agentID); got != 1 {

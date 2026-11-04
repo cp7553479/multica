@@ -78,6 +78,9 @@ type cursorSupplementSession struct {
 	server    *http.Server
 	hooksPath string
 	hooksData []byte
+	// persistSession gates the independent hook transport on the same durable
+	// identity confirmation used by the stdout stream.
+	persistSession func(string) error
 
 	mu        sync.Mutex
 	sessionID string
@@ -373,6 +376,13 @@ func (s *cursorSupplementSession) ServeHTTP(w http.ResponseWriter, r *http.Reque
 	if err := json.NewDecoder(io.LimitReader(r.Body, cursorHookRequestLimit)).Decode(&req); err != nil {
 		http.Error(w, "invalid hook request", http.StatusBadRequest)
 		return
+	}
+	if s.persistSession != nil && req.ParentToolCallID == "" && slices.Contains(cursorSupplementEvents, req.Event) {
+		if err := s.persistSession(req.ConversationID); err != nil {
+			http.Error(w, "provider session persistence failed", http.StatusServiceUnavailable)
+			return
+		}
+		s.activate(req.ConversationID)
 	}
 	body, err := json.Marshal(s.prepareHook(req))
 	if err == nil {

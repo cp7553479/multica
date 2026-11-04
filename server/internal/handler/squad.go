@@ -1158,21 +1158,6 @@ func (h *Handler) shouldSuppressSquadLeaderSelfTrigger(ctx context.Context, issu
 	return !latest.SquadID.Valid || uuidToString(latest.SquadID) != uuidToString(squadID)
 }
 
-// commentMentionsAnyone returns true when the comment body contains at least
-// one routing-style mention — [@Name](mention://agent|member|squad|all/<id>).
-// Issue cross-references (mention://issue/...) are ignored because they are
-// not directed at a participant. Only the current comment is inspected —
-// parent (thread root) mentions are NOT inherited here.
-func commentMentionsAnyone(content string) bool {
-	for _, m := range util.ParseMentions(content) {
-		switch m.Type {
-		case "agent", "member", "squad", "all":
-			return true
-		}
-	}
-	return false
-}
-
 // The squad-leader assign/promotion readiness decision now lives in the single
 // service.IssueService.WillEnqueueRun predicate (MUL-3375), shared by the issue
 // write paths and the preview endpoint. The former handler-local mirrors
@@ -1182,9 +1167,8 @@ func commentMentionsAnyone(content string) bool {
 // dedup in one place.
 
 // enqueueSquadLeaderTask triggers the squad leader agent for an issue assigned
-// to a squad. Assign and backlog-promotion paths use this directly; comment
-// paths go through computeCommentAgentTriggers so preview and create share the
-// same trigger set.
+// to a squad. Assign and backlog-promotion paths use this directly. Comments
+// only enter a session when the issue has an explicit agent owner.
 // It returns true only when a leader task was actually enqueued.
 func (h *Handler) enqueueSquadLeaderTask(ctx context.Context, issue db.Issue, triggerCommentID pgtype.UUID, authorType, authorID, handoffNote string) bool {
 	squad, err := h.Queries.GetSquadInWorkspace(ctx, db.GetSquadInWorkspaceParams{

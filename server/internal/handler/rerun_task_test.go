@@ -29,8 +29,9 @@ func TestRerunTaskByUserContinuity(t *testing.T) {
 			if tc.reassigned {
 				currentAgentID = createHandlerTestAgent(t, "New assignee", []byte("[]"))
 			}
-			issueID := dbfx.Issue(t, "rerun a displaced agent", testutil.Cols{
-				"assignee_type": "agent", "assignee_id": currentAgentID,
+			squadID := dbfx.Squad(t, "auxiliary rerun target "+t.Name(), currentAgentID)
+			issueID := dbfx.Issue(t, "rerun a displaced auxiliary agent", testutil.Cols{
+				"assignee_type": "squad", "assignee_id": squadID,
 			})
 			commentID := dbfx.Comment(t, issueID, "continue this work")
 			sourceID := dbfx.Task(t, agentID, testutil.Cols{
@@ -102,8 +103,9 @@ func TestRerunTaskByUserPrivateHistoricalAgent(t *testing.T) {
 	}
 	agentID, ownerID, _ := privateAgentTestFixture(t)
 	currentAgentID := createHandlerTestAgent(t, "Current public assignee", []byte("[]"))
-	issueID := dbfx.Issue(t, "private historical run", testutil.Cols{
-		"assignee_type": "agent", "assignee_id": currentAgentID,
+	squadID := dbfx.Squad(t, "auxiliary private historical target", currentAgentID)
+	issueID := dbfx.Issue(t, "private historical auxiliary run", testutil.Cols{
+		"assignee_type": "squad", "assignee_id": squadID,
 	})
 	sourceID := dbfx.Task(t, agentID, testutil.Cols{"issue_id": issueID, "runtime_id": testRuntimeID})
 	for _, fresh := range []bool{false, true} {

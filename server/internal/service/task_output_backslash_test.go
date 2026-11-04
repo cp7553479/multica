@@ -97,7 +97,7 @@ func TestWriteChatCompletionOutcomeBackslashes(t *testing.T) {
 	}
 }
 
-func TestCompleteTaskFallbackCommentBackslashes(t *testing.T) {
+func TestCompleteTaskPreservesOutputWithoutPublishing(t *testing.T) {
 	f, s, issue, agent := conditionFixture(t)
 	ctx := context.Background()
 	f.Cleanup(t, "DELETE FROM comment WHERE issue_id=$1", issue)
@@ -116,9 +116,12 @@ func TestCompleteTaskFallbackCommentBackslashes(t *testing.T) {
 				t.Fatalf("CompleteTask: %v", err)
 			}
 			var got string
-			f.QueryRow(t, "SELECT content FROM comment WHERE issue_id=$1 AND source_task_id=$2", issue, taskID).Scan(&got)
-			if got != tc.want {
-				t.Errorf("stored fallback comment = %q, want %q", got, tc.want)
+			f.QueryRow(t, "SELECT result->>'output' FROM agent_task_queue WHERE id=$1", taskID).Scan(&got)
+			if got != tc.output {
+				t.Errorf("stored run output = %q, want original %q", got, tc.output)
+			}
+			if n := f.Count(t, "SELECT count(*) FROM comment WHERE issue_id=$1 AND source_task_id=$2", issue, taskID); n != 0 {
+				t.Fatalf("completion published %d comments without an explicit tool call", n)
 			}
 		})
 	}

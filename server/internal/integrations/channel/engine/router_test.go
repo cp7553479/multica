@@ -328,23 +328,23 @@ func (f *fakeIssues) PublishAttachmentsChanged(context.Context, db.Issue, pgtype
 }
 
 type fakeTasks struct {
-	denyInvoke          bool
-	invokeErr           error
-	mu                  sync.Mutex
-	called              bool
-	callCount           int
-	promotions          int
-	issueTaskPromotions []pgtype.UUID
-	forceFresh          bool
-	forceFreshArgs      []bool
-	initiator           pgtype.UUID
-	initiators          []pgtype.UUID
-	contextRevisions    []int64
-	bindingIDs          []pgtype.UUID
-	routeRevisions      []int64
-	err                 error
-	prepared            bool
-	prepareErr          error
+	denyInvoke           bool
+	invokeErr            error
+	mu                   sync.Mutex
+	called               bool
+	callCount            int
+	promotions           int
+	issueSessionReleases []pgtype.UUID
+	forceFresh           bool
+	forceFreshArgs       []bool
+	initiator            pgtype.UUID
+	initiators           []pgtype.UUID
+	contextRevisions     []int64
+	bindingIDs           []pgtype.UUID
+	routeRevisions       []int64
+	err                  error
+	prepared             bool
+	prepareErr           error
 }
 
 func (f *fakeTasks) PromoteChannelChatTasksIfMediaReady(_ context.Context, _ pgtype.UUID) error {
@@ -354,10 +354,10 @@ func (f *fakeTasks) PromoteChannelChatTasksIfMediaReady(_ context.Context, _ pgt
 	return nil
 }
 
-func (f *fakeTasks) PromoteDeferredChannelIssueTask(_ context.Context, taskID pgtype.UUID) error {
+func (f *fakeTasks) ReleaseIssueAgentSession(_ context.Context, sessionID pgtype.UUID) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.issueTaskPromotions = append(f.issueTaskPromotions, taskID)
+	f.issueSessionReleases = append(f.issueSessionReleases, sessionID)
 	return nil
 }
 
@@ -1168,7 +1168,7 @@ func TestRouter_IssueCommand_Creates(t *testing.T) {
 
 func TestRouter_IssueCommandWithMediaBindsWithoutChatRun(t *testing.T) {
 	h := newHarness(t)
-	issueTaskID := uuidFromString(t, "99999999-9999-4999-8999-999999999999")
+	issueSessionID := uuidFromString(t, "99999999-9999-4999-8999-999999999999")
 	h.binder.appendResult = AppendResult{
 		MessageID:   uuidFromString(t, "77777777-7777-4777-8777-777777777777"),
 		DedupMarked: true,
@@ -1180,7 +1180,7 @@ func TestRouter_IssueCommandWithMediaBindsWithoutChatRun(t *testing.T) {
 		Issue: db.Issue{
 			ID: uuidFromString(t, "88888888-8888-4888-8888-888888888888"), Number: 43, Title: "Inspect image",
 		},
-		AssignedTaskID: issueTaskID,
+		AssignedSessionID: issueSessionID,
 	}
 	if err := h.router.Handle(context.Background(), p2pMessage(t)); err != nil {
 		t.Fatalf("Handle: %v", err)
@@ -1193,6 +1193,35 @@ func TestRouter_IssueCommandWithMediaBindsWithoutChatRun(t *testing.T) {
 	}
 	if got := h.binder.boundMedia(); len(got.MediaRefs) != 1 || got.IssueID != h.issues.result.Issue.ID || got.Body != "hello" {
 		t.Fatalf("bound issue media = %+v", got)
+	}
+}
+
+func TestRouter_IssueCommandMediaDoesNotUseAssignedTaskAsSession(t *testing.T) {
+	h := newHarness(t)
+	h.binder.appendResult = AppendResult{
+		MessageID:   uuidFromString(t, "77777777-7777-4777-8777-777777777777"),
+		DedupMarked: true,
+		IssueCommand: &IssueCommand{
+			Title: "Inspect image",
+		},
+	}
+	h.issues.result = service.IssueCreateResult{
+		Issue: db.Issue{
+			ID: uuidFromString(t, "88888888-8888-4888-8888-888888888888"), Number: 43, Title: "Inspect image",
+		},
+		AssignedTaskID: uuidFromString(t, "99999999-9999-4999-8999-999999999999"),
+	}
+	if err := h.router.Handle(context.Background(), p2pMessage(t)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if !waitFor(time.Second, func() bool { return h.tasks.promotionCalls() == 1 }) {
+		t.Fatal("issue command media did not finish binding")
+	}
+	h.tasks.mu.Lock()
+	releases := len(h.tasks.issueSessionReleases)
+	h.tasks.mu.Unlock()
+	if releases != 0 || h.tasks.calls() != 0 {
+		t.Fatalf("media finalization used an execution as a session: releases=%d chat_runs=%d", releases, h.tasks.calls())
 	}
 }
 
@@ -1248,7 +1277,7 @@ func TestRouter_IssueCommand_ActiveDuplicateIsTerminalProductOutcome(t *testing.
 		t.Fatalf("duplicate media published issue attachment changes = %d, want 0", h.issues.attachmentsChanged.Load())
 	}
 	h.tasks.mu.Lock()
-	issuePromotions := len(h.tasks.issueTaskPromotions)
+	issuePromotions := len(h.tasks.issueSessionReleases)
 	h.tasks.mu.Unlock()
 	if issuePromotions != 0 {
 		t.Fatalf("duplicate media promoted a non-existent issue task, calls=%d", issuePromotions)
@@ -1433,15 +1462,15 @@ func TestRouter_IssueCommand_MediaTargetsCreatedIssue(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newHarness(t)
 			issueID := uuidFromString(t, "77777777-7777-7777-7777-777777777777")
-			issueTaskID := uuidFromString(t, "88888888-8888-4888-8888-888888888888")
+			issueSessionID := uuidFromString(t, "88888888-8888-4888-8888-888888888888")
 			h.binder.parseIssue = true
 			h.binder.appendResult = AppendResult{
 				MessageID:   uuidFromString(t, "99999999-9999-4999-8999-999999999999"),
 				DedupMarked: true,
 			}
 			h.issues.result = service.IssueCreateResult{
-				Issue:          db.Issue{ID: issueID, Number: 42, Title: tc.title},
-				AssignedTaskID: issueTaskID,
+				Issue:             db.Issue{ID: issueID, Number: 42, Title: tc.title},
+				AssignedSessionID: issueSessionID,
 			}
 			msg := p2pMessage(t)
 			msg.Type = channel.MsgTypeImage
@@ -1474,15 +1503,15 @@ func TestRouter_IssueCommand_MediaTargetsCreatedIssue(t *testing.T) {
 			if !waitFor(time.Second, func() bool {
 				h.tasks.mu.Lock()
 				defer h.tasks.mu.Unlock()
-				return len(h.tasks.issueTaskPromotions) == 1
+				return len(h.tasks.issueSessionReleases) == 1
 			}) {
 				t.Fatal("deferred issue task was not promoted after media binding")
 			}
 			h.tasks.mu.Lock()
-			gotTaskID := h.tasks.issueTaskPromotions[0]
+			gotSessionID := h.tasks.issueSessionReleases[0]
 			h.tasks.mu.Unlock()
-			if gotTaskID != issueTaskID {
-				t.Fatalf("promoted issue task = %v, want %v", gotTaskID, issueTaskID)
+			if gotSessionID != issueSessionID {
+				t.Fatalf("released issue session = %v, want %v", gotSessionID, issueSessionID)
 			}
 			if !waitFor(time.Second, func() bool { return h.issues.attachmentsChanged.Load() == 1 }) {
 				t.Fatalf("attachment change events = %d, want 1", h.issues.attachmentsChanged.Load())
@@ -1511,16 +1540,16 @@ func TestRouter_IssueCommand_WithoutMediaKeepsImmediateAssignedTask(t *testing.T
 		t.Fatalf("text-only /issue unexpectedly deferred its assigned task until %v", h.issues.opts.AssignedAgentRunFireAt)
 	}
 	h.tasks.mu.Lock()
-	promotions := len(h.tasks.issueTaskPromotions)
+	promotions := len(h.tasks.issueSessionReleases)
 	h.tasks.mu.Unlock()
 	if promotions != 0 {
-		t.Fatalf("text-only /issue task promotions = %d, want 0", promotions)
+		t.Fatalf("text-only /issue session releases = %d, want 0", promotions)
 	}
 }
 
-func TestRouter_IssueCommand_BindFailurePromotesDeferredTaskWithoutAttachmentEvent(t *testing.T) {
+func TestRouter_IssueCommand_BindFailureReleasesDeferredSessionWithoutAttachmentEvent(t *testing.T) {
 	h := newHarness(t)
-	issueTaskID := uuidFromString(t, "88888888-8888-4888-8888-888888888888")
+	issueSessionID := uuidFromString(t, "88888888-8888-4888-8888-888888888888")
 	h.binder.appendResult = AppendResult{
 		DedupMarked: true,
 		IssueCommand: &IssueCommand{
@@ -1529,8 +1558,8 @@ func TestRouter_IssueCommand_BindFailurePromotesDeferredTaskWithoutAttachmentEve
 	}
 	h.binder.bindErr = errors.New("attachment write failed")
 	h.issues.result = service.IssueCreateResult{
-		Issue:          db.Issue{ID: uuidFromString(t, "77777777-7777-7777-7777-777777777777"), Number: 42, Title: "Fix broken layout"},
-		AssignedTaskID: issueTaskID,
+		Issue:             db.Issue{ID: uuidFromString(t, "77777777-7777-7777-7777-777777777777"), Number: 42, Title: "Fix broken layout"},
+		AssignedSessionID: issueSessionID,
 	}
 
 	if err := h.router.Handle(context.Background(), p2pMessage(t)); err != nil {
@@ -1539,9 +1568,9 @@ func TestRouter_IssueCommand_BindFailurePromotesDeferredTaskWithoutAttachmentEve
 	if !waitFor(time.Second, func() bool {
 		h.tasks.mu.Lock()
 		defer h.tasks.mu.Unlock()
-		return len(h.tasks.issueTaskPromotions) == 1
+		return len(h.tasks.issueSessionReleases) == 1
 	}) {
-		t.Fatal("failed attachment bind left the issue task deferred")
+		t.Fatal("failed attachment bind left the issue session deferred")
 	}
 	if h.issues.attachmentsChanged.Load() != 0 {
 		t.Fatalf("attachment change events after failed bind = %d, want 0", h.issues.attachmentsChanged.Load())

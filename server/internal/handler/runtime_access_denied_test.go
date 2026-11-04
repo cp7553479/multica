@@ -92,40 +92,40 @@ func TestCommentMention_RuntimeAccessDeniedReportsTargetAndNotice(t *testing.T) 
 	ctx := context.Background()
 	runtimeID := createCascadeFixtureRuntime(t, ctx, "Mention access denied runtime")
 	agentID := createRuntimeAccessDeniedAgent(t, ctx, runtimeID, "Mention access denied agent")
-	issueID := createMentionFixtureIssue(t, ctx, "mention access denied issue")
-
-	req := newRequest(http.MethodPost, "/api/issues/"+issueID+"/comments", map[string]any{
-		"content": "[@Agent](mention://agent/" + agentID + ") please help",
+	issueID := dbfx.Issue(t, "Owner session runtime access denied", testutil.Cols{
+		"assignee_type": "agent", "assignee_id": agentID,
 	})
-	req = withURLParam(req, "id", issueID)
-	w := testutil.Call(t, testHandler.CreateComment, req).WantOneOf(http.StatusOK, http.StatusCreated)
-	var body struct {
-		TriggerOutcomes []struct {
-			TargetID   string `json:"target_id"`
-			Status     string `json:"status"`
-			ReasonCode string `json:"reason_code"`
-		} `json:"trigger_outcomes"`
+	dbfx.Cleanup(t, "DELETE FROM agent_task_queue WHERE issue_id=$1", issueID)
+
+	// Comments belong to the assigned owner; runtime-owner consent is checked
+	// before any execution payload or task token reaches the daemon.
+	comment := captureSessionComment(t, issueID, map[string]any{"content": "Please help with this issue"}, "", "")
+	if len(comment.TriggerOutcomes) != 1 || comment.TriggerOutcomes[0].TargetID != agentID {
+		t.Fatalf("comment did not route to the assigned owner: %+v", comment.TriggerOutcomes)
 	}
-	w.JSON(&body)
-	found := false
-	for _, outcome := range body.TriggerOutcomes {
-		if outcome.TargetID == agentID {
-			found = true
-			if outcome.Status != string(DispatchBlocked) || outcome.ReasonCode != string(ReasonRuntimeAccessDenied) {
-				t.Fatalf("target outcome = %+v, want blocked/runtime_access_denied", outcome)
-			}
-		}
+	sessions := captureIssueSessions(t, issueID)
+	if len(sessions) != 1 || sessions[0].AgentID != agentID || sessions[0].ActiveTaskID == nil {
+		t.Fatalf("owner session did not retain the input: %+v", sessions)
 	}
-	if !found {
-		t.Fatalf("no blocked outcome for agent %s: %s", agentID, w.Body.String())
+	taskID := *sessions[0].ActiveTaskID
+	req := withURLParam(newOwnerDaemonRequest(http.MethodPost, "/api/daemon/runtimes/"+runtimeID+"/tasks/claim", nil), "runtimeId", runtimeID)
+	w := testutil.Call(t, testHandler.ClaimTaskByRuntime, req).Want(http.StatusOK)
+	if strings.TrimSpace(w.Body.String()) != `{"task":null}` {
+		t.Fatalf("private runtime received an unauthorized execution: %s", w.Body.String())
 	}
-	var notice string
-	dbfx.QueryRow(t, `
-		SELECT content FROM comment
-		WHERE issue_id = $1 AND author_type = 'system' AND type = 'system'
-		ORDER BY created_at DESC LIMIT 1
-	`, issueID).Scan(&notice)
-	if !strings.Contains(notice, "public") || !strings.Contains(notice, "rebind/copy") {
-		t.Fatalf("mention notice = %q, want both recovery paths", notice)
+	var status, failureReason string
+	dbfx.QueryRow(t, "SELECT status,failure_reason FROM agent_task_queue WHERE id=$1", taskID).Scan(&status, &failureReason)
+	if status != "failed" || failureReason != string(ReasonRuntimeAccessDenied) {
+		t.Fatalf("execution state = %s/%s, want failed/runtime_access_denied", status, failureReason)
+	}
+	after := captureIssueSessions(t, issueID)
+	if len(after) != 1 || after[0].ID != sessions[0].ID || after[0].State != "blocked" || after[0].FailureReason == nil || *after[0].FailureReason != string(ReasonRuntimeAccessDenied) || after[0].ActiveTaskID != nil {
+		t.Fatalf("runtime refusal was not visible on the session: %+v", after)
+	}
+	if len(after[0].Events) != 2 || after[0].Events[1].Kind != "comment.created" || after[0].Events[1].SourceID == nil || *after[0].Events[1].SourceID != comment.ID {
+		t.Fatalf("runtime refusal lost the owner's comment input: %+v", after[0].Events)
+	}
+	if n := dbfx.Count(t, "SELECT count(*) FROM task_token WHERE task_id=$1", taskID); n != 0 {
+		t.Fatalf("unauthorized execution received %d task tokens", n)
 	}
 }

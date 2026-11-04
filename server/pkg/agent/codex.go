@@ -1036,7 +1036,7 @@ func (b *codexBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 			case result.codexStartupRefreshRetrySafe:
 				retryReason = "model_catalog_refresh"
 			}
-			if retryReason == "" || attempt == 2 {
+			if retryReason == "" || attempt == 2 || (opts.StrictSessionResume && retryReason == "model_catalog_refresh") {
 				flushHeldPins()
 				resCh <- result
 				return
@@ -1597,6 +1597,14 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 			return
 		}
 		c.setThreadID(threadID)
+		if opts.PersistSession != nil {
+			if err := opts.PersistSession(runCtx, threadID); err != nil {
+				stopProcess()
+				drainAndWait()
+				resCh <- Result{Status: "failed", Error: fmt.Sprintf("codex session persistence failed: %v", err), SessionID: threadID}
+				return
+			}
+		}
 		if resumed {
 			b.cfg.Logger.Info("codex thread resumed", "thread_id", threadID)
 		} else {
@@ -1684,7 +1692,11 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 					drainAndWait() // flush os/exec stderr goroutine before sampling Tail
 					finalStatus = "failed"
 					finalError = withAgentStderr(fmt.Sprintf("codex turn/start failed: %v", err), "codex", sanitizeCodexDiagnostic(stderrBuf.Tail()))
-					resCh <- Result{Status: finalStatus, Error: finalError, DurationMs: time.Since(startTime).Milliseconds()}
+					var persistentID string
+					if opts.PersistSession != nil {
+						persistentID = threadID
+					}
+					resCh <- Result{Status: finalStatus, Error: finalError, SessionID: persistentID, DurationMs: time.Since(startTime).Milliseconds()}
 					return
 				}
 			}
@@ -2037,6 +2049,9 @@ func (c *codexClient) startOrResumeThread(ctx context.Context, opts ExecOptions,
 		resumeResult, err := c.request(ctx, "thread/resume", resumeParams)
 		if err == nil {
 			if threadID := extractThreadID(resumeResult); threadID != "" {
+				if opts.StrictSessionResume && threadID != priorThreadID {
+					return "", false, fmt.Errorf("codex persistent session identity changed from %s to %s", priorThreadID, threadID)
+				}
 				logger.Info("codex lifecycle",
 					"phase", "thread_resume_response",
 					"task_id", c.cfg.TaskID,
@@ -2050,8 +2065,14 @@ func (c *codexClient) startOrResumeThread(ctx context.Context, opts ExecOptions,
 				)
 				return threadID, true, nil
 			}
+			if opts.StrictSessionResume {
+				return "", false, fmt.Errorf("codex thread/resume returned no thread ID for persistent session %s", priorThreadID)
+			}
 			logger.Warn("codex thread/resume returned no thread ID; falling back to thread/start", "prior_thread_id", priorThreadID)
 		} else {
+			if opts.StrictSessionResume {
+				return "", false, fmt.Errorf("codex persistent session resume failed: %w", err)
+			}
 			if isCodexTransportError(err) {
 				logger.Warn("codex thread/resume failed due to transport error; not falling back to thread/start", "prior_thread_id", priorThreadID, "error", err)
 				return "", false, fmt.Errorf("codex thread/resume failed: %w", err)

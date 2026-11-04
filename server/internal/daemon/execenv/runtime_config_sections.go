@@ -384,11 +384,11 @@ const commentReceiptRule = "For final-result comments, use `--output table` to c
 func writeCommentFormatting(b *strings.Builder) {
 	b.WriteString("## Comment Formatting\n\n")
 	if runtimeGOOS == "windows" {
-		b.WriteString("On Windows, **always write the comment body to a UTF-8 file with your file-write tool first, then post it with `--content-file <path>`** — do NOT pipe via `--content-stdin` (Windows PowerShell 5.1's `$OutputEncoding` may replace non-ASCII characters with `?`). Never use inline `--content` for agent-authored comments. Write the file inside your working directory, never `/tmp` or shared paths (MUL-4252). Keep the same `--parent` value from the trigger comment when replying. Delete the temp file (`Remove-Item ./reply.md` in PowerShell, `rm ./reply.md` in Git Bash) only after the post succeeded; do not rely on `\\n` escapes.\n\n")
+		b.WriteString("On Windows, **always write the comment body to a UTF-8 file with your file-write tool first, then post it with `--content-file <path>`** — do NOT pipe via `--content-stdin` (Windows PowerShell 5.1's `$OutputEncoding` may replace non-ASCII characters with `?`). Never use inline `--content` for agent-authored comments. Write the file inside your working directory, never `/tmp` or shared paths (MUL-4252). Set `--parent` only when deliberately replying to that comment; omit it for a top-level comment. Delete the temp file (`Remove-Item ./reply.md` in PowerShell, `rm ./reply.md` in Git Bash) only after the post succeeded; do not rely on `\\n` escapes.\n\n")
 		b.WriteString(commentReceiptRule)
 		return
 	}
-	b.WriteString("For issue comments, **always write the comment body to a UTF-8 file with your file-write tool first, then post it with `--content-file <path>`**. Never use inline `--content` for agent-authored comments (MUL-2904); never use `--content-stdin` HEREDOCs alongside other flags (#4182). Write the file inside your working directory, never `/tmp` or shared paths (MUL-4252). Keep the same `--parent` value from the trigger comment when replying; delete the temp file (`rm ./reply.md`) only after the post succeeded; do not rely on `\\n` escapes.\n\n")
+	b.WriteString("For issue comments, **always write the comment body to a UTF-8 file with your file-write tool first, then post it with `--content-file <path>`**. Never use inline `--content` for agent-authored comments (MUL-2904); never use `--content-stdin` HEREDOCs alongside other flags (#4182). Write the file inside your working directory, never `/tmp` or shared paths (MUL-4252). Set `--parent` only when deliberately replying to that comment; omit it for a top-level comment; delete the temp file (`rm ./reply.md`) only after the post succeeded; do not rely on `\\n` escapes.\n\n")
 	b.WriteString(commentReceiptRule)
 }
 
@@ -612,7 +612,7 @@ func writeWorkflowAutopilot(b *strings.Builder) {
 // Squad dispatch leaves work in progress until a later turn confirms delivery.
 // The per-task leader role may change brief bytes across a resumed session.
 func writeWorkflowIssue(b *strings.Builder, ctx TaskContextForEnv) {
-	b.WriteString("**Every issue turn runs the same workflow.** The per-turn user message carries what triggered this run — an assignment handoff, or a triggering comment with its id and your `--parent` value — plus this issue's real id and ready-to-run context-read commands; assemble other calls from `## Available Commands`.\n\n")
+	b.WriteString("**Every issue turn runs the same workflow.** The per-turn user message carries the issue-session events to process, including an assignment handoff or a comment with its source id — plus this issue's real id and ready-to-run context-read commands; assemble other calls from `## Available Commands`.\n\n")
 
 	b.WriteString("1. Read the issue (`multica issue get`) to understand the context.\n")
 	b.WriteString("   The per-turn message may report that the server compared the issue against your last run; when it says the issue is unchanged, that report is this step's answer and you continue from your resumed context. Only that explicit report waives the read — a message that says nothing about the issue record has not compared it.\n")
@@ -625,11 +625,7 @@ func writeWorkflowIssue(b *strings.Builder, ctx TaskContextForEnv) {
 	} else {
 		b.WriteString("3. If any part of what this turn will produce is what the issue itself asks for, set `in_progress` FIRST (skip when the issue is already `in_progress`, or when your Agent Identity forbids status writes): the board should show the issue being worked while you work, not only after. The kind of activity — research, design, planning, review — never decides this; only whether the output is part of THIS issue's ask. Then complete " + step3Rest)
 	}
-	if ctx.IsSquadLeader {
-		b.WriteString("4. **Post your final results as a comment** (unless your outcome is `no_action` — see the no_action rule in your Squad Operating Protocol): post it with `multica issue comment add` using the platform-correct non-inline mode from ## Comment Formatting (never inline `--content`). When the per-turn user message carries a triggering comment, reply in its thread with the `--parent` value it gives you for THIS turn (never one from an earlier turn); when it lists several threads, post one reply per thread. With no triggering comment, post a new top-level comment. Your results are only visible to the user if posted via this CLI call; text in your terminal or run logs is NOT delivered.\n")
-	} else {
-		b.WriteString("4. **Post your final results as a comment — this step is mandatory**: post it with `multica issue comment add` using the platform-correct non-inline mode from ## Comment Formatting (never inline `--content`). When the per-turn user message carries a triggering comment, reply in its thread with the `--parent` value it gives you for THIS turn (never one from an earlier turn); when it lists several threads, post one reply per thread. With no triggering comment, post a new top-level comment. `## Output` states why this call is the only delivery channel.\n")
-	}
+	b.WriteString("4. Choose the explicit action this session needs: publish a top-level comment with `multica issue comment add` without `--parent`, reply to a specific comment with `--parent <comment-id>`, or edit the issue with `multica issue update`. Use the platform-correct non-inline mode from ## Comment Formatting. No comment is required merely because a turn ended; final output stays in the run transcript and is never posted automatically.\n")
 	if ctx.HasProjectWorkflow {
 		b.WriteString("5. Before exiting, confirm the issue sits where things actually stand: you ran the matching command from `[Project workflow]`, or you left it at its current step on purpose because its work continues.\n\n")
 		writeIssueStatusRulesForWorkflow(b, ctx)
@@ -793,33 +789,14 @@ func writeTraecliSkills(b *strings.Builder, skills []SkillContextForEnv) {
 	}
 }
 
-// writeMentions emits the @mention side-effects section (compressed).
+// writeMentions explains notifications independently of issue-session routing.
 func writeMentions(b *strings.Builder) {
 	b.WriteString("## Mentions\n\n")
-	b.WriteString("Mention links are **side-effecting actions**:\n\n")
-	b.WriteString("- `[MUL-123](mention://issue/<issue-id>)` — clickable link (no side effect)\n")
-	// Projects have no `MUL-123`-style identifier to autolink, so unless the
-	// agent writes this form (or pastes the project URL, which the reader's
-	// client unfurls into the same chip) a project reference stays dead text.
-	b.WriteString("- `[Project Name](mention://project/<project-id>)` — clickable link (no side effect)\n")
-	b.WriteString("- `[@Name](mention://member/<user-id>)` — **notifies a human**\n")
-	b.WriteString("- `[@Name](mention://agent/<agent-id>)` — **enqueues a new run for that agent**\n\n")
-	// No prescriptive default here (MUL-6417): the mention syntax hides its
-	// semantics — it reads like a free social gesture but is a spawn/notify
-	// operation — so what this paragraph must supply is the facts that
-	// invalidate the human-@-culture prior (cc-for-visibility, thanks-@X),
-	// not a rule. Every real incident was an agent acting on a false need:
-	// notifying followers who already see the comment (completion wakes are
-	// platform-owned too), courtesy (a thank-you run whose only reply is
-	// another thank-you run), or reference — the @-form used merely to write
-	// someone's name (MUL-6528: an agent attributing a product decision to
-	// "@Steve Jobs" in prose enqueued a run for the agent it was crediting).
-	// The notify caveat is scoped to FOLLOWERS on
-	// purpose — for a human who does not follow the issue, a mention is
-	// exactly how they find out, and that escalation must stay available
-	// (Elon's review catch on #7245). The cost asymmetry line is what breaks
-	// the ambiguous middle.
-	b.WriteString("A mention pulls someone into work they are not doing yet: escalate to a human owner, hand another agent a concrete new sub-task, loop someone in because the user asked. It is not needed merely to notify — followers of the issue already see your comment, and completion notifications are platform-owned. Nor is it how a name is written — crediting a decision or citing someone's earlier point is prose about them, not work for them; the link form dispatches whoever it names, so a reference stays plain text. A thank-you / sign-off / FYI mention of another agent enqueues a paid run whose only possible reply is another courtesy; a missed mention costs one follow-up ask, a stray one costs a run. Silence ends conversations.\n\n")
+	b.WriteString("- `[MUL-123](mention://issue/<issue-id>)` — clickable issue link\n")
+	b.WriteString("- `[Project Name](mention://project/<project-id>)` — clickable project link\n")
+	b.WriteString("- `[@Name](mention://member/<user-id>)` — notifies a human\n")
+	b.WriteString("- `[@Name](mention://agent/<agent-id>)` — agent reference or notification; it does not start an agent run or redirect this issue's events\n\n")
+	b.WriteString("New comments and issue changes go to the issue's current assigned agent session. To ask another agent to work, explicitly assign an issue or create and assign a sub-issue using the CLI. A mention alone does not delegate work. Your own comments and edits do not wake your own session.\n\n")
 }
 
 // writeAttachments emits the Attachments pointer.
@@ -914,12 +891,8 @@ func writeOutput(b *strings.Builder, kind taskKind, ctx TaskContextForEnv) {
 			writeInlineBlocksPolicy(b)
 		}
 	default:
-		if ctx.IsSquadLeader {
-			b.WriteString("⚠️ **Final results MUST be delivered via `multica issue comment add`** — unless your outcome is `no_action`, which your Squad Operating Protocol states in full. For every other outcome (`action`, `failed`) a comment is mandatory. The user does NOT see your terminal output or run logs — only comments on the issue.\n\n")
-		} else {
-			b.WriteString("⚠️ **Final results MUST be delivered via `multica issue comment add`.** The user does NOT see your terminal output or run logs — only comments on the issue.\n\n")
-		}
-		b.WriteString("**Post exactly ONE comment per run — your final result, before this turn exits.** Do NOT post progress updates or plans along the way. Only a scheduled wakeup check whose `[WAKEUP]` block offers `multica issue wakeup checkin` may check in instead of commenting, when it found nothing that needs a reply.\n\n")
+		b.WriteString("Issue communication uses explicit tools: publish a top-level comment with `multica issue comment add` without `--parent`, reply with `--parent <comment-id>`, or edit the issue with `multica issue update`. Choose the action and destination that serve the issue; a turn does not require a comment.\n\n")
+		b.WriteString("Final output stays in the run transcript and is never posted automatically. New comments are session events, not instructions to publish one reply per event.\n\n")
 		b.WriteString("Keep comments concise and natural — state the outcome, not the process.\n\n")
 		b.WriteString("**Delivering files here:** pass `--attachment <path>` to `multica issue comment add` (repeatable) — the only way a screenshot or artifact reaches the reader.\n")
 		writeInlineBlocksPolicy(b)

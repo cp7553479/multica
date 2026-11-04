@@ -803,7 +803,7 @@ func TestUserCancelledDelegatedFailureRecoveryStaysCancelled(t *testing.T) {
 	}
 }
 
-func TestManualRerunKeepsDelegatedFailureRecoveryReplayable(t *testing.T) {
+func TestManualRerunRejectsAssignedIssueWithoutReplacingRecovery(t *testing.T) {
 	f, svc := seedDelegatedFailureFixture(t)
 	ctx := context.Background()
 	failedID := f.insertWorkerTask(t, "failed", "comment", 1, 2)
@@ -831,7 +831,7 @@ func TestManualRerunKeepsDelegatedFailureRecoveryReplayable(t *testing.T) {
 		t.Fatalf("load initial recovery task/comment: %v", err)
 	}
 
-	rerun, err := svc.RerunIssue(
+	_, err = svc.RerunIssue(
 		ctx,
 		util.MustParseUUID(f.issueID),
 		util.MustParseUUID(f.sourceTask),
@@ -839,8 +839,8 @@ func TestManualRerunKeepsDelegatedFailureRecoveryReplayable(t *testing.T) {
 		util.MustParseUUID(f.userID), false,
 		nil,
 	)
-	if err != nil {
-		t.Fatalf("RerunIssue: %v", err)
+	if !errors.Is(err, ErrIssueSessionRerunRequiresEvent) {
+		t.Fatalf("RerunIssue error = %v, want issue-session event requirement", err)
 	}
 	var firstStatus string
 	var acknowledged bool
@@ -849,32 +849,18 @@ func TestManualRerunKeepsDelegatedFailureRecoveryReplayable(t *testing.T) {
 		FROM agent_task_queue WHERE id = $1`, firstRecoveryTaskID, recoveryCommentID).Scan(&firstStatus, &acknowledged); err != nil {
 		t.Fatalf("read rerun-cancelled recovery task: %v", err)
 	}
-	if firstStatus != "cancelled" || acknowledged {
-		t.Fatalf("rerun-cancelled recovery = status %q acknowledged %v, want cancelled and replayable", firstStatus, acknowledged)
+	if firstStatus != "queued" || acknowledged {
+		t.Fatalf("rejected rerun changed recovery = status %q acknowledged %v, want queued and unacknowledged", firstStatus, acknowledged)
 	}
 
-	result, err := svc.RecoverPendingDelegatedFailures(ctx, 100)
-	if err != nil || result.Replayed != 1 || result.Exhausted != 0 {
-		t.Fatalf("recovery sweep after rerun = %+v, %v; want one replay", result, err)
-	}
-	var rerunTrigger string
-	if err := f.pool.QueryRow(ctx, `SELECT COALESCE(trigger_comment_id::text, '') FROM agent_task_queue WHERE id = $1`, rerun.ID).Scan(&rerunTrigger); err != nil {
-		t.Fatalf("read rerun trigger: %v", err)
-	}
-	if rerunTrigger != util.UUIDToString(recoveryCommentID) {
-		t.Fatalf("rerun trigger = %q, want recovery comment %s", rerunTrigger, util.UUIDToString(recoveryCommentID))
-	}
 	var dedicatedRecoveryTasks int
 	if err := f.pool.QueryRow(ctx, `
 		SELECT count(*) FROM agent_task_queue
 		WHERE trigger_evidence_kind = 'delegated_failure' AND trigger_evidence_ref_id = $1`, failedID).Scan(&dedicatedRecoveryTasks); err != nil {
-		t.Fatalf("count dedicated recovery tasks: %v", err)
+		t.Fatal(err)
 	}
 	if dedicatedRecoveryTasks != 1 {
-		t.Fatalf("dedicated recovery task count after rerun = %d, want original cancelled task only", dedicatedRecoveryTasks)
-	}
-	if result, err := svc.RecoverPendingDelegatedFailures(ctx, 100); err != nil || result != (DelegatedFailureRecoverySweepResult{}) {
-		t.Fatalf("second recovery sweep after rerun = %+v, %v; want zero result", result, err)
+		t.Fatalf("rejected rerun created %d recovery tasks, want original only", dedicatedRecoveryTasks)
 	}
 }
 

@@ -11,18 +11,15 @@ import (
 )
 
 // Retain the existing 40KB prompt budget, including the <=12KB instruction.
-// Consumed notifications stay linked to the task during the retention window.
+// Original receipts remain addressable during the retention window.
 const wakeupNoteLimit = 40000
-const wakeupLegacyHeading = "Previous wakeup context (historical; follow the current instruction above):\n"
 const wakeupOmittedEvidence = "Some trigger details were omitted to keep this prompt bounded. Read current issue comments, runs and state before deciding what to do.\n"
 
-// Keep facts as data in task.context; handoff_note is only a rendering.
-// Legacy notes remain opaque during mixed-version operation, never parsed.
+// Facts stay structured in the immutable session event; the note is only a rendering.
 type wakeupEvidence struct {
 	Version     int          `json:"version"`
 	Instruction string       `json:"instruction,omitempty"`
 	Facts       []wakeupFact `json:"facts,omitempty"`
-	Legacy      string       `json:"legacy,omitempty"`
 	Omitted     bool         `json:"omitted,omitempty"`
 }
 type wakeupFact struct {
@@ -30,42 +27,17 @@ type wakeupFact struct {
 	Payload   json.RawMessage `json:"payload"`
 }
 
-func mergeWakeupEvidence(w db.IssueWakeup, previous db.AgentTaskQueue, receipts []db.IssueWakeupReceipt) (string, json.RawMessage) {
-	var stored struct {
-		Evidence wakeupEvidence `json:"wakeup_evidence"`
-	}
-	_ = json.Unmarshal(previous.Context, &stored)
-	evidence := stored.Evidence
-	// jsonb can reorder object keys/spacing; normalize before rendering.
-	for i := range evidence.Facts {
-		evidence.Facts[i].Payload = canonicalWakeupPayload(evidence.Facts[i].Payload)
-	}
-	previousConfig := w
-	if evidence.Instruction != "" {
-		previousConfig.Instruction = evidence.Instruction
-	}
-	if evidence.Version != 1 || renderWakeupEvidence(previousConfig, evidence) != previous.HandoffNote.String {
-		// An old dispatcher may have updated only handoff_note. Preserve its text
-		// as one bounded legacy item instead of trusting a stale structured summary.
-		evidence = wakeupEvidence{Version: 1, Legacy: previous.HandoffNote.String}
-	}
-	if w.Kind != "event" {
-		evidence = wakeupEvidence{Version: 1}
-	}
+func buildWakeupEvidence(w db.IssueWakeup, receipts []db.IssueWakeupReceipt) (string, json.RawMessage) {
+	evidence := wakeupEvidence{Version: 1}
 
 	header := wakeupNoteHeader(w)
-	budget := wakeupNoteLimit - len(header) - len(wakeupOmittedEvidence) - len(wakeupLegacyHeading)
+	budget := wakeupNoteLimit - len(header) - len(wakeupOmittedEvidence)
 	budget = max(budget, 0)
-	total := len(evidence.Legacy)
+	total := 0
 	for _, fact := range evidence.Facts {
 		total += len(fact.EventType) + len(fact.Payload) + 2
 	}
 	trim := func() {
-		if total > budget && evidence.Legacy != "" {
-			total -= len(evidence.Legacy)
-			evidence.Legacy = ""
-			evidence.Omitted = true
-		}
 		for total > budget && len(evidence.Facts) > 0 {
 			fact := evidence.Facts[0]
 			total -= len(fact.EventType) + len(fact.Payload) + 2
@@ -113,10 +85,6 @@ func renderWakeupEvidence(w db.IssueWakeup, evidence wakeupEvidence) string {
 	}
 	var b strings.Builder
 	b.WriteString(header)
-	if evidence.Legacy != "" {
-		b.WriteString(wakeupLegacyHeading)
-		b.WriteString(evidence.Legacy)
-	}
 	for _, fact := range evidence.Facts {
 		fmt.Fprintf(&b, "%s %s\n", fact.EventType, fact.Payload)
 	}

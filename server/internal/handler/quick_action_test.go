@@ -202,12 +202,8 @@ func TestQuickActionWithoutAgentPostsPromptWithoutMentions(t *testing.T) {
 	dbfx.Cleanup(t, `DELETE FROM quick_action WHERE id = $1`, action.ID)
 
 	// The issue can have an assignee without the action explicitly mentioning it.
-	agentID := dbfx.Agent(t, "Issue assignee", testRuntimeID)
-	issueID := dbfx.Issue(t, "Quick action message", testutil.Cols{
-		"assignee_type": "agent", "assignee_id": agentID,
-	})
+	issueID, agentID, _ := issueSessionCaptureFixture(t)
 	dbfx.Cleanup(t, `DELETE FROM comment WHERE issue_id = $1`, issueID)
-	dbfx.Cleanup(t, `DELETE FROM agent_task_queue WHERE issue_id = $1`, issueID)
 	path := "/api/issues/" + issueID + "/quick-actions/" + action.ID
 	request := func(suffix string) *http.Request {
 		return testutil.WithURLParams(newRequest(http.MethodPost, path+suffix, nil),
@@ -221,6 +217,9 @@ func TestQuickActionWithoutAgentPostsPromptWithoutMentions(t *testing.T) {
 	if preview.Content != prompt {
 		t.Fatalf("preview = %q, want the prompt without mention markup %q", preview.Content, prompt)
 	}
+	if n := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id=$1", issueID); n != 0 {
+		t.Fatalf("rendering the action started %d executions", n)
+	}
 
 	var comment CommentResponse
 	testutil.Call(t, testHandler.RunQuickAction, request("/run")).Want(http.StatusCreated).JSON(&comment)
@@ -230,7 +229,29 @@ func TestQuickActionWithoutAgentPostsPromptWithoutMentions(t *testing.T) {
 	if comment.QuickActionID == nil || *comment.QuickActionID != action.ID {
 		t.Fatalf("comment must retain its quick action attribution, got %+v", comment.QuickActionID)
 	}
-	if len(comment.TriggerOutcomes) != 0 {
-		t.Fatalf("a mention-free action must not explicitly trigger a target, got %+v", comment.TriggerOutcomes)
+	if len(comment.TriggerOutcomes) != 1 || comment.TriggerOutcomes[0].TargetType != "agent" || comment.TriggerOutcomes[0].TargetID != agentID || comment.TriggerOutcomes[0].Status == DispatchBlocked {
+		t.Fatalf("a mention-free action must enter the issue owner's session, got %+v", comment.TriggerOutcomes)
+	}
+	sessions := captureIssueSessions(t, issueID)
+	if len(sessions) != 1 || sessions[0].AgentID != agentID || len(sessions[0].Events) != 2 || sessions[0].ActiveTaskID == nil {
+		t.Fatalf("quick action did not reach the owner inbox: %+v", sessions)
+	}
+	event := sessions[0].Events[1]
+	if event.Kind != "comment.created" || event.SourceID == nil || *event.SourceID != comment.ID || event.ActorType != "member" || event.ActorID == nil || *event.ActorID != testUserID {
+		t.Fatalf("quick action event lost its comment or actor: %+v", event)
+	}
+
+	var followup CommentResponse
+	testutil.Call(t, testHandler.RunQuickAction, request("/run")).Want(http.StatusCreated).JSON(&followup)
+	after := captureIssueSessions(t, issueID)
+	if len(after) != 1 || after[0].ID != sessions[0].ID || len(after[0].Events) != 3 || after[0].ActiveTaskID == nil || *after[0].ActiveTaskID != *sessions[0].ActiveTaskID {
+		t.Fatalf("running the action again replaced the owner's session or execution: %+v", after)
+	}
+	next := after[0].Events[2]
+	if next.Kind != "comment.created" || next.SourceID == nil || *next.SourceID != followup.ID || next.Sequence != event.Sequence+1 {
+		t.Fatalf("second action did not append the next input: %+v", next)
+	}
+	if n := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id=$1", issueID); n != 1 {
+		t.Fatalf("two quick action inputs created %d executions, want one", n)
 	}
 }

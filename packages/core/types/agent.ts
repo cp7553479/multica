@@ -352,6 +352,8 @@ export interface AgentTask {
   /** Present on cancellations recorded by a backend with actor provenance. */
   cancelled_by?: TaskCancellationActor;
   created_at: string;
+  /** The persistent issue session owns delivery and retries for this run. */
+  issue_agent_session_id?: string;
   /** Non-empty when the task was spawned from a chat session. */
   chat_session_id?: string;
   /** Non-empty when the task was spawned by an autopilot run. */

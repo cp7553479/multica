@@ -151,21 +151,6 @@ describe("useIssueTimeline", () => {
     expect(result.current.submitComment).toBe(first.submitComment);
   });
 
-  it("passes suppressed agent ids through editComment", async () => {
-    const { result } = renderHook(() => useIssueTimeline("issue-1", "user-1"));
-
-    await act(async () => {
-      await result.current.editComment("comment-1", "updated", ["attachment-1"], ["agent-1"]);
-    });
-
-    expect(stableHandles.updateMutateAsync).toHaveBeenCalledWith({
-      commentId: "comment-1",
-      content: "updated",
-      attachmentIds: ["attachment-1"],
-      suppressAgentIds: ["agent-1"],
-    });
-  });
-
   it("passes the captured comment content through editComment", async () => {
     const { result } = renderHook(() => useIssueTimeline("issue-1", "user-1"));
 
@@ -174,7 +159,6 @@ describe("useIssueTimeline", () => {
         "comment-1",
         "updated",
         [],
-        undefined,
         "original",
       );
     });
@@ -183,7 +167,6 @@ describe("useIssueTimeline", () => {
       commentId: "comment-1",
       content: "updated",
       attachmentIds: [],
-      suppressAgentIds: undefined,
       contentBase: "original",
     });
   });

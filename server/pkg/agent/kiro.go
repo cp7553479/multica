@@ -378,6 +378,10 @@ func (b *kiroBackend) Execute(ctx context.Context, prompt string, opts ExecOptio
 			// silent state reset is handled the same way as hermes/kimi.
 			var changed bool
 			sessionID, changed = resolveResumedSessionID(opts.ResumeSessionID, result)
+			if changed && opts.StrictSessionResume {
+				resCh <- Result{Status: "failed", Error: "kiro persistent session identity changed; refusing replacement", SessionID: opts.ResumeSessionID}
+				return
+			}
 			if changed {
 				b.cfg.Logger.Warn("agent returned a different session id on resume — original was likely lost; continuing with the new id",
 					"backend", "kiro",
@@ -412,10 +416,20 @@ func (b *kiroBackend) Execute(ctx context.Context, prompt string, opts ExecOptio
 		}
 
 		c.sessionID = sessionID
+		if opts.PersistSession != nil {
+			if err := opts.PersistSession(runCtx, sessionID); err != nil {
+				cancel()
+				resCh <- Result{Status: "failed", Error: fmt.Sprintf("kiro session persistence failed: %v", err), SessionID: sessionID}
+				return
+			}
+		}
 		supplements.mu.Lock()
 		supplements.sessionID = sessionID
 		supplements.mu.Unlock()
 		b.cfg.Logger.Info("kiro session created", "session_id", sessionID)
+		if opts.PersistSession != nil {
+			trySend(msgCh, Message{Type: MessageStatus, Status: "running", SessionID: sessionID})
+		}
 
 		modelToSet := opts.Model
 		// Kiro 2.34 can return a default model before loading its reasoning

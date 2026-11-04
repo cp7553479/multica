@@ -60,12 +60,6 @@ export function useSettingsSearchIndex(
       },
       {
         tab: "preferences",
-        anchor: "running-agent-reply",
-        title: t(($) => $.preferences.running_agent_reply.title),
-        description: t(($) => $.preferences.running_agent_reply.hint),
-      },
-      {
-        tab: "preferences",
         anchor: "chat",
         title: t(($) => $.chat.floating_label),
         description: t(($) => $.chat.floating_hint),

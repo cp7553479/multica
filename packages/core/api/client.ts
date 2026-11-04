@@ -1,3 +1,5 @@
+import type { IssueAgentSession } from "../types/issue-agent-session";
+import { IssueAgentSessionsSchema, RetryIssueAgentSessionEventSchema } from "./issue-agent-session-schema";
 import type { ZodType } from "zod";
 import { AgentRuntimeSchema, EMPTY_RUNTIME } from "../runtimes/schema";
 import type { IssueWakeup, IssueWakeupInput, IssueWakeupSummaryRow, PausedWakeup, SystemWakeup, WakeupRun, WorkspaceSystemWakeup } from "../types/issue-wakeup";
@@ -1687,14 +1689,28 @@ export class ApiClient {
     });
   }
 
+  async listIssueAgentSessions(issueId: string): Promise<IssueAgentSession[]> {
+    const endpoint = `/api/issues/${issueId}/agent-sessions`;
+    const raw = await this.fetch<unknown>(endpoint);
+    const sessions = parseWithFallback<IssueAgentSession[] | null>(raw, IssueAgentSessionsSchema, null, { endpoint });
+    if (sessions === null) throw new Error("Invalid agent session response");
+    return sessions;
+  }
+
+  async retryIssueAgentSessionEvent(issueId: string, sessionId: string, eventId: string): Promise<void> {
+    const endpoint = `/api/issues/${issueId}/agent-sessions/${sessionId}/events/${eventId}/retry`;
+    const raw = await this.fetch<unknown>(endpoint, { method: "POST" });
+    if (!parseWithFallback(raw, RetryIssueAgentSessionEventSchema, { ok: false }, { endpoint }).ok) {
+      throw new Error("Invalid event retry response");
+    }
+  }
+
   async createComment(
     issueId: string,
     content: string,
     type?: string,
     parentId?: string,
     attachmentIds?: string[],
-    suppressAgentIds?: string[],
-    steerTaskIds?: string[],
   ): Promise<Comment> {
     return this.fetch(`/api/issues/${issueId}/comments`, {
       method: "POST",
@@ -1703,8 +1719,6 @@ export class ApiClient {
         type: type ?? "comment",
         ...(parentId ? { parent_id: parentId } : {}),
         ...(attachmentIds?.length ? { attachment_ids: attachmentIds } : {}),
-        ...(suppressAgentIds?.length ? { suppress_agent_ids: suppressAgentIds } : {}),
-        ...(steerTaskIds?.length ? { steer_task_ids: steerTaskIds } : {}),
       }),
     });
   }
@@ -1756,13 +1770,12 @@ export class ApiClient {
     return this.fetch("/api/assignee-frequency");
   }
 
-  async updateComment(commentId: string, content: string, attachmentIds?: string[], suppressAgentIds?: string[], contentBase?: string, expectedRevision?: number): Promise<Comment> {
+  async updateComment(commentId: string, content: string, attachmentIds?: string[], contentBase?: string, expectedRevision?: number): Promise<Comment> {
     return this.fetch(`/api/comments/${commentId}`, {
       method: "PUT",
       body: JSON.stringify({
         content,
         attachment_ids: attachmentIds,
-        ...(suppressAgentIds?.length ? { suppress_agent_ids: suppressAgentIds } : {}),
         ...(contentBase !== undefined ? { content_base: contentBase } : {}),
         ...(expectedRevision !== undefined ? { expected_revision: expectedRevision } : {}),
       }),

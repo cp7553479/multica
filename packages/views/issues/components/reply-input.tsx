@@ -6,9 +6,8 @@ import { useRef, useState, useEffect, useMemo } from "react";
 import { ContentEditor, type ContentEditorRef, useFileDropZone, FileDropOverlay, useLazyEditor, useUploadGate, useComposerSubmit } from "../../editor";
 import { FileUploadButton } from "@multica/ui/components/common/file-upload-button";
 import { SubmitButton } from "@multica/ui/components/common/submit-button";
-import { Button } from "@multica/ui/components/ui/button";
 import { ActorAvatar } from "../../common/actor-avatar";
-import { contentReferencesAttachment, type AgentTask } from "@multica/core/types";
+import { contentReferencesAttachment } from "@multica/core/types";
 import { useShortcut } from "@multica/core/shortcuts";
 import { ShortcutKeycaps } from "../../common/shortcut-keycaps";
 import { useCommentDraftStore, type CommentDraftKey } from "@multica/core/issues/stores";
@@ -17,9 +16,6 @@ import type { AvatarSize } from "@multica/ui/lib/avatar-size";
 import { useT } from "../../i18n";
 import { CommentTriggerChips } from "./comment-trigger-chips";
 import { useCommentTriggerPreview } from "../hooks/use-comment-trigger-preview";
-import { useRecipientActions } from "../hooks/use-recipient-actions";
-import { SteerAttachmentNotice } from "./steer-attachment-notice";
-import { useStopRunsBeforeSend } from "./use-stop-runs-before-send";
 import { useCommentUploads } from "./use-comment-uploads";
 import { useQuickActionMenu } from "../hooks/use-quick-action-menu";
 
@@ -33,7 +29,7 @@ interface ReplyInputProps {
   avatarId: string;
   /** Resolves true on success, false on failure — the reply box keeps its text
    *  (locked + spinning) until then, clearing only on success. */
-  onSubmit: (content: string, attachmentIds?: string[], suppressAgentIds?: string[], steerTaskIds?: string[]) => Promise<string | boolean>;
+  onSubmit: (content: string, attachmentIds?: string[]) => Promise<string | boolean>;
   /** Called after the server accepts the reply and the composer is cleared. */
   onAccepted?: (commentId: string) => void;
   size?: "sm" | "default";
@@ -43,12 +39,7 @@ interface ReplyInputProps {
   draftKey?: CommentDraftKey;
   targetMissing?: boolean;
   onEditAnnotation?: (id: string) => boolean;
-  /** Whether a running turn takes this reply by default: true for the turn
-   *  that belongs to this thread. Other recipients' turns can still be chosen. */
-  steerByDefault?: (task: AgentTask) => boolean;
 }
-
-const NEVER_STEER_BY_DEFAULT = () => false;
 
 // ReplyInput
 
@@ -64,7 +55,6 @@ function ReplyInput({
   draftKey,
   onEditAnnotation,
   targetMissing = false,
-  steerByDefault = NEVER_STEER_BY_DEFAULT,
 }: ReplyInputProps) {
   const { t } = useT("issues");
   const { t: tEditor } = useT("editor");
@@ -98,19 +88,6 @@ function ReplyInput({
   // CommentInput.
   const { uploads, attachments: pendingAttachments, handleUpload, removeUpload, gate } =
     useCommentUploads(draftKey, { issueId }, uploadGate, editorRef);
-  const hasAttachments = useMemo(
-    () => pendingAttachments.some((a) => contentReferencesAttachment(content, a)) || gate.uploading,
-    [pendingAttachments, content, gate.uploading],
-  );
-  const { recipients, attachmentsBlockSteer, routing, setAction, reset: resetRecipients } = useRecipientActions({
-    issueId,
-    agents: triggerPreview.agents,
-    allowSteer: true,
-    hasAttachments,
-    steerByDefault,
-    resetKey: `${issueId}:${parentId}`,
-  });
-  const stopRunsBeforeSend = useStopRunsBeforeSend(issueId);
 
   // Readonly-first: static shell until intent; an unsent draft mounts the
   // real editor immediately (see CommentInput). This is also what keeps the
@@ -173,11 +150,6 @@ function ReplyInput({
     afterAccepted: () => (editorScrubbedRef.current ? "blur" : "none"),
     onSubmit: async (content) => {
       editorScrubbedRef.current = false;
-      const { suppressAgentIds, steerTaskIds } = routing;
-      // A preview still catching up with an edited @mention can name a
-      // recipient this comment no longer addresses: never stop a run on it.
-      const restartTaskIds = triggerPreview.isCurrent ? routing.restartTaskIds : [];
-      if (!(await stopRunsBeforeSend(restartTaskIds))) return false;
       if (draftKey) {
         // Flush pending debounce before snapshotting — see CommentInput.
         const pending = editorRef.current?.flushPendingUpdate?.();
@@ -193,8 +165,6 @@ function ReplyInput({
       return onSubmit(
         content,
         activeIds.length > 0 ? activeIds : undefined,
-        suppressAgentIds.length > 0 ? suppressAgentIds : undefined,
-        steerTaskIds.length > 0 ? steerTaskIds : undefined,
       ).then((commentId) => {
         acceptedCommentIdRef.current = typeof commentId === "string" ? commentId : null;
         return !!commentId;
@@ -217,7 +187,6 @@ function ReplyInput({
       editorRef.current?.clearContent();
       setContent("");
       setIsEmpty(true);
-      resetRecipients();
       editorScrubbedRef.current = true;
       if (acceptedCommentIdRef.current) onAccepted?.(acceptedCommentIdRef.current);
     },
@@ -241,7 +210,6 @@ function ReplyInput({
           (!isEmpty || annotations.length > 0) && "pb-9",
         )}
       >
-        {attachmentsBlockSteer && <SteerAttachmentNotice />}
         {draftKey && annotations.length > 0 && <>
           {targetMissing && <p role="alert" className="mb-2 text-caption text-destructive">{t(($) => $.reply.annotations.target_deleted)}</p>}
           <ReplyAnnotations draftKey={draftKey} annotations={annotations}
@@ -305,11 +273,10 @@ function ReplyInput({
         )}
         <div className="absolute bottom-0 left-0 right-24 min-w-0">
           <CommentTriggerChips
-            recipients={recipients}
+            recipients={triggerPreview.agents}
             blocked={triggerPreview.blocked}
             hasAllMembersMention={triggerPreview.hasAllMembersMention}
             draftContent={composedContent}
-            onActionChange={setAction}
           />
         </div>
         <div className="absolute bottom-0 right-0 flex items-center gap-1">
@@ -318,17 +285,7 @@ function ReplyInput({
             multiple
             onSelect={(file) => lazy.uploadOrQueue([file])}
           />
-          {routing.restartTaskIds.length > 0 ? (
-            <Button
-              size="sm"
-              variant="destructive"
-              className="rounded-full"
-              onClick={submit}
-              disabled={!canSend || submitting || gate.uploading}
-            >
-              {t(($) => $.comment.restart_send)}
-            </Button>
-          ) : <SubmitButton
+          <SubmitButton
             onClick={submit}
             disabled={!canSend}
             loading={submitting}
@@ -349,7 +306,7 @@ function ReplyInput({
             ariaLabel={gate.uploading
               ? tEditor(($) => $.upload.in_progress)
               : t(($) => $.comment.send_tooltip)}
-          />}
+          />
         </div>
         {isDragOver && <FileDropOverlay />}
       </div>

@@ -169,12 +169,6 @@
     "sticky_comment_bar": {
       "title": "Fijar la barra de comentarios abajo"
     },
-    "running_agent_reply": {
-      "title": "Al responder a un agente en ejecución",
-      "steer": "Añadir a la ejecución actual",
-      "after_run": "Empezar tras esta ejecución",
-      "hint": "Solo establece el valor predeterminado. Puedes cambiarlo para cualquier mensaje antes de enviarlo."
-    },
     "comments_title": "Comentarios",
     "appearance_title": "Apariencia",
     "issue_fields": {

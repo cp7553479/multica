@@ -80,6 +80,11 @@ func TestIssueWakeupEnableOneShotRequiresExplicitFutureRearm(t *testing.T) {
 	}
 	f.Exec(t, "UPDATE issue_wakeup SET next_fire_at=now()-interval '1 second' WHERE id=$1", w.ID)
 	wakeDispatch(t, s, restored)
+	events := wakeupInbox(t, f, w.ID)
+	if len(events) != 1 || events[0].Status != "pending" || events[0].DeliveredAt.Valid {
+		t.Fatalf("one-shot did not retain its undelivered event: %+v", events)
+	}
+	task := wakeupSessionTask(t, f, issue, agent)
 	if _, err = s.Enable(ctx, issue, owner, pgtype.UUID{}, w.ID, WakeupEnableInput{Revision: restored.Revision, At: &future}); !errors.Is(err, ErrWakeupInput) {
 		t.Fatalf("consumed toggle accepted: %v", err)
 	}
@@ -89,8 +94,19 @@ func TestIssueWakeupEnableOneShotRequiresExplicitFutureRearm(t *testing.T) {
 	if _, err = s.Disable(ctx, issue, w.ID, owner); err != nil {
 		t.Fatal(err)
 	}
+	withdrawn, err := f.q.GetIssueAgentEvent(ctx, events[0].ID)
+	if err != nil || withdrawn.Status != "ignored" || withdrawn.DeliveredAt.Valid {
+		t.Fatalf("disable did not withdraw the pending event: %+v %v", withdrawn, err)
+	}
+	ended, err := f.q.GetAgentTask(ctx, task.ID)
+	if err != nil || ended.Status != "cancelled" {
+		t.Fatalf("empty unclaimed consumer was not cancelled: %+v %v", ended, err)
+	}
 	if _, err = s.Enable(ctx, issue, owner, pgtype.UUID{}, w.ID, WakeupEnableInput{Revision: restored.Revision, At: &future, Rearm: true}); err != nil {
 		t.Fatal(err)
+	}
+	if events := wakeupInbox(t, f, w.ID); len(events) != 1 || events[0].ID != withdrawn.ID || events[0].Status != "ignored" {
+		t.Fatalf("rearm replayed the withdrawn event: %+v", events)
 	}
 }
 

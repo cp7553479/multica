@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"net/http"
+	"strconv"
 
 	"github.com/jackc/pgx/v5"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
@@ -11,6 +12,22 @@ import (
 type wakeupActorKey struct{}
 type wakeupActor struct{ kind, id, task string }
 type wakeupHandedToKey struct{}
+type wakeupHandoffKey struct{}
+type wakeupHandoff struct {
+	note, brief string
+	workflow    bool
+}
+
+func (h *Handler) withIssueSessionHandoff(ctx context.Context, prev db.Issue, params db.UpdateIssueParams, handoff *workflowHandoff, note string) context.Context {
+	projected := prev
+	projected.AssigneeType, projected.AssigneeID = params.AssigneeType, params.AssigneeID
+	if params.Status.Valid {
+		projected.Status = params.Status.String
+	}
+	return context.WithValue(ctx, wakeupHandoffKey{}, wakeupHandoff{
+		note: note, workflow: handoff != nil, brief: h.workflowHandoffBrief(ctx, projected, handoff),
+	})
+}
 
 // withWakeupHandedTo names the agent a write hands the issue to. That agent
 // gets the change as its own run, so the write's issue events skip its event
@@ -52,6 +69,12 @@ func (h *Handler) beginWakeupWrite(ctx context.Context) (pgx.Tx, error) {
 	}
 	if agent, ok := ctx.Value(wakeupHandedToKey{}).(string); ok {
 		if _, err = tx.Exec(ctx, `SELECT set_config('multica.handed_to_agent',$1,true)`, agent); err != nil {
+			_ = tx.Rollback(ctx)
+			return nil, err
+		}
+	}
+	if handoff, ok := ctx.Value(wakeupHandoffKey{}).(wakeupHandoff); ok {
+		if _, err = tx.Exec(ctx, `SELECT set_config('multica.handoff_note',$1,true),set_config('multica.workflow_handoff',$2,true),set_config('multica.workflow_brief',$3,true)`, handoff.note, strconv.FormatBool(handoff.workflow), handoff.brief); err != nil {
 			_ = tx.Rollback(ctx)
 			return nil, err
 		}

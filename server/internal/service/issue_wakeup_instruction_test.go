@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"reflect"
 	"strings"
@@ -56,13 +57,15 @@ func TestIssueWakeupInstructionPreservesStateAndPendingEvents(t *testing.T) {
 			}
 			if kind == "event" {
 				wakeDispatch(t, s, after)
-				var note string
-				if err = f.Pool.QueryRow(ctx, "SELECT handoff_note FROM agent_task_queue WHERE issue_id=$1 AND context->>'wakeup_id'=$2", issue, util.UUIDToString(w.ID)).Scan(&note); err != nil {
-					t.Fatal(err)
+				events := wakeupInbox(t, f, w.ID)
+				if len(events) != 1 || events[0].Status != "pending" {
+					t.Fatalf("pending receipt was not transferred once: %+v", events)
 				}
-				if !strings.Contains(note, "new instructions") {
-					t.Fatal("pending event lost or dispatched old instructions")
+				var payload wakeupSessionPayload
+				if err = json.Unmarshal(events[0].Payload, &payload); err != nil || payload.Instruction != "new instructions" || !strings.Contains(payload.Note, "new instructions") {
+					t.Fatalf("pending event lost or transferred old instructions: %s (%v)", events[0].Payload, err)
 				}
+				wakeupSessionTask(t, f, issue, agent)
 			}
 			if _, err = s.Disable(ctx, issue, w.ID, owner); err != nil {
 				t.Fatal(err)
@@ -83,7 +86,7 @@ func TestIssueWakeupInstructionPreservesStateAndPendingEvents(t *testing.T) {
 	}
 }
 
-func TestIssueWakeupInstructionPreservesQueuedRunAndChecksScope(t *testing.T) {
+func TestIssueWakeupInstructionPreservesTransferredEventAndChecksScope(t *testing.T) {
 	f, s, issue, agent := wakeFixture(t)
 	ctx := context.Background()
 	owner := parseTestUUID(t, f.UserID)
@@ -94,12 +97,17 @@ func TestIssueWakeupInstructionPreservesQueuedRunAndChecksScope(t *testing.T) {
 	if err := s.EditInstruction(ctx, issue, w.ID, owner, in); err != nil {
 		t.Fatal(err)
 	}
-	var note string
-	if err := f.Pool.QueryRow(ctx, "SELECT handoff_note FROM agent_task_queue WHERE issue_id=$1 AND context->>'wakeup_id'=$2", issue, util.UUIDToString(w.ID)).Scan(&note); err != nil {
-		t.Fatal(err)
+	events := wakeupInbox(t, f, w.ID)
+	if len(events) != 1 || events[0].Status != "pending" {
+		t.Fatalf("transferred inputs: %+v", events)
 	}
-	if !strings.Contains(note, "queued instruction") || strings.Contains(note, "future instruction") {
-		t.Fatal("edit rewrote queued run")
+	var payload wakeupSessionPayload
+	if err := json.Unmarshal(events[0].Payload, &payload); err != nil || payload.Instruction != "queued instruction" || strings.Contains(payload.Note, "future instruction") {
+		t.Fatalf("edit rewrote the transferred instruction: %s (%v)", events[0].Payload, err)
+	}
+	task := wakeupSessionTask(t, f, issue, agent)
+	if claimed := wakeupClaimEvents(t, f, s, task, 1); len(claimed) != 1 || claimed[0].ID != events[0].ID || string(claimed[0].Payload) != string(events[0].Payload) {
+		t.Fatalf("claim changed the transferred instruction: %+v", claimed)
 	}
 	current, err := s.Tasks.Queries.LocklessWakeup(ctx, w.ID)
 	if err != nil {

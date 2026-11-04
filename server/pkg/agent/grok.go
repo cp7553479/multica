@@ -421,6 +421,10 @@ func (b *grokBackend) Execute(ctx context.Context, prompt string, opts ExecOptio
 			}
 			var changed bool
 			sessionID, changed = resolveResumedSessionID(opts.ResumeSessionID, result)
+			if changed && opts.StrictSessionResume {
+				resCh <- Result{Status: "failed", Error: "grok persistent session identity changed; refusing replacement", SessionID: opts.ResumeSessionID}
+				return
+			}
 			if changed {
 				b.cfg.Logger.Warn("agent returned a different session id on resume — original was likely lost; continuing with the new id",
 					"backend", "grok",
@@ -455,6 +459,13 @@ func (b *grokBackend) Execute(ctx context.Context, prompt string, opts ExecOptio
 		}
 
 		c.sessionID = sessionID
+		if opts.PersistSession != nil {
+			if err := opts.PersistSession(runCtx, sessionID); err != nil {
+				cancel()
+				resCh <- Result{Status: "failed", Error: fmt.Sprintf("grok session persistence failed: %v", err), SessionID: sessionID}
+				return
+			}
+		}
 		supplements.mu.Lock()
 		supplements.sessionID = sessionID
 		supplements.mu.Unlock()

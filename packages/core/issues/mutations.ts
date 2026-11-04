@@ -846,17 +846,12 @@ export function useCreateComment(issueId: string) {
       type,
       parentId,
       attachmentIds,
-      suppressAgentIds,
-      steerTaskIds,
     }: {
       content: string;
       type?: string;
       parentId?: string;
       attachmentIds?: string[];
-      suppressAgentIds?: string[];
-      /** Running turns this comment goes into instead of a follow-up run. */
-      steerTaskIds?: string[];
-    }) => api.createComment(issueId, content, type, parentId, attachmentIds, suppressAgentIds, steerTaskIds),
+    }) => api.createComment(issueId, content, type, parentId, attachmentIds),
     onSuccess: (comment) => {
       if (comment.issue_revision) {
         onIssueAuxiliaryRevision(qc, wsId, issueId, comment.issue_revision);
@@ -917,17 +912,15 @@ export function useUpdateComment(issueId: string) {
       commentId,
       content,
       attachmentIds,
-      suppressAgentIds,
       contentBase,
       expectedRevision,
     }: {
       commentId: string;
       content: string;
       attachmentIds: string[];
-      suppressAgentIds?: string[];
       contentBase?: string;
       expectedRevision?: number;
-    }) => api.updateComment(commentId, content, attachmentIds, suppressAgentIds, contentBase, expectedRevision),
+    }) => api.updateComment(commentId, content, attachmentIds, contentBase, expectedRevision),
     onMutate: async ({ commentId, content, attachmentIds }) => {
       await qc.cancelQueries({ queryKey: issueKeys.timeline(issueId) });
       const prev = qc.getQueryData<TimelineCache>(issueKeys.timeline(issueId));

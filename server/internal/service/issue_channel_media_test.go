@@ -162,7 +162,7 @@ func TestPublishAttachmentsChangedAlsoBroadcastsUpdatedDescription(t *testing.T)
 	}
 }
 
-func TestCreateMediaGatedIssueCommitsDeferredTaskAtomicallyBeforeCreatedEvent(t *testing.T) {
+func TestCreateMediaGatedIssueCommitsDeferredSessionAtomicallyBeforeCreatedEvent(t *testing.T) {
 	pool := newResolveOriginatorPool(t)
 	ctx := context.Background()
 	q := db.New(pool)
@@ -170,148 +170,108 @@ func TestCreateMediaGatedIssueCommitsDeferredTaskAtomicallyBeforeCreatedEvent(t 
 	workspaceUUID := util.MustParseUUID(workspaceID)
 	userUUID := util.MustParseUUID(userID)
 	agentUUID := util.MustParseUUID(agentID)
+	fireAt := time.Now().Add(time.Minute)
 
 	bus := events.New()
 	wakeup := &stubWakeup{}
 	createdOverlay := json.RawMessage(`{"mcpServers":{"creator":{"url":"https://creator.example"}}}`)
 	taskService := &TaskService{
-		Queries:      q,
-		TxStarter:    pool,
-		Bus:          bus,
+		Queries: q, TxStarter: pool, Bus: bus,
 		Composio:     &stubOverlayBuilder{resp: createdOverlay},
-		FeatureFlags: composioMCPAppsTestFlags(true),
-		Wakeup:       wakeup,
+		FeatureFlags: composioMCPAppsTestFlags(true), Wakeup: wakeup,
+		IssueSessionCanInvoke: func(_ context.Context, _ db.Agent, event db.IssueAgentEvent) bool {
+			return event.ActorType == "member" && event.ActorID == userUUID
+		},
 	}
-	var competingTaskID pgtype.UUID
-	var competingErr error
+	var callbackErr error
+	var committedSession db.IssueAgentSession
 	txStarter := &afterCommitTxStarter{pool: pool, afterCommit: func() {
-		// This callback runs after the issue transaction is visible but before
-		// IssueService resumes. The old implementation committed only the issue,
-		// so this ordinary queued insert won the unique slot. The fixed path has
-		// already committed the deferred task in the same transaction.
-		var issueID, runtimeID pgtype.UUID
-		if err := pool.QueryRow(ctx, `
-			SELECT i.id, a.runtime_id
-			FROM issue i
-			JOIN agent a ON a.id = i.assignee_id
-			WHERE i.workspace_id = $1 AND i.title = 'Media-gated issue'`, workspaceUUID).
-			Scan(&issueID, &runtimeID); err != nil {
-			competingErr = fmt.Errorf("discover committed issue: %w", err)
+		var issueID pgtype.UUID
+		if err := pool.QueryRow(ctx, `SELECT id FROM issue WHERE workspace_id=$1 AND title='Media-gated issue'`, workspaceUUID).Scan(&issueID); err != nil {
+			callbackErr = err
 			return
 		}
-		competingErr = pool.QueryRow(ctx, `
-			INSERT INTO agent_task_queue (agent_id, runtime_id, issue_id, status, priority)
-			VALUES ($1, $2, $3, 'queued', 1)
-			RETURNING id`, agentUUID, runtimeID, issueID).Scan(&competingTaskID)
+		var err error
+		committedSession, err = q.GetIssueAgentSessionForPair(ctx, db.GetIssueAgentSessionForPairParams{
+			WorkspaceID: workspaceUUID, AgentID: agentUUID, IssueID: issueID,
+		})
+		if err != nil {
+			callbackErr = fmt.Errorf("session not committed with issue: %w", err)
+			return
+		}
+		if !committedSession.WakeAfter.Valid || committedSession.WakeAfter.Time.Before(fireAt.Add(-time.Millisecond)) {
+			callbackErr = fmt.Errorf("session missing durable media deadline: %+v", committedSession)
+			return
+		}
+		if task, err := taskService.WakeIssueAgentSession(ctx, committedSession.ID); err != nil || task != nil {
+			callbackErr = fmt.Errorf("wake raced media gate: task=%v err=%v", task, err)
+		}
 	}}
 	issueService := NewIssueService(q, txStarter, bus, nil, taskService)
-
-	var callbackErr error
-	var mergedCommentID pgtype.UUID
+	var followupID pgtype.UUID
 	bus.Subscribe(protocol.EventIssueCreated, func(event events.Event) {
-		payload, ok := event.Payload.(map[string]any)
-		if !ok {
-			callbackErr = fmt.Errorf("issue:created payload = %#v", event.Payload)
+		if callbackErr != nil {
 			return
 		}
-		issueID, ok := payload["issue_id"].(string)
-		if !ok {
-			callbackErr = fmt.Errorf("issue:created issue_id = %#v", payload["issue_id"])
+		if committedSession.ActiveTaskID.Valid {
+			callbackErr = errors.New("session started before media was bound")
 			return
 		}
-		issueUUID := util.MustParseUUID(issueID)
-
-		var status string
-		var mediaPending bool
-		var runtimeOverlay []byte
-		if err := pool.QueryRow(ctx, `
-			SELECT status, context->>'channel_issue_media_pending' = 'true', runtime_mcp_overlay
-			FROM agent_task_queue
-			WHERE issue_id = $1 AND agent_id = $2`, issueUUID, agentUUID).Scan(&status, &mediaPending, &runtimeOverlay); err != nil {
-			callbackErr = fmt.Errorf("load task during issue:created: %w", err)
-			return
-		}
-		if status != "deferred" || !mediaPending {
-			callbackErr = fmt.Errorf("task during issue:created = status %q media_pending %v", status, mediaPending)
-			return
-		}
-		var runtimeOverlayValue, createdOverlayValue any
-		if err := json.Unmarshal(runtimeOverlay, &runtimeOverlayValue); err != nil {
-			callbackErr = fmt.Errorf("decode task overlay during issue:created: %w", err)
-			return
-		}
-		if err := json.Unmarshal(createdOverlay, &createdOverlayValue); err != nil || !reflect.DeepEqual(runtimeOverlayValue, createdOverlayValue) {
-			callbackErr = fmt.Errorf("task overlay during issue:created = %s, want %s", runtimeOverlay, createdOverlay)
-			return
-		}
-
 		if err := pool.QueryRow(ctx, `
 			INSERT INTO comment (issue_id, workspace_id, author_type, author_id, content)
-			VALUES ($1, $2, 'member', $3, 'Immediate follow-up')
-			RETURNING id`, issueUUID, workspaceUUID, userUUID).Scan(&mergedCommentID); err != nil {
-			callbackErr = fmt.Errorf("insert immediate comment: %w", err)
+			VALUES ($1, $2, 'member', $3, 'Immediate follow-up') RETURNING id`,
+			committedSession.IssueID, workspaceUUID, userUUID).Scan(&followupID); err != nil {
+			callbackErr = err
 			return
 		}
-		if _, err := q.MergeCommentIntoPendingTask(ctx, db.MergeCommentIntoPendingTaskParams{
-			IssueID:                 issueUUID,
-			AgentID:                 agentUUID,
-			NewTriggerCommentID:     mergedCommentID,
-			NewOriginatorUserID:     userUUID,
-			NewAccountableUserID:    userUUID,
-			NewOriginatorSource:     pgtype.Text{String: "direct_human", Valid: true},
-			NewTriggerEvidenceKind:  pgtype.Text{String: "comment", Valid: true},
-			NewTriggerEvidenceRefID: mergedCommentID,
-		}); !errors.Is(err, pgx.ErrNoRows) {
-			callbackErr = fmt.Errorf("new comment thread must not merge into the assignment: %v", err)
+		if task, err := taskService.WakeIssueAgentSession(ctx, committedSession.ID); err != nil || task != nil {
+			callbackErr = fmt.Errorf("follow-up escaped media gate: task=%v err=%v", task, err)
 		}
 	})
-
 	result, err := issueService.Create(ctx, IssueCreateParams{
-		WorkspaceID:  workspaceUUID,
-		Title:        "Media-gated issue",
-		Status:       "todo",
-		Priority:     "medium",
-		AssigneeType: pgtype.Text{String: "agent", Valid: true},
-		AssigneeID:   agentUUID,
-		CreatorType:  "member",
-		CreatorID:    userUUID,
-	}, IssueCreateOpts{AssignedAgentRunFireAt: time.Now().Add(time.Minute)})
+		WorkspaceID: workspaceUUID, Title: "Media-gated issue", Status: "todo", Priority: "medium",
+		AssigneeType: pgtype.Text{String: "agent", Valid: true}, AssigneeID: agentUUID,
+		CreatorType: "member", CreatorID: userUUID,
+	}, IssueCreateOpts{AssignedAgentRunFireAt: fireAt})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	if callbackErr != nil {
 		t.Fatal(callbackErr)
 	}
-	if !result.AssignedTaskID.Valid {
-		t.Fatal("media-gated issue did not return its deferred task")
+	if !result.AssignedSessionID.Valid || result.AssignedSessionID != committedSession.ID || result.AssignedTaskID.Valid {
+		t.Fatalf("media-gated create = session %v task %v", result.AssignedSessionID, result.AssignedTaskID)
 	}
-	if len(wakeup.calls) != 1 || wakeup.calls[0].taskID != "" {
-		t.Fatalf("post-commit schedule wakeups = %+v, want one wakeup without a ready task id", wakeup.calls)
+	if len(wakeup.calls) != 0 {
+		t.Fatalf("media-gated session woke prematurely: %+v", wakeup.calls)
 	}
-	if !isDuplicatePendingTaskErr(competingErr) {
-		t.Fatalf("post-commit competing queued insert error = %v, want duplicate pending task", competingErr)
+	events, err := q.ListIssueAgentEvents(ctx, db.ListIssueAgentEventsParams{SessionID: result.AssignedSessionID, EventLimit: 10})
+	if err != nil || len(events) != 2 || events[0].Kind != "assigned" || events[1].SourceID != followupID {
+		t.Fatalf("durable events before release = %+v err=%v", events, err)
 	}
-	if competingTaskID.Valid {
-		t.Fatalf("post-commit competing task unexpectedly won: %s", util.UUIDToString(competingTaskID))
+	if err := taskService.ReleaseIssueAgentSession(ctx, result.AssignedSessionID); err != nil {
+		t.Fatal(err)
 	}
-
-	var taskID, triggerCommentID, runtimeID pgtype.UUID
-	var taskCount int
-	if err := pool.QueryRow(ctx, `
-		SELECT id, trigger_comment_id, runtime_id, count(*) OVER ()
-		FROM agent_task_queue
-		WHERE issue_id = $1 AND agent_id = $2
-		  AND status IN ('queued', 'dispatched', 'deferred')
-		ORDER BY created_at
-		LIMIT 1`, result.Issue.ID, agentUUID).
-		Scan(&taskID, &triggerCommentID, &runtimeID, &taskCount); err != nil {
-		t.Fatalf("load final pending task: %v", err)
+	session, err := q.GetIssueAgentSession(ctx, result.AssignedSessionID)
+	if err != nil || !session.ActiveTaskID.Valid || session.WakeAfter.Valid {
+		t.Fatalf("released session = %+v err=%v", session, err)
 	}
-	if taskCount != 1 || taskID != result.AssignedTaskID || triggerCommentID.Valid {
-		t.Fatalf("pending task = count %d id %v trigger %v, want one assignment task %v without a comment trigger", taskCount, taskID, triggerCommentID, result.AssignedTaskID)
+	task, err := q.GetAgentTask(ctx, session.ActiveTaskID)
+	if err != nil || task.TriggerCommentID.Valid || !IsIssueAgentSessionTask(task) {
+		t.Fatalf("released execution = %+v err=%v", task, err)
 	}
-	if wakeup.calls[0].runtimeID != util.UUIDToString(runtimeID) {
-		t.Fatalf("schedule wakeup runtime = %q, want %q", wakeup.calls[0].runtimeID, util.UUIDToString(runtimeID))
+	var gotOverlay, wantOverlay any
+	if err := json.Unmarshal(task.RuntimeMcpOverlay, &gotOverlay); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(createdOverlay, &wantOverlay); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(gotOverlay, wantOverlay) {
+		t.Fatalf("execution overlay = %s, want %s", task.RuntimeMcpOverlay, createdOverlay)
+	}
+	if len(wakeup.calls) != 1 || wakeup.calls[0].taskID != util.UUIDToString(task.ID) {
+		t.Fatalf("release wakeups = %+v", wakeup.calls)
 	}
 }
 
@@ -410,7 +370,11 @@ func TestCreateIssuePropertiesAreVisibleAtCommitBeforeEnqueue(t *testing.T) {
 	bus.Subscribe(protocol.EventIssuePropertiesChanged, func(events.Event) {
 		propertyChangedEvents++
 	})
-	taskService := &TaskService{Queries: q, TxStarter: pool, Bus: bus}
+	taskService := &TaskService{Queries: q, TxStarter: pool, Bus: bus,
+		IssueSessionCanInvoke: func(_ context.Context, _ db.Agent, event db.IssueAgentEvent) bool {
+			return event.ActorType == "member" && event.ActorID == userUUID
+		},
+	}
 	issueService := NewIssueService(q, txStarter, bus, nil, taskService)
 
 	result, err := issueService.Create(ctx, IssueCreateParams{
@@ -457,86 +421,6 @@ func TestCreateIssuePropertiesAreVisibleAtCommitBeforeEnqueue(t *testing.T) {
 	properties, ok := issueSnapshot["properties"].(map[string]any)
 	if !ok || properties[util.UUIDToString(propertyID)] != "ready" {
 		t.Fatalf("issue:created properties = %#v", issueSnapshot["properties"])
-	}
-}
-
-func TestHydrateDeferredChannelIssueTaskOverlayDoesNotOverwriteMergedCommentPlan(t *testing.T) {
-	pool := newResolveOriginatorPool(t)
-	ctx := context.Background()
-	q := db.New(pool)
-	workspaceID, userID, agentID, issueID := seedAttributionFixture(t, pool)
-	userUUID := util.MustParseUUID(userID)
-
-	plainService := &TaskService{Queries: q, TxStarter: pool, Bus: events.New()}
-	task, err := plainService.EnqueueDeferredChannelIssueTask(ctx, db.Issue{
-		ID:           util.MustParseUUID(issueID),
-		WorkspaceID:  util.MustParseUUID(workspaceID),
-		AssigneeType: pgtype.Text{String: "agent", Valid: true},
-		AssigneeID:   util.MustParseUUID(agentID),
-		CreatorType:  "member",
-		CreatorID:    userUUID,
-		Priority:     "medium",
-	}, time.Now().Add(time.Minute))
-	if err != nil {
-		t.Fatalf("EnqueueDeferredChannelIssueTask: %v", err)
-	}
-
-	var commentID pgtype.UUID
-	if err := pool.QueryRow(ctx, `
-		INSERT INTO comment (issue_id, workspace_id, author_type, author_id, content)
-		VALUES ($1, $2, 'member', $3, 'New effective trigger')
-		RETURNING id`, task.IssueID, workspaceID, userID).Scan(&commentID); err != nil {
-		t.Fatalf("seed merged comment: %v", err)
-	}
-	if _, err := pool.Exec(ctx, `UPDATE agent_task_queue SET trigger_comment_id=$2 WHERE id=$1`, task.ID, commentID); err != nil {
-		t.Fatal(err)
-	}
-	mergedOverlay := json.RawMessage(`{"mcpServers":{"merged":{"url":"https://merged.example"}}}`)
-	if _, err := q.MergeCommentIntoPendingTask(ctx, db.MergeCommentIntoPendingTaskParams{
-		IssueID:                 task.IssueID,
-		AgentID:                 task.AgentID,
-		NewTriggerCommentID:     commentID,
-		NewOriginatorUserID:     userUUID,
-		NewAccountableUserID:    userUUID,
-		NewRuntimeMcpOverlay:    mergedOverlay,
-		NewOriginatorSource:     pgtype.Text{String: "direct_human", Valid: true},
-		NewTriggerEvidenceKind:  pgtype.Text{String: "comment", Valid: true},
-		NewTriggerEvidenceRefID: commentID,
-	}); err != nil {
-		t.Fatalf("MergeCommentIntoPendingTask: %v", err)
-	}
-
-	hydrationBuilder := &stubOverlayBuilder{
-		resp: json.RawMessage(`{"mcpServers":{"stale":{"url":"https://stale.example"}}}`),
-	}
-	hydratingService := &TaskService{
-		Queries:      q,
-		Composio:     hydrationBuilder,
-		FeatureFlags: composioMCPAppsTestFlags(true),
-	}
-	if err := hydratingService.hydrateDeferredChannelIssueTaskOverlay(ctx, task); err != nil {
-		t.Fatalf("hydrateDeferredChannelIssueTaskOverlay: %v", err)
-	}
-
-	var triggerID pgtype.UUID
-	var storedOverlay []byte
-	if err := pool.QueryRow(ctx, `
-		SELECT trigger_comment_id, runtime_mcp_overlay
-		FROM agent_task_queue WHERE id = $1`, task.ID).Scan(&triggerID, &storedOverlay); err != nil {
-		t.Fatalf("load hydrated task: %v", err)
-	}
-	if triggerID != commentID {
-		t.Fatalf("trigger_comment_id = %s, want %s", util.UUIDToString(triggerID), util.UUIDToString(commentID))
-	}
-	var storedValue, mergedValue any
-	if err := json.Unmarshal(storedOverlay, &storedValue); err != nil {
-		t.Fatalf("decode stored runtime_mcp_overlay: %v", err)
-	}
-	if err := json.Unmarshal(mergedOverlay, &mergedValue); err != nil {
-		t.Fatalf("decode expected runtime_mcp_overlay: %v", err)
-	}
-	if !reflect.DeepEqual(storedValue, mergedValue) {
-		t.Fatalf("runtime_mcp_overlay = %s, want merged overlay %s", storedOverlay, mergedOverlay)
 	}
 }
 

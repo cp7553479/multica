@@ -97,9 +97,14 @@ func TestIssueWakeupCollaborationCapture(t *testing.T) {
 		t.Fatal(err)
 	}
 	wakeDispatch(t, s, w)
-	if n := f.Count(t, "SELECT count(*) FROM agent_task_queue WHERE context->>'wakeup_id'=$1", util.UUIDToString(w.ID)); n != 1 {
-		t.Fatalf("expected coalesced run, got %d", n)
+	events := wakeupInbox(t, f, w.ID)
+	if len(events) != 1 || events[0].Status != "pending" {
+		t.Fatalf("expected one coalesced inbox input, got %+v", events)
 	}
+	if strings.Contains(string(events[0].Payload), "private-") || strings.Contains(string(events[0].Payload), "secret") {
+		t.Fatalf("private collaboration content entered the session payload: %s", events[0].Payload)
+	}
+	wakeupSessionTask(t, f, issue, agent)
 }
 
 func TestIssueWakeupNonterminalSubscriptionIsProspective(t *testing.T) {
@@ -126,17 +131,27 @@ func TestIssueWakeupReplyUnresolveKeepsSource(t *testing.T) {
 	f, s, issue, agent := wakeFixture(t)
 	parent := f.Comment(t, util.UUIDToString(issue), "resolved thread", testutil.Cols{"resolved_at": testutil.Raw("now()"), "resolved_by_type": "member", "resolved_by_id": f.UserID})
 	w := wakeCreate(t, f, s, issue, WakeupInput{AgentID: agent, Kind: "event", Mode: "continuous", EventTypes: []string{"comment.unresolved"}, Instruction: "inspect reply"})
-	run := f.Task(t, agent, testutil.Cols{"issue_id": issue, "runtime_id": testutil.Raw("(SELECT runtime_id FROM agent WHERE id='" + agent + "')")})
-	f.Cleanup(t, "DELETE FROM comment WHERE source_task_id=$1", run)
-	f.Exec(t, "UPDATE agent_task_queue SET context=jsonb_build_object('wakeup_id',$2::text) WHERE id=$1", run, util.UUIDToString(w.ID))
-	s.Tasks.createAgentComment(context.Background(), issue, parseTestUUID(t, agent), "own reply", "comment", parseTestUUID(t, parent), parseTestUUID(t, run))
+	ctx := context.Background()
+	if err := s.Trigger(ctx, issue, w.ID, parseTestUUID(t, f.UserID)); err != nil {
+		t.Fatal(err)
+	}
+	task := wakeupSessionTask(t, f, issue, agent)
+	wakeupAckEvents(t, s, task, wakeupClaimEvents(t, f, s, task, 32))
+	wakeStart(t, f, util.UUIDToString(task.ID))
+	f.Cleanup(t, "DELETE FROM comment WHERE source_task_id=$1", task.ID)
+	s.Tasks.createAgentComment(ctx, issue, parseTestUUID(t, agent), "own reply", "comment", parseTestUUID(t, parent), task.ID)
 	if n := f.Count(t, "SELECT count(*) FROM comment WHERE id=$1 AND resolved_at IS NULL", parent); n != 1 {
 		t.Fatal("reply did not reopen thread")
 	}
-	if n := f.Count(t, "SELECT count(*) FROM issue_wakeup_receipt WHERE wakeup_id=$1", w.ID); n != 0 {
-		t.Fatal("automatic unresolve caused self-loop")
+	wakeDispatch(t, s, w)
+	if events := wakeupInbox(t, f, w.ID); len(events) != 1 {
+		t.Fatalf("automatic unresolve caused another session input: %+v", events)
 	}
-	f.Exec(t, "UPDATE agent_task_queue SET context='{}' WHERE id=$1", run)
+	if n := f.Count(t, "SELECT count(*) FROM issue_wakeup_receipt WHERE wakeup_id=$1 AND processed_at IS NULL", w.ID); n != 0 {
+		t.Fatal("own reply left an actionable receipt")
+	}
+	run := f.Task(t, agent, testutil.Cols{"issue_id": issue, "status": "completed", "runtime_id": testutil.Raw("(SELECT runtime_id FROM agent WHERE id='" + agent + "')")})
+	f.Cleanup(t, "DELETE FROM comment WHERE source_task_id=$1", run)
 	f.Exec(t, "UPDATE comment SET resolved_at=now(),resolved_by_type='member',resolved_by_id=$2 WHERE id=$1", parent, f.UserID)
 	s.Tasks.createAgentComment(context.Background(), issue, parseTestUUID(t, agent), "external reply", "comment", parseTestUUID(t, parent), parseTestUUID(t, run))
 	if n := f.Count(t, "SELECT count(*) FROM issue_wakeup_receipt WHERE wakeup_id=$1 AND payload->>'source_task_id'=$2", w.ID, run); n != 1 {
@@ -148,8 +163,14 @@ func TestIssueWakeupCollaborationTransactionAndActor(t *testing.T) {
 	f, s, issue, agent := wakeFixture(t)
 	comment := f.Comment(t, util.UUIDToString(issue), "original", testutil.Cols{"author_type": "agent", "author_id": agent})
 	w := wakeCreate(t, f, s, issue, WakeupInput{AgentID: agent, Kind: "event", Mode: "continuous", EventTypes: []string{"comment.updated", "issue.metadata_changed"}, FilterAgentID: agent, Instruction: "inspect"})
-	run := f.Task(t, agent, testutil.Cols{"issue_id": issue, "runtime_id": testutil.Raw("(SELECT runtime_id FROM agent WHERE id='" + agent + "')")})
+	run := f.Task(t, agent, testutil.Cols{"issue_id": issue, "status": "completed", "runtime_id": testutil.Raw("(SELECT runtime_id FROM agent WHERE id='" + agent + "')")})
 	ctx := context.Background()
+	if err := s.Trigger(ctx, issue, w.ID, parseTestUUID(t, f.UserID)); err != nil {
+		t.Fatal(err)
+	}
+	task := wakeupSessionTask(t, f, issue, agent)
+	wakeupAckEvents(t, s, task, wakeupClaimEvents(t, f, s, task, 32))
+	wakeStart(t, f, util.UUIDToString(task.ID))
 	write := func(commit, own bool) {
 		t.Helper()
 		tx, err := f.Pool.Begin(ctx)
@@ -157,13 +178,12 @@ func TestIssueWakeupCollaborationTransactionAndActor(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer tx.Rollback(ctx)
-		if _, err = tx.Exec(ctx, "SELECT set_config('multica.source_task_id',$1,true),set_config('multica.actor_type','agent',true),set_config('multica.actor_id',$2,true)", run, agent); err != nil {
-			t.Fatal(err)
-		}
+		source := run
 		if own {
-			if _, err = tx.Exec(ctx, "UPDATE agent_task_queue SET context=jsonb_build_object('wakeup_id',$2::text) WHERE id=$1", run, util.UUIDToString(w.ID)); err != nil {
-				t.Fatal(err)
-			}
+			source = util.UUIDToString(task.ID)
+		}
+		if _, err = tx.Exec(ctx, "SELECT set_config('multica.source_task_id',$1,true),set_config('multica.actor_type','agent',true),set_config('multica.actor_id',$2,true)", source, agent); err != nil {
+			t.Fatal(err)
 		}
 		if _, err = tx.Exec(ctx, "UPDATE comment SET content=content||'!' WHERE id=$1", comment); err != nil {
 			t.Fatal(err)
@@ -177,7 +197,9 @@ func TestIssueWakeupCollaborationTransactionAndActor(t *testing.T) {
 			}
 		}
 	}
-	count := func() int { return f.Count(t, "SELECT count(*) FROM issue_wakeup_receipt WHERE wakeup_id=$1", w.ID) }
+	count := func() int {
+		return f.Count(t, "SELECT count(*) FROM issue_wakeup_receipt WHERE wakeup_id=$1 AND event_type IN ('comment.updated','issue.metadata_changed')", w.ID)
+	}
 	write(false, false)
 	if count() != 0 {
 		t.Fatal("rollback left receipts")
@@ -191,13 +213,26 @@ func TestIssueWakeupCollaborationTransactionAndActor(t *testing.T) {
 	if count() != 2 {
 		t.Fatalf("trusted agent edits missing: %d", count())
 	}
-	write(true, true)
-	if count() != 2 {
-		t.Fatal("own wakeup edits caused a self-loop")
+	wakeDispatch(t, s, w)
+	if events := wakeupInbox(t, f, w.ID); len(events) != 2 {
+		t.Fatalf("trusted external edits were not transferred: %+v", events)
 	}
-	// Transaction-local identity must not leak to the next borrower.
+	// Transaction-local identity must not leak to the next borrower while
+	// this actor-filtered rule is still enabled.
 	f.Exec(t, "UPDATE comment SET content='later system edit' WHERE id=$1", comment)
 	if count() != 2 {
 		t.Fatal("source identity leaked")
+	}
+	write(true, true)
+	wakeDispatch(t, s, w)
+	if events := wakeupInbox(t, f, w.ID); len(events) != 2 {
+		t.Fatalf("writes by the actual rule consumer produced %d rule inputs, want the original 2", len(events))
+	}
+	if n := f.Count(t, "SELECT count(*) FROM issue_wakeup_receipt WHERE wakeup_id=$1 AND processed_at IS NULL", w.ID); n != 0 {
+		t.Fatal("own rule edits left actionable receipts")
+	}
+	current, err := f.q.LocklessWakeup(ctx, w.ID)
+	if err != nil || !current.Enabled || current.PausedReason.Valid || current.FireCount != 2 {
+		t.Fatalf("self acknowledgement changed the enabled rule or fire count: %+v %v", current, err)
 	}
 }

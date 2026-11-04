@@ -59,15 +59,72 @@ func (b *cursorBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 	closeStdin := func() { closeStdinOnce.Do(func() { _ = stdin.Close() }) }
 	stderrBuf := newStderrTail(newLogWriter(b.cfg.Logger, "[cursor:stderr] "), agentStderrTailBytes)
 	cmd.Stderr = stderrBuf
+	msgCh := make(chan Message, 256)
+	resCh := make(chan Result, 1)
+	var persistenceMu sync.Mutex
+	var establishedSessionID string
+	var sessionPersistenceError error
+	persistenceFinished := false
+	persistenceDone := make(chan struct{})
+	persistSession := func(sid string) error {
+		if sid == "" {
+			select {
+			case <-persistenceDone:
+			case <-runCtx.Done():
+				return fmt.Errorf("cursor provider session identity unavailable before hook boundary: %w", runCtx.Err())
+			}
+		}
+		persistenceMu.Lock()
+		defer persistenceMu.Unlock()
+		if persistenceFinished {
+			return context.Canceled
+		}
+		if sessionPersistenceError != nil {
+			return sessionPersistenceError
+		}
+		if sid == "" {
+			return nil
+		}
+		if (establishedSessionID != "" && establishedSessionID != sid) || (opts.StrictSessionResume && opts.ResumeSessionID != "" && opts.ResumeSessionID != sid) {
+			sessionPersistenceError = fmt.Errorf("cursor persistent session identity changed; refusing replacement")
+			cancel()
+			return sessionPersistenceError
+		}
+		if establishedSessionID != "" {
+			return nil
+		}
+		establishedSessionID = sid
+		if err := opts.PersistSession(runCtx, sid); err != nil {
+			sessionPersistenceError = fmt.Errorf("cursor persist provider session: %w", err)
+			close(persistenceDone)
+			cancel()
+			return sessionPersistenceError
+		}
+		close(persistenceDone)
+		select {
+		case msgCh <- Message{Type: MessageStatus, Status: "running", SessionID: sid}:
+			return nil
+		case <-runCtx.Done():
+			return runCtx.Err()
+		}
+	}
 
 	var supplements *cursorSupplementSession
 	var supplementErr error
 	if opts.EnableTaskSupplement {
 		supplements, supplementErr = startCursorSupplementSession(runCtx, opts.Cwd, opts.CursorHookCommand, b.cfg.Logger)
 		if supplementErr != nil {
+			if opts.StrictSessionResume {
+				closeStdin()
+				cancel()
+				return nil, fmt.Errorf("cursor persistent issue session live delivery unavailable: %w", supplementErr)
+			}
 			b.cfg.Logger.Warn("cursor additional messages unavailable for this run", "error", supplementErr)
 			supplements = nil
 		} else {
+			if opts.PersistSession != nil {
+				supplements.persistSession = persistSession
+			}
 			cmd.Env = append(cmd.Env, supplements.env()...)
 			prompt += supplements.promptNote()
 		}
@@ -82,8 +139,6 @@ func (b *cursorBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 
 	b.cfg.Logger.Info("cursor-agent started", "pid", cmd.Process.Pid, "cwd", opts.Cwd, "model", opts.Model)
 
-	msgCh := make(chan Message, 256)
-	resCh := make(chan Result, 1)
 	background := newCursorBackgroundTools(runCtx, cmd, msgCh, b.cfg.Logger)
 
 	// The prompt is delivered on stdin (see buildCursorArgs). Write it from its
@@ -123,6 +178,7 @@ func (b *cursorBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 		finalStatus := "completed"
 		var finalError string
 		var protocolError string
+		var persistentSessionError string
 		resultSeen := false
 		resultIsError := false
 		resultBytes := 0
@@ -175,8 +231,30 @@ func (b *cursorBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 			lastEventType = observedCursorEventType(evt.Type)
 
 			if sid := evt.readSessionID(); sid != "" {
+				if opts.StrictSessionResume && opts.ResumeSessionID != "" && sid != opts.ResumeSessionID {
+					persistentSessionError = "cursor persistent session identity changed; refusing replacement"
+					cancel()
+					break scanLoop
+				}
+				if opts.PersistSession != nil {
+					if err := persistSession(sid); err != nil {
+						break scanLoop
+					}
+				}
 				sessionID = sid
 				supplements.activate(sid)
+			}
+			if opts.PersistSession != nil && (evt.Type == "assistant" || evt.Type == "tool_call" || evt.Type == "thinking" || evt.Type == "result") {
+				persistenceMu.Lock()
+				missingIdentity := establishedSessionID == ""
+				if missingIdentity {
+					sessionPersistenceError = fmt.Errorf("cursor provider session identity unavailable before model output")
+				}
+				persistenceMu.Unlock()
+				if missingIdentity {
+					cancel()
+					break scanLoop
+				}
 			}
 
 			switch evt.Type {
@@ -185,7 +263,7 @@ func (b *cursorBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 					background.Reap()
 				}
 				if evt.Subtype == "init" {
-					trySend(msgCh, Message{Type: MessageStatus, Status: "running"})
+					trySend(msgCh, Message{Type: MessageStatus, Status: "running", SessionID: sessionID})
 				}
 				if evt.Subtype == "error" {
 					errMsg := cursorErrorText(&evt)
@@ -411,6 +489,22 @@ func (b *cursorBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 			}
 		}
 
+		if persistentSessionError != "" {
+			finalStatus = "failed"
+			finalError = persistentSessionError
+			sessionID = opts.ResumeSessionID
+		}
+		if opts.PersistSession != nil {
+			persistenceMu.Lock()
+			persistenceFinished = true
+			if establishedSessionID != "" {
+				sessionID = establishedSessionID
+			}
+			if sessionPersistenceError != nil {
+				finalStatus, finalError = "failed", sessionPersistenceError.Error()
+			}
+			persistenceMu.Unlock()
+		}
 		if finalError != "" {
 			finalError = sanitizeAgentDiagnostic(finalError)
 		}

@@ -6953,7 +6953,7 @@ func sessionHomeReachable(provider string, env *execenv.Environment, envReused b
 // function reads — the env-root provenance and the workdir task-context marker
 // — are written at Prepare time, so neither depends on completion ordering.
 func shouldReusePriorWorkdir(task Task, localAssignment *localDirectoryAssignment, workspacesRoot string) (string, bool) {
-	if task.PriorWorkDir == "" || localAssignment != nil {
+	if task.PriorWorkDir == "" || (localAssignment != nil && task.IssueAgentSessionID == "") {
 		return "", false
 	}
 
@@ -6972,6 +6972,9 @@ func shouldReusePriorWorkdir(task Task, localAssignment *localDirectoryAssignmen
 	info, err := os.Stat(workdir)
 	if err != nil || !info.IsDir() {
 		return "", false
+	}
+	if task.IssueAgentSessionID != "" {
+		return workdir, issueSessionWorkdirOwned(task, root, workdir)
 	}
 	rel, err := filepath.Rel(root, workdir)
 	if err != nil || !filepath.IsLocal(rel) {
@@ -7410,7 +7413,7 @@ func (d *Daemon) lockReusablePriorEnvRoot(ctx context.Context, task Task, localA
 	if !ok {
 		return nil, "", nil, false, nil
 	}
-	priorRoot := filepath.Dir(workDir)
+	priorRoot := priorTaskEnvRoot(task, d.cfg.WorkspacesRoot, workDir)
 	// workDir came back through util.ResolveSymlinks, so the root it is
 	// measured against has to be resolved the same way — otherwise a symlinked
 	// workspaces root (macOS /tmp -> /private/tmp, a home on a linked volume,
@@ -7486,7 +7489,7 @@ func (d *Daemon) lockReusablePriorEnvRoot(ctx context.Context, task Task, localA
 	}
 	// ...and the directory we are about to hand to Reuse has to be that same
 	// one, so the object locked and the object used cannot diverge.
-	currentInfo, err := os.Stat(filepath.Dir(recheckedWorkDir))
+	currentInfo, err := os.Stat(priorTaskEnvRoot(task, d.cfg.WorkspacesRoot, recheckedWorkDir))
 	if err != nil || !os.SameFile(lockedInfo, currentInfo) {
 		d.logger.Info("prior workdir changed identity while being claimed; starting a fresh environment",
 			"task", task.ID)
@@ -7940,6 +7943,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	// Repos are passed as metadata only — the agent checks them out on demand
 	// via `multica repo checkout <url>`.
 	taskCtx := execenv.TaskContextForEnv{
+		IssueAgentSessionID: task.IssueAgentSessionID,
 		IssueID:             task.IssueID,
 		TriggerCommentID:    task.TriggerCommentID,
 		TriggerThreadID:     task.TriggerThreadID,
@@ -7999,6 +8003,11 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 			// between this task being queued behind its predecessor and mounting it.
 			d.markActiveStore(store)
 			defer d.unmarkActiveStore(store)
+			if task.IssueAgentSessionID != "" {
+				if err := pinIssueSessionStore(store, task.IssueAgentSessionID); err != nil {
+					return TaskResult{}, fmt.Errorf("pin issue session history: %w", err)
+				}
+			}
 
 			waitCtx, waitCancel := context.WithCancel(prepareCtx)
 			var cancelledByPoll <-chan struct{}
@@ -8036,8 +8045,8 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	d.markActiveEnvRoot(resolvedRoot)
 	defer d.unmarkActiveEnvRoot(resolvedRoot)
 	if task.PriorWorkDir != "" {
-		priorRoot := filepath.Dir(task.PriorWorkDir)
-		if priorRoot != resolvedRoot {
+		priorRoot := priorTaskEnvRoot(task, d.cfg.WorkspacesRoot, task.PriorWorkDir)
+		if priorRoot != resolvedRoot && priorRoot != "" {
 			d.markActiveEnvRoot(priorRoot)
 			defer d.unmarkActiveEnvRoot(priorRoot)
 		}
@@ -8259,6 +8268,11 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 			hermesSessionStore = store
 			d.markActiveStore(store)
 			defer d.unmarkActiveStore(store)
+			if task.IssueAgentSessionID != "" {
+				if err := pinIssueSessionStore(store, task.IssueAgentSessionID); err != nil {
+					return TaskResult{}, fmt.Errorf("pin issue session history: %w", err)
+				}
+			}
 		}
 	}
 	// Reasonix locates its user config from the environment (REASONIX_HOME, and
@@ -8296,6 +8310,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 			// PriorWorkDir instead would re-resolve it, so the directory we
 			// locked and the directory we use could differ.
 			WorkDir:               priorWorkDir,
+			EnvRoot:               priorTaskEnvRoot(task, d.cfg.WorkspacesRoot, priorWorkDir),
 			Provider:              provider,
 			CodexVersion:          codexVersion,
 			ResumeSessionID:       task.PriorSessionID,
@@ -8322,7 +8337,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		// into "declined and started clean". See lockReusablePriorEnvRoot for
 		// what remains uncovered.
 		if env != nil && lockedPriorInfo != nil {
-			usedInfo, statErr := os.Stat(filepath.Dir(env.WorkDir))
+			usedInfo, statErr := os.Stat(priorTaskEnvRoot(task, d.cfg.WorkspacesRoot, env.WorkDir))
 			if statErr != nil || !os.SameFile(lockedPriorInfo, usedInfo) {
 				// No "task" field here: taskLog already carries the full id.
 				taskLog.Info("reused workdir is not the directory that was claimed; starting a fresh environment")
@@ -8333,6 +8348,9 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		// Whether it did decides whether an env-root-scoped session store — the
 		// Hermes overlay's task-local state.db — carried over from the prior task.
 		envReused = env != nil
+	}
+	if env == nil && task.IssueAgentSessionID != "" && task.PriorWorkDir != "" {
+		return TaskResult{}, errors.New("persistent issue session working directory is unavailable; restore the session before retrying")
 	}
 	if env == nil {
 		var err error
@@ -8440,6 +8458,22 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		}
 	}
 	phaseRecorder.Mark(taskPhaseEnvironmentReady)
+	if task.IssueAgentSessionID != "" {
+		defer func() {
+			if taskResult.WorkDir == "" {
+				taskResult.WorkDir = env.WorkDir
+			}
+			if taskResult.EnvRoot == "" {
+				taskResult.EnvRoot = env.RootDir
+			}
+			if taskResult.SessionID == "" {
+				taskResult.SessionID = task.PriorSessionID
+			}
+			if env.LocalWorktree != nil {
+				taskResult.BranchName = env.LocalWorktree.Branch
+			}
+		}()
+	}
 	// Belt-and-suspenders: also mark whatever root we ended up with, in case
 	// future changes diverge from ResolveRootDir.
 	if env.RootDir != resolvedRoot && env.RootDir != "" {
@@ -8456,7 +8490,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	// In-place local_directory runs never enter this block: their WorkDir is
 	// already durable, so DurableWorkDir deliberately stays absent instead of
 	// duplicating the same path under two lifecycle meanings.
-	if env.LocalWorktree != nil {
+	if env.LocalWorktree != nil && task.IssueAgentSessionID == "" {
 		defer func() {
 			if taskResult.WorkDir == "" {
 				taskResult.WorkDir = env.WorkDir
@@ -8529,7 +8563,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	// this pass Finalize would auto-commit the sidecars Prepare just wrote and
 	// deliver a branch whose only content is Multica's own runtime files — or,
 	// in place, leave them behind in the user's tree.
-	if env.LocalDirectory || env.LocalWorktree != nil {
+	if (env.LocalDirectory || env.LocalWorktree != nil) && task.IssueAgentSessionID == "" {
 		defer func() {
 			if taskResult.FailureReason == taskfailure.ReasonProcessCleanupUnconfirmed.String() {
 				return // Preserve files that an unconfirmed process may still use.
@@ -8609,6 +8643,12 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	if supplementSupported && provider == "cursor" {
 		cursorHookCommand, supplementSupported = cursorSupplementHookCommand(env)
 	}
+	if task.IssueAgentSessionID != "" && !supplementSupported {
+		return TaskResult{}, fmt.Errorf("provider %s does not support live issue session events; update the provider or select a supported runtime", provider)
+	}
+	if task.IssueAgentSessionID != "" {
+		taskCapabilities = append(taskCapabilities, protocol.DaemonCapabilityIssueSessionEventsV1)
+	}
 	if supplementSupported {
 		taskCapabilities = append(taskCapabilities, protocol.DaemonCapabilityTaskSupplementV1)
 	}
@@ -8616,6 +8656,9 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	if err != nil {
 		stopPrepareLease()
 		return TaskResult{}, fmt.Errorf("start task failed: %w", err)
+	}
+	if task.IssueAgentSessionID != "" && !taskSupplementNegotiated {
+		return TaskResult{}, errors.New("server did not negotiate live issue session events")
 	}
 	if taskSupplementNegotiated {
 		// Register before provider launch so a hint cannot arrive in the gap
@@ -8641,6 +8684,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	claudeResumeReady := provider == "claude" && migrateClaudeWorktreeTranscript(
 		env, task.PriorSessionID, env.WorkDir, task.PriorWorkDir, sanitizeAgentEnv(agentEnvOverrides), taskLog,
 	)
+	expectedPersistentSession := task.PriorSessionID
 	resumeReachable := gateResumeToReachableSession(
 		&task, &taskCtx, provider, env.WorkDir,
 		sessionHomeReachable(provider, env, envReused),
@@ -8656,6 +8700,10 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	// conversation Codex will silently restart from scratch.
 	if resumeReachable {
 		gateCodexResumeToRolloutPresence(&task, &taskCtx, provider, env.CodexHome, taskLog)
+	}
+
+	if task.IssueAgentSessionID != "" && (task.PriorSessionResumeUnavailable || (expectedPersistentSession != "" && task.PriorSessionID != expectedPersistentSession)) {
+		return TaskResult{}, errors.New("persistent issue session history is unavailable; restore it before retrying")
 	}
 
 	// Build the runtime brief and inject it into the provider-specific
@@ -8676,14 +8724,14 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	// edits since the previous turn collided with the branch's own work. The
 	// conflict is deliberately left in place for the agent to resolve, so the
 	// prompt has to be the thing that tells it (MUL-6881).
-	if env.LocalWorktree != nil && len(env.LocalWorktree.ReplayConflicts) > 0 {
+	if env.LocalWorktree != nil && task.IssueAgentSessionID == "" && len(env.LocalWorktree.ReplayConflicts) > 0 {
 		promptOptions = append(promptOptions, WithWorktreeReplayConflicts(env.LocalWorktree.ReplayConflicts))
 	}
 	// And it delivers only what ends on its own branch, still containing the
 	// commit it started from. Say so up front: squashing or switching to a PR
 	// branch is ordinary git hygiene the agent would otherwise reach for, and
 	// the daemon cannot record either (#9404).
-	if env.LocalWorktree != nil {
+	if env.LocalWorktree != nil && task.IssueAgentSessionID == "" {
 		promptOptions = append(promptOptions, WithWorktreeBranch(env.LocalWorktree.Branch, env.LocalWorktree.BaseCommit))
 		// The branch block's rule for uncommitted files has one exception,
 		// decided by the same predicate Finalize uses (#9788 review).
@@ -8691,7 +8739,10 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 			promptOptions = append(promptOptions, WithWorktreeCommitsAllLeftovers())
 		}
 	}
-	prompt := BuildPrompt(task, provider, promptOptions...)
+	prompt := issueSessionPrompt(task, BuildPrompt(task, provider, promptOptions...))
+	if task.IssueAgentSessionID != "" {
+		ctx = context.WithValue(ctx, issueSessionTransportKey{}, issueSessionTransport{SessionID: task.IssueAgentSessionID, Initial: task.IssueSessionEvents, AckedInitial: &atomic.Int32{}})
+	}
 
 	// Pass task-scoped auth credentials and context so the spawned agent CLI
 	// can call the Multica API and the local daemon (e.g. `multica repo checkout`).
@@ -8932,6 +8983,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	}
 	execOpts := agent.ExecOptions{
 		EnableTaskSupplement:       taskSupplementNegotiated,
+		StrictSessionResume:        task.IssueAgentSessionID != "",
 		CursorHookCommand:          cursorHookCommand,
 		Cwd:                        env.WorkDir,
 		PiSkillPaths:               env.PiSkillPaths,
@@ -9057,7 +9109,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	defer stopUsageFlush()
 	result, tools, err := d.executeAndDrain(ctx, backend, prompt, execOpts, taskLog, task.ID, env.CodexHome, &msgSeq)
 	if err != nil {
-		return TaskResult{}, err
+		return TaskResult{SessionID: result.SessionID, WorkDir: env.WorkDir, EnvRoot: env.RootDir}, err
 	}
 	if result.Status == "cleanup_unconfirmed" {
 		if env.LocalWorktree != nil {
@@ -9065,7 +9117,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		}
 	}
 
-	if shouldRetryWithFreshSession(result, task.PriorSessionID, tools, provider) {
+	if task.IssueAgentSessionID == "" && shouldRetryWithFreshSession(result, task.PriorSessionID, tools, provider) {
 		firstResult := result
 		firstUsage := result.Usage
 		firstTools := tools
@@ -9130,7 +9182,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	// branch — give it one turn to put the work back before failing the task
 	// (#9404). The delivery guard itself is untouched: the repaired state must
 	// pass the very same check in Finalize.
-	if env.LocalWorktree != nil && result.Status == "completed" {
+	if env.LocalWorktree != nil && task.IssueAgentSessionID == "" && result.Status == "completed" {
 		if problem := env.LocalWorktree.CheckDelivery(); problem != nil {
 			result, tools = d.repairWorktreeDelivery(ctx, backend, execOpts, result, tools, problem, env, taskLog, task.ID, &msgSeq)
 		}
@@ -9141,7 +9193,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	// silence resumed a session the runtime cannot drive. Retire it so the
 	// next trigger starts fresh instead of re-entering the same hang; the
 	// cancel-ack (or the fail callback on daemon shutdown) carries it.
-	if retiredSessionID == "" {
+	if retiredSessionID == "" && task.IssueAgentSessionID == "" {
 		silent, wasSilent := outputObserver.silentFor()
 		if shouldRetireSilentResume(result.Status, task.PriorSessionID, silent, wasSilent) {
 			taskLog.Warn("resumed session produced no output before cancellation; retiring it so the next run starts fresh",
@@ -9166,6 +9218,13 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		"agent_error", result.Error,
 	)
 
+	if task.IssueAgentSessionID != "" && result.Status == "completed" && result.SessionID == "" && task.PriorSessionID == "" {
+		return TaskResult{}, errors.New("provider did not return a persistent issue session ID")
+	}
+	if task.IssueAgentSessionID != "" && task.PriorSessionID != "" && result.SessionID != "" && result.SessionID != task.PriorSessionID {
+		return TaskResult{}, errors.New("provider replaced the persistent issue session; refusing to continue with a different conversation")
+	}
+
 	// Convert agent usage map to task usage entries. Same conversion the live
 	// flush above uses, so both reports write the same rows.
 	usageEntries := taskUsageEntries(provider, result.Usage)
@@ -9184,6 +9243,9 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	if result.SessionID != "" && !codexSessionResumable(env.CodexHome, result.SessionID, codexRolloutFlushWait) {
 		taskLog.Warn("codex session rollout not present in task CODEX_HOME; withholding resume pointer and flagging continuity gap",
 			"session_id", result.SessionID, "codex_home", env.CodexHome, "status", result.Status)
+		if task.IssueAgentSessionID != "" {
+			return TaskResult{SessionID: result.SessionID}, errors.New("persistent issue session transcript was not saved; restore it before retrying")
+		}
 		result.SessionID = ""
 		sessionRolloutMissing = true
 	}
@@ -9758,6 +9820,52 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 	// drain, leaving the subprocess running.
 	agentCtx, agentCancel := context.WithCancel(ctx)
 	defer agentCancel()
+	transport, issueSession := ctx.Value(issueSessionTransportKey{}).(issueSessionTransport)
+	if issueSession {
+		pinReady := make(chan struct{})
+		transport.PinReady = pinReady
+		var pinMu sync.Mutex
+		var establishedSessionID, pinnedSessionID string
+		var pinErr error
+		opts.PersistSession = func(_ context.Context, sessionID string) error {
+			pinMu.Lock()
+			defer pinMu.Unlock()
+			if pinErr != nil {
+				return pinErr
+			}
+			if sessionID == "" || (opts.ResumeSessionID != "" && sessionID != opts.ResumeSessionID) || (pinnedSessionID != "" && sessionID != pinnedSessionID) {
+				pinErr = errors.New("provider attempted to replace the persistent issue session identity")
+				agentCancel()
+				return pinErr
+			}
+			establishedSessionID = sessionID
+			if pinnedSessionID == sessionID {
+				return nil
+			}
+			pinCtx, cancelPin := context.WithTimeout(context.WithoutCancel(ctx), taskSupplementAckTimeout)
+			defer cancelPin()
+			if err := d.client.pinIssueTaskSession(pinCtx, taskID, sessionID, opts.Cwd); err != nil {
+				pinErr = fmt.Errorf("persistent issue session identity could not be durably saved: %w", err)
+				agentCancel()
+				return pinErr
+			}
+			pinnedSessionID = sessionID
+			close(pinReady)
+			return nil
+		}
+		defer func() {
+			pinMu.Lock()
+			defer pinMu.Unlock()
+			if finalResult.SessionID == "" {
+				finalResult.SessionID = establishedSessionID
+			}
+			if pinErr != nil {
+				finalErr = pinErr
+			} else if finalResult.Status == "completed" && pinnedSessionID == "" {
+				finalErr = errors.New("provider completed without durably saving the persistent issue session identity")
+			}
+		}()
+	}
 
 	session, err := backend.Execute(agentCtx, prompt, opts)
 	if err != nil {
@@ -9778,20 +9886,41 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 	outputObserver.begin()
 	taskLog.Debug("backend started, draining messages")
 
+	if issueSession && (session.Supplement == nil || session.SupplementReady == nil) {
+		agentCancel()
+		defer func() { finalErr = errors.New("provider started without live issue session event support") }()
+	}
+
 	// Only negotiated sessions may claim additions. Stop and join delivery
 	// before the caller reports the task's terminal state to the server.
 	if opts.EnableTaskSupplement && session.Supplement != nil && session.SupplementReady != nil {
 		supplementCtx, cancelSupplements := context.WithCancel(agentCtx)
 		supplementsDone := make(chan struct{})
 		wakeup, unsubscribe := d.taskSupplementSignals.subscribe(taskID)
+		var transportErr error
 		go func() {
 			defer unsubscribe()
 			defer close(supplementsDone)
-			d.runTaskSupplementLoop(supplementCtx, session, taskID, wakeup, taskLog)
+			if issueSession {
+				transportErr = d.runIssueSessionLoop(supplementCtx, session, taskID, transport, wakeup, taskLog)
+				if transportErr != nil {
+					agentCancel()
+				}
+			} else {
+				d.runTaskSupplementLoop(supplementCtx, session, taskID, wakeup, taskLog)
+			}
 		}()
 		defer func() {
 			cancelSupplements()
 			<-supplementsDone
+			// A fast turn can complete before the first live-ready poll. Its
+			// successful result still proves receipt of the initial prompt.
+			if issueSession && transportErr == nil && finalResult.Status == "completed" {
+				transportErr = d.ackIssueSessionInitial(ctx, taskID, transport)
+			}
+			if transportErr != nil {
+				finalErr = transportErr
+			}
 		}()
 	}
 
@@ -10025,7 +10154,7 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 					// preserved), while a session whose rollout never lands is never
 					// pinned. The terminal report is the authoritative writer.
 					// Non-Codex providers (codexHome == "") pin immediately.
-					if msg.SessionID != "" && !sessionPinned.Swap(true) {
+					if !issueSession && msg.SessionID != "" && !sessionPinned.Swap(true) {
 						sid := msg.SessionID
 						wd := opts.Cwd
 						go func() {
@@ -10676,6 +10805,9 @@ func (d *Daemon) reserveStoreForDeletion(store string) (commit func(), ok bool) 
 	d.activeStoresMu.Lock()
 	defer d.activeStoresMu.Unlock()
 	if d.activeStores[store] > 0 || d.deletingStores[store] {
+		return nil, false
+	}
+	if _, err := os.Stat(filepath.Join(store, issueSessionStoreMarker)); err == nil {
 		return nil, false
 	}
 	d.deletingStores[store] = true

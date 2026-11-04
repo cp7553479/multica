@@ -322,6 +322,10 @@ func (d *Daemon) gcWorkspaceIssues(ctx context.Context, workspaceID string, cand
 // atomically reserves the env root because a task can start while the server
 // reconciliation request is in flight.
 func (d *Daemon) applyGCAction(ctx context.Context, taskDir string, action gcAction, stats *gcStats) int {
+	if persistentIssueSessionEnv(taskDir) {
+		stats.skipped++
+		return 0
+	}
 	if action != gcActionSkip {
 		if _, err := d.gcTaskDirOwner(taskDir); err != nil {
 			d.logger.Warn("gc: refusing to mutate unowned task directory", "dir", taskDir, "error", err)

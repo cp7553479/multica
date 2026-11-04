@@ -44,13 +44,22 @@ func TestIssueCloseStopsWakeupsInApplication(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			pending := dbfx.Task(t, agent, testutil.Cols{"issue_id": issue, "runtime_id": testRuntimeID, "context": `{"wakeup_id":"` + uuidToString(w.ID) + `"}`})
+			if err := svc.Trigger(ctx, parseUUID(issue), w.ID, parseUUID(testUserID)); err != nil {
+				t.Fatal(err)
+			}
+			var pending, event string
+			dbfx.QueryRow(t, `SELECT s.active_task_id,e.id FROM issue_agent_session s
+                JOIN issue_agent_event e ON e.session_id=s.id WHERE s.issue_id=$1
+                AND e.kind='wakeup.fired' AND e.payload->>'wakeup_id'=$2`, issue, uuidToString(w.ID)).Scan(&pending, &event)
 			tc.close(t, issue)
 			if n := dbfx.Count(t, "SELECT count(*) FROM issue_wakeup WHERE id=$1 AND NOT enabled AND disabled_at IS NOT NULL", w.ID); n != 1 {
 				t.Fatal("closed issue kept its wakeup")
 			}
 			var status, reason string
 			dbfx.QueryRow(t, "SELECT status,error FROM agent_task_queue WHERE id=$1", pending).Scan(&status, &reason)
+			if n := dbfx.Count(t, "SELECT count(*) FROM issue_agent_event WHERE id=$1 AND status='ignored' AND failure_reason='issue_closed'", event); n != 1 {
+				t.Fatal("closed issue retained a pending rule event")
+			}
 			if status != "cancelled" || reason != "Issue closed; wakeup disabled" {
 				t.Fatalf("unstarted wakeup run = %s (%s)", status, reason)
 			}

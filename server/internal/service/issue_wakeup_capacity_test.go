@@ -16,7 +16,7 @@ import (
 )
 
 func TestIssueWakeupBusyRuleDoesNotBlockOtherWorkspace(t *testing.T) {
-	for _, lock := range []string{"issue", "rule", "task", "workspace"} {
+	for _, lock := range []string{"issue", "rule", "session", "workspace"} {
 		t.Run(lock, func(t *testing.T) {
 			f, s, issue, agent := wakeFixture(t)
 			other, _, otherIssue, otherAgent := wakeFixture(t)
@@ -39,12 +39,9 @@ func TestIssueWakeupBusyRuleDoesNotBlockOtherWorkspace(t *testing.T) {
 				sql, key = "SELECT id FROM issue WHERE id=$1 FOR NO KEY UPDATE", issue
 			case "rule":
 				sql, key = "SELECT id FROM issue_wakeup WHERE id=$1 FOR UPDATE", first.ID
-			case "task":
-				task, err := f.q.FindPendingWakeupTask(context.Background(), util.UUIDToString(first.ID))
-				if err != nil {
-					t.Fatal(err)
-				}
-				sql, key = "SELECT id FROM agent_task_queue WHERE id=$1 FOR UPDATE", task.ID
+			case "session":
+				session := wakeupTargetSession(t, f, issue, agent)
+				sql, key = "SELECT id FROM issue_agent_session WHERE id=$1 FOR UPDATE", session.ID
 			case "workspace":
 				sql, key = "SELECT id FROM workspace WHERE id=$1 FOR UPDATE", f.WorkspaceID
 			}
@@ -59,7 +56,7 @@ func TestIssueWakeupBusyRuleDoesNotBlockOtherWorkspace(t *testing.T) {
 			if ctx.Err() != nil {
 				t.Fatal("busy rule consumed batch deadline")
 			}
-			if got := other.Count(t, "SELECT count(*) FROM agent_task_queue WHERE context->>'wakeup_id'=$1", util.UUIDToString(second.ID)); got != 1 {
+			if got := len(wakeupInbox(t, other, second.ID)); got != 1 {
 				t.Fatalf("unrelated rule not dispatched: %d", got)
 			}
 			if got := f.Count(t, "SELECT count(*) FROM issue_wakeup_receipt WHERE wakeup_id=$1 AND processed_at IS NULL", first.ID); got != 1 {
@@ -111,12 +108,13 @@ func TestIssueWakeupPendingEventsAreBoundedAndLegacyInputsDrain(t *testing.T) {
 		t.Fatalf("lost burst summary: %s", payload)
 	}
 	wakeDispatch(t, s, w)
-	task, err := f.q.FindPendingWakeupTask(context.Background(), util.UUIDToString(w.ID))
-	if err != nil {
-		t.Fatal(err)
+	inputs := wakeupInbox(t, f, w.ID)
+	if len(inputs) != 1 || !strings.Contains(string(inputs[0].Payload), last) || !strings.Contains(string(inputs[0].Payload), "legacy-reference") || !strings.Contains(string(inputs[0].Payload), strings.TrimSpace(wakeupOmittedEvidence)) {
+		t.Fatalf("missing durable evidence or state-read instruction: %+v", inputs)
 	}
-	if !strings.Contains(task.HandoffNote.String, last) || !strings.Contains(task.HandoffNote.String, "legacy-reference") || !strings.Contains(task.HandoffNote.String, wakeupOmittedEvidence) {
-		t.Fatal("missing evidence or state-read instruction")
+	task := wakeupSessionTask(t, f, issue, agent)
+	if claimed := wakeupClaimEvents(t, f, s, task, 32); len(claimed) != 1 || claimed[0].ID != inputs[0].ID {
+		t.Fatalf("bounded summary was not deliverable: %+v", claimed)
 	}
 	f.Comment(t, util.UUIDToString(issue), "after consumption")
 	if got := f.Count(t, "SELECT count(*) FROM issue_wakeup_receipt WHERE wakeup_id=$1 AND processed_at IS NULL", w.ID); got != 1 {
@@ -281,11 +279,8 @@ func TestIssueWakeupLegacyConsumerCannotConsumeUnseenMerge(t *testing.T) {
 		t.Fatalf("old consumer lost new evidence: %d", got)
 	}
 	wakeDispatch(t, s, w)
-	task, err := f.q.FindPendingWakeupTask(ctx, util.UUIDToString(w.ID))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(task.HandoffNote.String, latest) {
-		t.Fatal("new dispatcher lost merged reference")
+	inputs := wakeupInbox(t, f, w.ID)
+	if len(inputs) != 1 || !strings.Contains(string(inputs[0].Payload), latest) {
+		t.Fatalf("new dispatcher lost merged reference: %+v", inputs)
 	}
 }

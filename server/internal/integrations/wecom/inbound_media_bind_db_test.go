@@ -188,7 +188,7 @@ func (*bindTestTasks) MemberMayInvokeAgent(context.Context, pgtype.UUID, pgtype.
 	return true, nil
 }
 
-func (*bindTestTasks) PromoteDeferredChannelIssueTask(context.Context, pgtype.UUID) error {
+func (*bindTestTasks) ReleaseIssueAgentSession(context.Context, pgtype.UUID) error {
 	return nil
 }
 

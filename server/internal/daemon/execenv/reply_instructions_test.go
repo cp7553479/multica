@@ -94,7 +94,7 @@ func TestBuildCommentReplyInstructionsNonCodexLinux(t *testing.T) {
 					"#4182",
 					"Keep the `&&`",
 					"do NOT reuse --parent values from previous turns",
-					"Post your reply as a comment",
+					"Choose whether this event needs a public response",
 				} {
 					if !strings.Contains(got, want) {
 						t.Errorf("%s reply instructions missing %q\n---\n%s", name, want, got)
@@ -215,9 +215,9 @@ func TestInjectRuntimeConfigKeepsTriggerCommentOutOfBrief(t *testing.T) {
 		// halves — a compression that drops either delivery case must fail
 		// here.
 		"**Every issue turn runs the same workflow.**",
-		"with the `--parent` value it gives you for THIS turn",
-		"never one from an earlier turn",
-		"With no triggering comment, post a new top-level comment",
+		"publish a top-level comment",
+		"reply to a specific comment",
+		"No comment is required merely because a turn ended",
 		// The no-write default that makes the un-routed workflow safe: a
 		// turn that moved nothing writes nothing (MUL-6300 → MUL-6417).
 		"questions, discussion, and acknowledgements never touch status",
@@ -334,27 +334,19 @@ func TestInjectRuntimeConfigWindowsAssignmentBriefStaysFileOnly(t *testing.T) {
 	}
 }
 
-// TestBuildCommentReplyInstructionsSquadLeaderCarveOut pins that the squad
-// leader variant scopes the reply imperative with the `no_action` exception
-// (MUL-5442 #6493 review): the leader's only silent path must not be
-// contradicted by a later unconditional "Post your reply" line, and the
-// ordinary variant must never carry the leader carve-out.
-func TestBuildCommentReplyInstructionsSquadLeaderCarveOut(t *testing.T) {
-	t.Parallel()
-
-	leader := BuildCommentReplyInstructions("claude", "issue-1", "comment-1", true)
-	if !strings.Contains(leader, "Unless your outcome is `no_action`, post your reply as a comment") {
-		t.Errorf("leader reply instructions missing the no_action carve-out\n---\n%s", leader)
-	}
-	if strings.Contains(leader, "Post your reply as a comment") {
-		t.Errorf("leader reply instructions still carry the unconditional imperative\n---\n%s", leader)
-	}
-
-	ordinary := BuildCommentReplyInstructions("claude", "issue-1", "comment-1", false)
-	if !strings.Contains(ordinary, "Post your reply as a comment") {
-		t.Errorf("ordinary reply instructions missing the imperative\n---\n%s", ordinary)
-	}
-	if strings.Contains(ordinary, "Unless your outcome is") {
-		t.Errorf("ordinary reply instructions leaked the leader carve-out\n---\n%s", ordinary)
+// Every role chooses its publication action independently of turn completion.
+func TestBuildCommentReplyInstructionsAllowsExplicitActionsForEveryRole(t *testing.T) {
+	for _, leader := range []bool{false, true} {
+		out := BuildCommentReplyInstructions("claude", "issue-1", "comment-1", leader)
+		for _, want := range []string{"Choose whether this event needs a public response", "omitting --parent", "multica issue update", "never posted automatically"} {
+			if !strings.Contains(out, want) {
+				t.Errorf("missing explicit output choice %q: %s", want, out)
+			}
+		}
+		for _, banned := range []string{"always use the trigger comment", "Post your reply as a comment", "Unless your outcome is"} {
+			if strings.Contains(out, banned) {
+				t.Errorf("retained forced publication %q: %s", banned, out)
+			}
+		}
 	}
 }

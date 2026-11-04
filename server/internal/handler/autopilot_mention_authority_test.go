@@ -170,7 +170,7 @@ func seedTaskOnIssue(t *testing.T, agentID, issueID, runtimeID string, originato
 	return taskID
 }
 
-// TestAutopilotCommentAuthority_KeysOnRunOriginator pins the post-MUL-6951 rule
+// TestAutopilotInvocationAuthority_KeysOnRunOriginator pins the post-MUL-6951 rule
 // for an autopilot run delegating mid-chain: the invoke gate keys on the run's own
 // originator — the human who armed the trigger — and nothing else. There is no
 // autopilot-shaped borrow path left, so the issue's provenance, the autopilot's
@@ -180,7 +180,7 @@ func seedTaskOnIssue(t *testing.T, agentID, issueID, runtimeID string, originato
 //
 // The negative cases that matter are therefore the two below: a human without
 // rights, and no human at all.
-func TestAutopilotCommentAuthority_KeysOnRunOriginator(t *testing.T) {
+func TestAutopilotInvocationAuthority_KeysOnRunOriginator(t *testing.T) {
 	if testHandler == nil || testPool == nil {
 		t.Skip("database not available")
 	}
@@ -189,35 +189,25 @@ func TestAutopilotCommentAuthority_KeysOnRunOriginator(t *testing.T) {
 	// agentID: private (default) agent owned by ownerID. plainMemberID: unrelated.
 	agentID, ownerID, plainMemberID := privateAgentTestFixture(t)
 
-	// mentionTriggersTarget runs the trigger compute the way the live comment paths
-	// do — with the originator resolved from the speaking run — and reports whether
-	// the private target fires.
-	mentionTriggersTarget := func(fx autopilotDelegationFixture, originatorUserID string) bool {
-		triggers, _ := testHandler.computeCommentAgentTriggers(
-			ctx, fx.Issue, fx.Comment.Content, nil, "agent", fx.LeaderAgentID,
-			commentTriggerComputeOptions{
-				ExcludeTriggerCommentID: fx.Comment.ID,
-				OriginatorUserID:        originatorUserID,
-			},
-		)
-		for _, tr := range triggers {
-			if uuidToString(tr.Agent.ID) == agentID {
-				return true
-			}
-		}
-		return false
+	// Session delivery uses the same run-originator gate as explicit assignment.
+	target, err := testHandler.Queries.GetAgent(ctx, parseUUID(agentID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mayInvokeTarget := func(fx autopilotDelegationFixture, originatorUserID string) bool {
+		return testHandler.canInvokeAgent(ctx, target, "agent", fx.LeaderAgentID, originatorUserID, testWorkspaceID)
 	}
 
 	t.Run("trigger owner owns the target -> triggers", func(t *testing.T) {
 		fx := newAutopilotDelegationFixture(t, agentID, ownerID, "autopilot")
-		if !mentionTriggersTarget(fx, ownerID) {
+		if !mayInvokeTarget(fx, ownerID) {
 			t.Fatal("an autopilot run carrying its trigger owner must reach a private agent that owner owns")
 		}
 	})
 
 	t.Run("trigger owner without invoke rights -> denied", func(t *testing.T) {
 		fx := newAutopilotDelegationFixture(t, agentID, plainMemberID, "autopilot")
-		if mentionTriggersTarget(fx, plainMemberID) {
+		if mayInvokeTarget(fx, plainMemberID) {
 			t.Fatal("a trigger owner with no invoke rights must not reach a private agent")
 		}
 	})
@@ -227,20 +217,15 @@ func TestAutopilotCommentAuthority_KeysOnRunOriginator(t *testing.T) {
 		// legacy row, or a broken originator chain N hops back) must be denied
 		// rather than fall back to any autopilot-derived identity.
 		fx := newAutopilotDelegationFixture(t, agentID, ownerID, "autopilot")
-		if mentionTriggersTarget(fx, "") {
+		if mayInvokeTarget(fx, "") {
 			t.Fatal("a run with no human originator must not reach a private agent")
 		}
 	})
 }
 
-// TestCreateComment_AutopilotLeaderMentionEnqueuesPrivateWorker is the MUL-4857
-// end-to-end: the autopilot-dispatched leader posts an @mention delegation on the
-// autopilot-created issue through the real HTTP CreateComment surface (X-Agent-ID
-// + X-Task-ID), and the mentioned DEFAULT-private worker is actually enqueued —
-// keyed on the autopilot creator's invoke rights, resolved from the request's
-// trusted X-Task-ID lineage. This exercises handler -> comment persistence ->
-// trigger -> enqueue, not just the compute function.
-func TestCreateComment_AutopilotLeaderMentionEnqueuesPrivateWorker(t *testing.T) {
+// Mentioning a private worker preserves the author's trusted task lineage,
+// but collaboration requires explicit assignment rather than a comment route.
+func TestCreateComment_AutopilotMentionDoesNotDispatchPrivateWorker(t *testing.T) {
 	if testHandler == nil || testPool == nil {
 		t.Skip("database not available")
 	}
@@ -272,25 +257,17 @@ func TestCreateComment_AutopilotLeaderMentionEnqueuesPrivateWorker(t *testing.T)
 	`, issueID, workerID).Scan(&workerTasks); err != nil {
 		t.Fatalf("count worker tasks: %v", err)
 	}
-	if workerTasks != 1 {
-		t.Fatalf("expected the private worker to be enqueued once via autopilot-creator authority, got %d queued tasks", workerTasks)
+	if workerTasks != 0 {
+		t.Fatalf("an @mention cannot dispatch a second agent; got %d worker tasks", workerTasks)
+	}
+	var sourceTaskID pgtype.UUID
+	if err := testPool.QueryRow(context.Background(), `SELECT source_task_id FROM comment WHERE issue_id=$1 ORDER BY created_at DESC LIMIT 1`, issueID).Scan(&sourceTaskID); err != nil {
+		t.Fatal(err)
+	}
+	if uuidToString(sourceTaskID) != fx.LeaderTaskID {
+		t.Fatalf("comment source = %q, want its authoring task %q", uuidToString(sourceTaskID), fx.LeaderTaskID)
 	}
 
-	// MUL-6951 consequence: the delegated run INHERITS the trigger owner as its
-	// originator (attribution's delegation rule copies the parent's human), so the
-	// authorization travels down the chain exactly as it does under a manual "run
-	// now". Under the previous design the parent had no originator to copy, so this
-	// row came out unattributed and the chain had to re-borrow at every hop.
-	var workerOriginator pgtype.UUID
-	if err := testPool.QueryRow(context.Background(), `
-		SELECT originator_user_id FROM agent_task_queue
-		WHERE issue_id = $1 AND agent_id = $2 AND status = 'queued'
-	`, issueID, workerID).Scan(&workerOriginator); err != nil {
-		t.Fatalf("read worker originator: %v", err)
-	}
-	if uuidToString(workerOriginator) != ownerID {
-		t.Fatalf("delegated worker originator = %q, want the trigger owner %q", uuidToString(workerOriginator), ownerID)
-	}
 }
 
 // nextWorkspaceIssueNumber advances and returns the test workspace's issue
@@ -358,75 +335,8 @@ func seedLeaderPlainComment(t *testing.T, issueID, leaderID, sourceTaskID string
 	return commentID
 }
 
-// TestReconcileCommentsOnCompletion_AutopilotDelegationRestoresAuthority is the
-// MUL-4857 must-fix #1 (review round 2): when the mentioned target was BUSY at
-// delegation time, the delegation is deferred to the target's completion
-// reconcile. That replay must restore the SAME autopilot-creator authority from
-// the comment's source_task_id — otherwise the unattributed autopilot chain's
-// follow-up is gate-denied again and the delegation is silently lost.
-func TestReconcileCommentsOnCompletion_AutopilotDelegationRestoresAuthority(t *testing.T) {
-	if testHandler == nil || testPool == nil {
-		t.Skip("database not available")
-	}
-	ctx := context.Background()
-	workerID, ownerID, plainMemberID := privateAgentTestFixture(t)
-
-	// followUps drives the reconcile: an autopilot delegation comment mentions the
-	// busy private worker, the worker's task then completes, and we count the
-	// follow-up tasks the completion reconcile enqueues for it.
-	followUps := func(t *testing.T, creatorUserID string) (string, int) {
-		fx := newAutopilotDelegationFixture(t, workerID, creatorUserID, "autopilot")
-		issueID := uuidToString(fx.Issue.ID)
-		workerTaskID := seedCompletedTaskOnIssueBefore(t, workerID, issueID, fx.RuntimeID)
-		// Simulate a claim race that registered an undelivered thread input.
-		dbfx.Exec(t, `UPDATE agent_task_queue SET coalesced_comment_ids=ARRAY[$2::uuid] WHERE id=$1`, workerTaskID, fx.Comment.ID)
-		workerTask, err := testHandler.Queries.GetAgentTask(ctx, util.MustParseUUID(workerTaskID))
-		if err != nil {
-			t.Fatalf("load worker task: %v", err)
-		}
-		testHandler.reconcileCommentsOnCompletion(ctx, &workerTask)
-		var queued int
-		if err := testPool.QueryRow(ctx, `
-			SELECT count(*) FROM agent_task_queue
-			WHERE issue_id = $1 AND agent_id = $2 AND status = 'queued'
-		`, issueID, workerID).Scan(&queued); err != nil {
-			t.Fatalf("count follow-ups: %v", err)
-		}
-		return issueID, queued
-	}
-
-	t.Run("trigger owner owns busy target -> one follow-up carrying that human", func(t *testing.T) {
-		issueID, queued := followUps(t, ownerID)
-		if queued != 1 {
-			t.Fatalf("expected exactly 1 reconcile follow-up for the freed worker, got %d", queued)
-		}
-		var originator pgtype.UUID
-		if err := testPool.QueryRow(ctx, `
-			SELECT originator_user_id FROM agent_task_queue
-			WHERE issue_id = $1 AND agent_id = $2 AND status = 'queued'
-		`, issueID, workerID).Scan(&originator); err != nil {
-			t.Fatalf("read follow-up originator: %v", err)
-		}
-		if uuidToString(originator) != ownerID {
-			t.Fatalf("reconcile follow-up originator = %q, want the trigger owner %q", uuidToString(originator), ownerID)
-		}
-	})
-
-	t.Run("trigger owner without rights -> no follow-up", func(t *testing.T) {
-		if _, queued := followUps(t, plainMemberID); queued != 0 {
-			t.Fatalf("a creator without invoke rights must not spawn a reconcile follow-up, got %d", queued)
-		}
-	})
-}
-
-// TestUpdateComment_AutopilotAuthorityReStampedToEditingTask is the MUL-4857
-// must-fix #2 (review round 2): an edit is a NEW action, so it must judge (and
-// persist) authority by the CURRENT editing task, not the comment's original
-// authoring task. A same-issue edit keeps the autopilot-creator authority; a
-// cross-issue edit re-stamps source_task_id to the EDITING task and still fails
-// closed (preview and save agree). Since MUL-6490 the lineage itself is always
-// persisted; what denies the cross-issue edit here is simply that the EDITING run
-// carries no human originator, so the gate has nobody to admit (MUL-6951).
+// Each edit records the task that actually wrote it, including cross-issue
+// writes. An older author's human identity cannot be borrowed by a later edit.
 func TestUpdateComment_AutopilotAuthorityReStampedToEditingTask(t *testing.T) {
 	if testHandler == nil || testPool == nil {
 		t.Skip("database not available")
@@ -458,14 +368,19 @@ func TestUpdateComment_AutopilotAuthorityReStampedToEditingTask(t *testing.T) {
 		return n
 	}
 
-	t.Run("same-issue edit keeps creator authority and triggers", func(t *testing.T) {
+	t.Run("same-issue edit records its authoring task without dispatching mentions", func(t *testing.T) {
 		fx := newAutopilotDelegationFixture(t, workerID, ownerID, "autopilot")
 		issueID := uuidToString(fx.Issue.ID)
 		commentID := seedLeaderPlainComment(t, issueID, fx.LeaderAgentID, fx.LeaderTaskID)
 		// Edit from the leader's own task on THIS autopilot issue.
 		editAddingMention(t, fx.LeaderTaskID, commentID, issueID, fx)
-		if got := countQueued(t, issueID); got != 1 {
-			t.Fatalf("same-issue edit should enqueue the private worker once, got %d", got)
+		if got := countQueued(t, issueID); got != 0 {
+			t.Fatalf("editing a mention cannot dispatch a second agent, got %d", got)
+		}
+		var sourceTaskID string
+		dbfx.QueryRow(t, "SELECT source_task_id FROM comment WHERE id=$1", commentID).Scan(&sourceTaskID)
+		if sourceTaskID != fx.LeaderTaskID {
+			t.Fatalf("edit source = %q, want %q", sourceTaskID, fx.LeaderTaskID)
 		}
 	})
 
@@ -496,98 +411,8 @@ func TestUpdateComment_AutopilotAuthorityReStampedToEditingTask(t *testing.T) {
 	})
 }
 
-// TestCreateComment_AutopilotWorkerResultWakesSquadLeader locks the accepted
-// behavior that the run's originator reaches the plain (non-@mention)
-// assigned-squad-leader fallback too, so a worker's result comment on the
-// autopilot issue can still wake the private squad leader and close the
-// leader -> worker -> leader loop under the autopilot chain.
-func TestCreateComment_AutopilotWorkerResultWakesSquadLeader(t *testing.T) {
-	if testHandler == nil || testPool == nil {
-		t.Skip("database not available")
-	}
-	ctx := context.Background()
-	runtimeID := handlerTestRuntimeID(t)
-
-	// Private squad leader owned by the autopilot creator; the worker is a distinct
-	// seeded agent so the leader self-trigger guard does not apply.
-	leaderID, ownerID, _ := privateAgentTestFixture(t)
-	var workerID string
-	if err := testPool.QueryRow(ctx, `
-		SELECT id FROM agent WHERE workspace_id = $1 AND id <> $2 ORDER BY created_at ASC LIMIT 1
-	`, testWorkspaceID, leaderID).Scan(&workerID); err != nil {
-		t.Fatalf("load worker agent: %v", err)
-	}
-
-	var autopilotID string
-	if err := testPool.QueryRow(ctx, `
-		INSERT INTO autopilot (workspace_id, title, assignee_id, execution_mode, created_by_type, created_by_id)
-		VALUES ($1, 'MUL-4857 squad', $2, 'create_issue', 'member', $3) RETURNING id
-	`, testWorkspaceID, leaderID, ownerID).Scan(&autopilotID); err != nil {
-		t.Fatalf("create autopilot: %v", err)
-	}
-	t.Cleanup(func() { testPool.Exec(context.Background(), `DELETE FROM autopilot WHERE id = $1`, autopilotID) })
-
-	var squadID string
-	if err := testPool.QueryRow(ctx, `
-		INSERT INTO squad (workspace_id, name, description, leader_id, creator_id)
-		VALUES ($1, 'MUL-4857 Squad', '', $2, $3) RETURNING id
-	`, testWorkspaceID, leaderID, ownerID).Scan(&squadID); err != nil {
-		t.Fatalf("create squad: %v", err)
-	}
-	t.Cleanup(func() { testPool.Exec(context.Background(), `DELETE FROM squad WHERE id = $1`, squadID) })
-
-	var issueID string
-	if err := testPool.QueryRow(ctx, `
-		INSERT INTO issue (workspace_id, creator_type, creator_id, title, assignee_type, assignee_id, number, origin_type, origin_id)
-		VALUES ($1, 'agent', $2, 'MUL-4857 squad issue', 'squad', $3, $4, 'autopilot', $5) RETURNING id
-	`, testWorkspaceID, leaderID, squadID, nextWorkspaceIssueNumber(t), autopilotID).Scan(&issueID); err != nil {
-		t.Fatalf("create squad issue: %v", err)
-	}
-	t.Cleanup(func() {
-		testPool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE issue_id = $1`, issueID)
-		testPool.Exec(context.Background(), `DELETE FROM comment WHERE issue_id = $1`, issueID)
-		testPool.Exec(context.Background(), `DELETE FROM issue WHERE id = $1`, issueID)
-	})
-
-	// The worker runs on this autopilot issue carrying the chain's human, which is
-	// what a delegated run inherits since MUL-6951.
-	workerTaskID := seedTaskOnIssue(t, workerID, issueID, runtimeID, ownerID)
-
-	// The worker posts a PLAIN result comment (no @mention) via HTTP.
-	w := httptest.NewRecorder()
-	r := newRequest("POST", "/api/issues/"+issueID+"/comments", map[string]any{
-		"content": "done — pushed the change",
-	})
-	r.Header.Set("X-Agent-ID", workerID)
-	r.Header.Set("X-Task-ID", workerTaskID)
-	r = withURLParam(r, "id", issueID)
-	testHandler.CreateComment(w, r)
-	if w.Code != http.StatusCreated {
-		t.Fatalf("worker result CreateComment: expected 201, got %d: %s", w.Code, w.Body.String())
-	}
-
-	var leaderTasks int
-	if err := testPool.QueryRow(ctx, `
-		SELECT count(*) FROM agent_task_queue
-		WHERE issue_id = $1 AND agent_id = $2 AND status = 'queued' AND is_leader_task = TRUE
-	`, issueID, leaderID).Scan(&leaderTasks); err != nil {
-		t.Fatalf("count leader tasks: %v", err)
-	}
-	if leaderTasks != 1 {
-		t.Fatalf("expected the private squad leader to be woken once via autopilot-creator authority, got %d", leaderTasks)
-	}
-}
-
-// TestUpdateComment_AdminEditOfAgentCommentClearsStaleLineage is the MUL-4857
-// must-fix (review round 3): a workspace admin may EDIT another author's comment,
-// but that manage right is NOT an invoke right over the author's private agents
-// (canInvokeAgent is deny-by-default for private agents — no admin bypass). When an
-// admin edits an autopilot Agent's comment to add a private @mention while the
-// target is busy, the immediate save is blocked on the admin's own member identity,
-// AND the persisted source_task_id MUST be cleared. Otherwise the deferred
-// completion-reconcile — which routes the comment under its ORIGINAL agent author on
-// the unattributed autopilot chain — would read the stale lineage and resurrect the
-// autopilot creator's authority once the target frees up.
+// An administrator's edit clears the agent task lineage. Management rights
+// do not make the edit an action by the original agent or its human originator.
 func TestUpdateComment_AdminEditOfAgentCommentClearsStaleLineage(t *testing.T) {
 	if testHandler == nil || testPool == nil {
 		t.Skip("database not available")
@@ -639,28 +464,13 @@ func TestUpdateComment_AdminEditOfAgentCommentClearsStaleLineage(t *testing.T) {
 		t.Fatalf("admin edit must be blocked immediately (no invoke right over a private agent); got %d queued", got)
 	}
 
-	// The stale autopilot lineage MUST be cleared so the deferred reconcile fails closed.
+	// A member edit must not retain the original agent's task authority.
 	var sourceTaskValid bool
 	if err := testPool.QueryRow(ctx, `SELECT source_task_id IS NOT NULL FROM comment WHERE id = $1`, commentID).Scan(&sourceTaskValid); err != nil {
 		t.Fatalf("read comment source_task_id: %v", err)
 	}
 	if sourceTaskValid {
-		t.Fatal("an admin edit of an agent comment must clear source_task_id so the deferred reconcile cannot borrow the original autopilot creator authority")
+		t.Fatal("a member edit must clear source_task_id rather than borrowing the original agent task authority")
 	}
 
-	// The busy worker now completes: the completion reconcile routes the comment
-	// under its original agent author (unattributed autopilot chain). With the
-	// lineage cleared it must NOT resurrect the creator authority or enqueue a
-	// follow-up. (Without the fix this reconcile would enqueue exactly one.)
-	workerTaskID := seedCompletedTaskOnIssueBefore(t, workerID, issueID, fx.RuntimeID)
-	// Simulate a claim race that registered an undelivered thread input.
-	dbfx.Exec(t, `UPDATE agent_task_queue SET coalesced_comment_ids=ARRAY[$2::uuid] WHERE id=$1`, workerTaskID, fx.Comment.ID)
-	workerTask, err := testHandler.Queries.GetAgentTask(ctx, util.MustParseUUID(workerTaskID))
-	if err != nil {
-		t.Fatalf("load worker task: %v", err)
-	}
-	testHandler.reconcileCommentsOnCompletion(ctx, &workerTask)
-	if got := countQueued(); got != 0 {
-		t.Fatalf("completion reconcile must not borrow the stale autopilot authority after an admin edit; got %d queued", got)
-	}
 }

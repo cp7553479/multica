@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/multica-ai/multica/server/internal/testutil"
 )
 
 // An unbound agent is refused by every execution entry point — that part already
@@ -15,9 +17,8 @@ import (
 // unbound agent has no machine to bring back; the fix is to bind one. These tests
 // pin the distinct reason code (MUL-5559).
 
-// TestCommentMention_UnboundAgentReportsRuntimeRequired: @mentioning an unbound
-// agent posts the comment, enqueues nothing, and reports agent_runtime_required
-// rather than runtime_offline.
+// An assigned owner receives mention-free comments in its persistent inbox.
+// Without a runtime, the inbox explicitly blocks instead of losing the input.
 func TestCommentMention_UnboundAgentReportsRuntimeRequired(t *testing.T) {
 	if testHandler == nil {
 		t.Skip("database not available")
@@ -40,18 +41,31 @@ func TestCommentMention_UnboundAgentReportsRuntimeRequired(t *testing.T) {
 		t.Fatalf("allow-list agent: %v", err)
 	}
 
-	issueID := createMentionFixtureIssue(t, ctx, "Mention unbound agent")
-
-	// Bound but never mentioned yet: the same agent must be triggerable before we
-	// unbind it, otherwise this test could pass for the wrong reason.
-	if code := mentionAgentReasonCode(t, issueID, agentID); code != "" {
-		t.Fatalf("bound agent: expected a successful trigger, got blocked with %q", code)
+	boundIssueID := dbfx.Issue(t, "Bound session owner", testutil.Cols{
+		"assignee_type": "agent", "assignee_id": agentID,
+	})
+	dbfx.Cleanup(t, "DELETE FROM agent_task_queue WHERE issue_id=$1", boundIssueID)
+	captureSessionComment(t, boundIssueID, map[string]any{"content": "Please take a look"}, "", "")
+	bound := captureIssueSessions(t, boundIssueID)
+	if len(bound) != 1 || bound[0].AgentID != agentID || bound[0].State != "ready" || bound[0].ActiveTaskID == nil {
+		t.Fatalf("bound owner did not receive an execution: %+v", bound)
 	}
 
 	unbindRuntime(t, ctx, runtimeID, agentID)
 
-	if code := mentionAgentReasonCode(t, issueID, agentID); code != string(ReasonAgentRuntimeRequired) {
-		t.Fatalf("unbound agent: reason_code = %q, want agent_runtime_required", code)
+	issueID := dbfx.Issue(t, "Unbound session owner", testutil.Cols{
+		"assignee_type": "agent", "assignee_id": agentID,
+	})
+	comment := captureSessionComment(t, issueID, map[string]any{"content": "Keep this input until a runtime is bound"}, "", "")
+	sessions := captureIssueSessions(t, issueID)
+	if len(sessions) != 1 || sessions[0].AgentID != agentID || sessions[0].State != "blocked" || sessions[0].FailureReason == nil || *sessions[0].FailureReason != "runtime_unbound" || sessions[0].RuntimeID != nil || sessions[0].ActiveTaskID != nil {
+		t.Fatalf("unbound owner session = %+v, want blocked/runtime_unbound without execution", sessions)
+	}
+	if len(sessions[0].Events) != 2 || sessions[0].Events[1].Kind != "comment.created" || sessions[0].Events[1].SourceID == nil || *sessions[0].Events[1].SourceID != comment.ID || sessions[0].Events[1].Status != "pending" {
+		t.Fatalf("unbound owner lost its queued input: %+v", sessions[0].Events)
+	}
+	if n := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id=$1", issueID); n != 0 {
+		t.Fatalf("unbound owner created %d executions", n)
 	}
 }
 

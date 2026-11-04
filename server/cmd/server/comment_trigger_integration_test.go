@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/multica-ai/multica/server/internal/auth"
+	"github.com/multica-ai/multica/server/internal/handler"
+	"github.com/multica-ai/multica/server/internal/testutil"
 )
 
 // authRequestWithAgent makes a request the server resolves as coming from an
@@ -273,219 +275,112 @@ func postCommentAsAgent(t *testing.T, issueID, content, agentID string, parentID
 // strPtr returns a pointer to a string.
 func strPtr(s string) *string { return &s }
 
-// TestCommentTriggerOnComment tests on_comment trigger scenarios end-to-end.
-// Verifies that the agent task queue is populated correctly based on:
-// - top-level vs threaded comments
-// - member vs agent thread starters
-// - presence/absence of @mentions
-func TestCommentTriggerOnComment(t *testing.T) {
-	agentID := getAgentID(t)
-	issueID := createIssueAssignedToAgent(t, "Comment trigger integration test", agentID)
-	t.Cleanup(func() {
-		clearTasks(t, issueID)
-		resp := authRequest(t, "DELETE", "/api/issues/"+issueID, nil)
-		resp.Body.Close()
-	})
-
-	t.Run("top-level comment without mentions triggers agent", func(t *testing.T) {
-		clearTasks(t, issueID)
-		postComment(t, issueID, "Please fix this bug", nil)
-		if n := countPendingTasks(t, issueID); n != 1 {
-			t.Errorf("expected 1 pending task, got %d", n)
-		}
-	})
-
-	t.Run("top-level comment mentioning only others suppresses trigger", func(t *testing.T) {
-		clearTasks(t, issueID)
-		// Mention a fake agent UUID that is not the assignee.
-		content := "[@SomeoneElse](mention://agent/00000000-0000-0000-0000-000000000001) what do you think?"
-		postComment(t, issueID, content, nil)
-		if n := countPendingTasks(t, issueID); n != 0 {
-			t.Errorf("expected 0 pending tasks, got %d", n)
-		}
-	})
-
-	t.Run("top-level comment mentioning assignee triggers agent", func(t *testing.T) {
-		clearTasks(t, issueID)
-		content := fmt.Sprintf("[@Agent](mention://agent/%s) fix this", agentID)
-		postComment(t, issueID, content, nil)
-		if n := countPendingTasks(t, issueID); n != 1 {
-			t.Errorf("expected 1 pending task, got %d", n)
-		}
-	})
-
-	t.Run("reply to agent thread without mentions triggers agent", func(t *testing.T) {
-		clearTasks(t, issueID)
-		// Agent starts a thread.
-		threadID := postCommentAsAgent(t, issueID, "I analyzed the issue.", agentID, nil)
-		// Member replies in the agent's thread.
-		postComment(t, issueID, "Looks good, please proceed", strPtr(threadID))
-		if n := countPendingTasks(t, issueID); n != 1 {
-			t.Errorf("expected 1 pending task, got %d", n)
-		}
-	})
-
-	// Regression guard for #1301: the assignee on_comment path must record
-	// the NEW reply as trigger_comment_id, not the thread root. Otherwise
-	// the daemon feeds stale content to the agent prompt, which with
-	// `--resume` sessions surfaces as "already replied, no further action".
-	// Reply placement (flat-thread grouping) is handled downstream in
-	// TaskService.createAgentComment, not here.
-	t.Run("reply records new comment id (not thread root) as trigger_comment_id", func(t *testing.T) {
-		clearTasks(t, issueID)
-		threadID := postCommentAsAgent(t, issueID, "First pass analysis.", agentID, nil)
-		replyID := postComment(t, issueID, "Please also check the edge case", strPtr(threadID))
-		if n := countPendingTasks(t, issueID); n != 1 {
-			t.Fatalf("expected 1 pending task, got %d", n)
-		}
-		if got := latestTriggerCommentID(t, issueID); got != replyID {
-			t.Errorf("trigger_comment_id = %q, want reply id %q (thread root was %q)",
-				got, replyID, threadID)
-		}
-	})
-
-	t.Run("reply to unowned member thread without mentions does not trigger assignee", func(t *testing.T) {
-		clearTasks(t, issueID)
-		// Member starts a thread.
-		threadID := postComment(t, issueID, "Hey team, what do you think?", nil)
-		// Clear the task that was created by the top-level comment.
-		clearTasks(t, issueID)
-		// Another member reply (same user in this test, but the key is parent is by member).
-		postComment(t, issueID, "I agree with you", strPtr(threadID))
-		if n := countPendingTasks(t, issueID); n != 0 {
-			t.Errorf("expected 0 pending tasks (unowned member thread), got %d", n)
-		}
-	})
-
-	t.Run("reply to member thread after agent handled root continues agent", func(t *testing.T) {
-		clearTasks(t, issueID)
-		// Member starts a thread (top-level comment).
-		threadID := postComment(t, issueID, "Please fix this bug", nil)
-		// Complete, but retain, the root-triggered task so the thread keeps its
-		// conversation owner without leaving pending work behind.
-		if _, err := testPool.Exec(context.Background(), `
-			UPDATE agent_task_queue
-			SET status = 'completed', completed_at = now()
-			WHERE issue_id = $1 AND trigger_comment_id = $2
-		`, issueID, threadID); err != nil {
-			t.Fatalf("failed to complete root-triggered task: %v", err)
-		}
-		// Agent replies in the thread.
-		postCommentAsAgent(t, issueID, "Working on it, found the root cause.", agentID, strPtr(threadID))
-		// Member follows up in the same thread without @mentioning the agent.
-		postComment(t, issueID, "Great, please also check the edge case", strPtr(threadID))
-		if n := countPendingTasks(t, issueID); n != 1 {
-			t.Errorf("expected 1 pending task (conversation continuation), got %d", n)
-		}
-	})
-
-	// MUL-8416: a reply that merges into the root's still-queued task takes
-	// over trigger_comment_id. Later replies under the root must still reach
-	// the agent once that task has finished.
-	t.Run("reply to member thread whose root was folded into a queued task continues agent", func(t *testing.T) {
-		clearTasks(t, issueID)
-		threadID := postComment(t, issueID, "Please fix this bug", nil)
-		followUpID := postComment(t, issueID, "Also check the spacing", strPtr(threadID))
-		if n := countPendingTasks(t, issueID); n != 1 {
-			t.Fatalf("expected the follow-up to merge into the root's task, got %d pending tasks", n)
-		}
-		if got := latestTriggerCommentID(t, issueID); got != followUpID {
-			t.Fatalf("trigger_comment_id = %q, want merged follow-up %q", got, followUpID)
-		}
-		if _, err := testPool.Exec(context.Background(), `
-			UPDATE agent_task_queue
-			SET status = 'completed', completed_at = now()
-			WHERE issue_id = $1 AND trigger_comment_id = $2
-		`, issueID, followUpID); err != nil {
-			t.Fatalf("failed to complete merged task: %v", err)
-		}
-		postComment(t, issueID, "Should the page header go too?", strPtr(threadID))
-		if n := countPendingTasks(t, issueID); n != 1 {
-			t.Errorf("expected 1 pending task (conversation continuation), got %d", n)
-		}
-	})
-
-	t.Run("reply to member thread mentioning assignee triggers agent", func(t *testing.T) {
-		clearTasks(t, issueID)
-		// Member starts a thread.
-		threadID := postComment(t, issueID, "Question about this", nil)
-		clearTasks(t, issueID)
-		// Reply mentioning the assignee agent.
-		content := fmt.Sprintf("[@Agent](mention://agent/%s) can you help with this?", agentID)
-		postComment(t, issueID, content, strPtr(threadID))
-		if n := countPendingTasks(t, issueID); n != 0 {
-			// The mention of the assignee agent unblocks on_comment but
-			// the assignee-mention path in on_mention skips the assignee.
-			// Either 0 or 1 is acceptable depending on the on_comment logic.
-			// With our implementation: isReplyToMemberThread returns false
-			// (assignee mentioned), and commentMentionsOthersButNotAssignee
-			// returns false (assignee is mentioned). So on_comment triggers.
-			// Let's re-check.
-		}
-		if n := countPendingTasks(t, issueID); n != 1 {
-			t.Errorf("expected 1 pending task (assignee mentioned in member thread), got %d", n)
-		}
-	})
-
-	t.Run("reply to member thread that @mentioned assignee triggers without re-mention", func(t *testing.T) {
-		clearTasks(t, issueID)
-		// Member starts a thread that @mentions the assignee agent.
-		content := fmt.Sprintf("[@Agent](mention://agent/%s) can you review this?", agentID)
-		threadID := postComment(t, issueID, content, nil)
-		// Clear the task created by the top-level mention.
-		clearTasks(t, issueID)
-		// Reply in the thread WITHOUT re-mentioning the assignee.
-		postComment(t, issueID, "Here is more context for you", strPtr(threadID))
-		if n := countPendingTasks(t, issueID); n != 1 {
-			t.Errorf("expected 1 pending task (assignee mentioned in thread root), got %d", n)
-		}
-	})
+// newHTTPCommentOwner isolates the runtime and owner from other integration
+// cases, while creating and assigning the issue through the real HTTP surface.
+func newHTTPCommentOwner(t *testing.T, title string) (issueID, agentID string) {
+	t.Helper()
+	agentID = newHTTPCommentAgent(t)
+	issueID = createIssueAssignedToAgent(t, title, agentID)
+	fixture := testutil.New(testPool, testWorkspaceID, testUserID)
+	fixture.Cleanup(t, "DELETE FROM issue WHERE id=$1", issueID)
+	fixture.Cleanup(t, "DELETE FROM agent_task_queue WHERE issue_id=$1", issueID)
+	return
 }
 
-// TestCommentTriggerAtAllSuppression verifies that @all mentions do not
-// trigger agent execution — @all is a broadcast, not a direct request.
-func TestCommentTriggerAtAllSuppression(t *testing.T) {
-	agentID := getAgentID(t)
-	issueID := createIssueAssignedToAgent(t, "@all suppression test", agentID)
-	t.Cleanup(func() {
-		clearTasks(t, issueID)
-		resp := authRequest(t, "DELETE", "/api/issues/"+issueID, nil)
+func newHTTPCommentAgent(t *testing.T) string {
+	t.Helper()
+	fixture := testutil.New(testPool, testWorkspaceID, testUserID)
+	runtimeID := fixture.Runtime(t, t.Name()+" runtime", testutil.Cols{"provider": "codex"})
+	return fixture.Agent(t, fmt.Sprintf("%s owner %d", t.Name(), time.Now().UnixNano()), runtimeID)
+}
+
+func readHTTPCommentSession(t *testing.T, issueID string) handler.IssueAgentSessionResponse {
+	t.Helper()
+	resp := authRequest(t, http.MethodGet, "/api/issues/"+issueID+"/agent-sessions", nil)
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-	})
+		t.Fatalf("read issue session: expected 200, got %d: %s", resp.StatusCode, body)
+	}
+	var sessions []handler.IssueAgentSessionResponse
+	readJSON(t, resp, &sessions)
+	if len(sessions) != 1 {
+		t.Fatalf("issue sessions = %+v, want one owner", sessions)
+	}
+	return sessions[0]
+}
 
-	t.Run("top-level @all comment suppresses on_comment", func(t *testing.T) {
-		clearTasks(t, issueID)
-		postComment(t, issueID, "[@All](mention://all/all) heads up everyone", nil)
-		if n := countPendingTasks(t, issueID); n != 0 {
-			t.Errorf("expected 0 pending tasks (@all should not trigger agent), got %d", n)
+func TestHTTPOwnerInboxReceivesTopLevelAndThreadedComments(t *testing.T) {
+	issueID, ownerID := newHTTPCommentOwner(t, "Owner inbox HTTP integration")
+	initial := readHTTPCommentSession(t, issueID)
+	if initial.ActiveTaskID == nil || len(initial.Events) != 1 || initial.Events[0].Kind != "assigned" {
+		t.Fatalf("assignment did not open the owner's session: %+v", initial)
+	}
+	if _, err := testPool.Exec(context.Background(), "UPDATE agent_task_queue SET status='running',started_at=now() WHERE id=$1", *initial.ActiveTaskID); err != nil {
+		t.Fatal(err)
+	}
+	agentRoot := postCommentAsAgent(t, issueID, "Explicit owner publication", ownerID, nil)
+	memberRoot := postComment(t, issueID, "Initial member instruction", nil)
+	comments := []struct {
+		content string
+		parent  *string
+	}{
+		{"Please fix this bug", nil},
+		{"[@Other](mention://agent/00000000-0000-0000-0000-000000000001) context", nil},
+		{fmt.Sprintf("[@Owner](mention://agent/%s) context", ownerID), nil},
+		{"Member reply under owner publication", &agentRoot},
+		{"Member reply under another member", &memberRoot},
+	}
+	var ids []string
+	for _, comment := range comments {
+		ids = append(ids, postComment(t, issueID, comment.content, comment.parent))
+	}
+	session := readHTTPCommentSession(t, issueID)
+	if session.ID != initial.ID || session.AgentID != ownerID || session.ActiveTaskID == nil || *session.ActiveTaskID != *initial.ActiveTaskID || len(session.Events) != 8 {
+		t.Fatalf("comments replaced their issue session: %+v", session)
+	}
+	if session.Events[1].SourceID == nil || *session.Events[1].SourceID != agentRoot || session.Events[1].Status != "ignored" {
+		t.Fatalf("owner publication could wake itself: %+v", session.Events[1])
+	}
+	for i, id := range ids {
+		event := session.Events[i+3]
+		if event.SourceID == nil || *event.SourceID != id || event.Sequence != int64(i+4) || event.Kind != "comment.created" {
+			t.Fatalf("message %s lost its ordered inbox event: %+v", id, event)
 		}
-	})
+	}
+	var executions int
+	if err := testPool.QueryRow(context.Background(), "SELECT count(*) FROM agent_task_queue WHERE issue_id=$1", issueID).Scan(&executions); err != nil || executions != 1 {
+		t.Fatalf("comments created per-comment executions: count=%d, error=%v", executions, err)
+	}
+}
 
-	t.Run("@all in agent thread suppresses on_comment", func(t *testing.T) {
-		clearTasks(t, issueID)
-		threadID := postCommentAsAgent(t, issueID, "Here is my analysis.", agentID, nil)
-		postComment(t, issueID, "[@All](mention://all/all) FYI for the team", strPtr(threadID))
-		if n := countPendingTasks(t, issueID); n != 0 {
-			t.Errorf("expected 0 pending tasks (@all in agent thread), got %d", n)
+func TestHTTPBroadcastMentionsDoNotSuppressTheOwnerInbox(t *testing.T) {
+	issueID, ownerID := newHTTPCommentOwner(t, "Broadcasts remain owner messages")
+	initial := readHTTPCommentSession(t, issueID)
+	root := postComment(t, issueID, "Thread context", nil)
+	contents := []string{
+		"[@All](mention://all/all) heads up everyone",
+		fmt.Sprintf("[@All](mention://all/all) [@Owner](mention://agent/%s) update", ownerID),
+		"[@All](mention://all/all) [@Other](mention://agent/00000000-0000-0000-0000-000000000001) update",
+	}
+	for _, content := range contents {
+		postComment(t, issueID, content, &root)
+	}
+	session := readHTTPCommentSession(t, issueID)
+	if session.ID != initial.ID || session.AgentID != ownerID || len(session.Events) != 5 || countPendingTasks(t, issueID) != 1 {
+		t.Fatalf("broadcast mentions changed owner delivery: %+v", session)
+	}
+	for _, event := range session.Events[1:] {
+		if event.Kind != "comment.created" || event.Status != "pending" {
+			t.Fatalf("broadcast content suppressed an inbox message: %+v", event)
 		}
-	})
-
-	// MUL-5411: @all suppresses only the IMPLICIT routes. An explicit @agent in
-	// the same comment is a direct request and must still enqueue that agent.
-	t.Run("@all with explicit @agent still triggers the agent", func(t *testing.T) {
-		clearTasks(t, issueID)
-		content := fmt.Sprintf("[@All](mention://all/all) heads up — [@Agent](mention://agent/%s) please take this", agentID)
-		postComment(t, issueID, content, nil)
-		if n := countPendingTasks(t, issueID); n != 1 {
-			t.Errorf("expected 1 pending task (@all must not swallow the explicit @agent), got %d", n)
-		}
-	})
+	}
 }
 
 // TestCommentTriggerOnAssignNoStatusGate verifies that assigning an agent to
 // a non-todo issue still triggers the agent (status gate was removed).
 func TestCommentTriggerOnAssignNoStatusGate(t *testing.T) {
-	agentID := getAgentID(t)
+	agentID := newHTTPCommentAgent(t)
 
 	// Create an in_progress issue.
 	issueID := createIssue(t, "On-assign status gate test")
@@ -517,241 +412,168 @@ func TestCommentTriggerOnAssignNoStatusGate(t *testing.T) {
 	}
 }
 
-// TestCommentTriggerOnMentionNoStatusGate verifies that @mentioning an agent
-// on a done issue still triggers the agent (no status gate on on_mention).
-func TestCommentTriggerOnMentionNoStatusGate(t *testing.T) {
-	agentID := getAgentID(t)
-
-	// Create a done issue (not assigned to agent).
-	issueID := createIssue(t, "On-mention done issue test")
-	resp := authRequest(t, "PUT", "/api/issues/"+issueID, map[string]any{
-		"status": "done",
-	})
+func TestHTTPMentionOnDoneIssueRequiresExplicitOwnerAssignment(t *testing.T) {
+	agentID := newHTTPCommentAgent(t)
+	issueID := createIssue(t, "Done issue with explicit owner")
+	fixture := testutil.New(testPool, testWorkspaceID, testUserID)
+	fixture.Cleanup(t, "DELETE FROM issue WHERE id=$1", issueID)
+	fixture.Cleanup(t, "DELETE FROM agent_task_queue WHERE issue_id=$1", issueID)
+	resp := authRequest(t, http.MethodPut, "/api/issues/"+issueID, map[string]any{"status": "done"})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("mark done: %d", resp.StatusCode)
+	}
 	resp.Body.Close()
-
-	t.Cleanup(func() {
-		clearTasks(t, issueID)
-		resp := authRequest(t, "DELETE", "/api/issues/"+issueID, nil)
-		resp.Body.Close()
-	})
-
-	// @mention the agent on a done issue — should still trigger.
-	content := fmt.Sprintf("[@Agent](mention://agent/%s) found a problem here", agentID)
-	postComment(t, issueID, content, nil)
-
-	if n := countPendingTasks(t, issueID); n != 1 {
-		t.Errorf("expected 1 pending task after @mention on done issue, got %d", n)
+	postComment(t, issueID, fmt.Sprintf("[@Agent](mention://agent/%s) follow-up context", agentID), nil)
+	if n := countPendingTasks(t, issueID); n != 0 {
+		t.Fatalf("a mention on an unassigned done issue dispatched %d tasks", n)
+	}
+	resp = authRequest(t, http.MethodPut, "/api/issues/"+issueID, map[string]any{"assignee_type": "agent", "assignee_id": agentID})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("assign done issue: %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+	session := readHTTPCommentSession(t, issueID)
+	if session.AgentID != agentID || session.ActiveTaskID == nil || len(session.Events) != 1 || session.Events[0].Kind != "assigned" || countPendingTasks(t, issueID) != 1 {
+		t.Fatalf("done status suppressed an explicit owner assignment: %+v", session)
 	}
 }
 
-// TestCommentTriggerThreadExplicitMentions verifies that a member root @mention
-// owns plain replies in that thread, while explicit mentions in the reply still
-// trigger normally.
-func TestCommentTriggerThreadExplicitMentions(t *testing.T) {
-	agentID := getAgentID(t)
-
-	// Create an issue NOT assigned to the agent, so on_comment won't fire.
-	issueID := createIssue(t, "Thread-inherited mention test")
-	t.Cleanup(func() {
-		clearTasks(t, issueID)
-		resp := authRequest(t, "DELETE", "/api/issues/"+issueID, nil)
-		resp.Body.Close()
-	})
-
-	t.Run("plain reply in thread routes to root mention owner", func(t *testing.T) {
-		clearTasks(t, issueID)
-		// Top-level comment @mentions the agent.
-		content := fmt.Sprintf("[@Agent](mention://agent/%s) can you review this?", agentID)
-		threadID := postComment(t, issueID, content, nil)
-		if n := countPendingTasks(t, issueID); n != 1 {
-			t.Fatalf("expected 1 pending task after initial mention, got %d", n)
+func TestHTTPThreadMentionsCannotSelectAnotherSessionOwner(t *testing.T) {
+	issueID, ownerID := newHTTPCommentOwner(t, "One owner across comment threads")
+	otherID := newHTTPCommentAgent(t)
+	root := postComment(t, issueID, fmt.Sprintf("[@Other](mention://agent/%s) context", otherID), nil)
+	contents := []string{
+		"Plain follow-up", fmt.Sprintf("[@Other](mention://agent/%s) update", otherID),
+		fmt.Sprintf("[@Owner](mention://agent/%s) update", ownerID),
+		fmt.Sprintf("[@Member](mention://member/%s) context", testUserID),
+	}
+	for _, content := range contents {
+		postComment(t, issueID, content, &root)
+	}
+	session := readHTTPCommentSession(t, issueID)
+	if session.AgentID != ownerID || len(session.Events) != 6 || countPendingTasks(t, issueID) != 1 || countPendingTasksForAgent(t, issueID, otherID) != 0 {
+		t.Fatalf("thread mentions selected another execution owner: %+v", session)
+	}
+	for _, event := range session.Events[2:] {
+		var payload struct {
+			ParentCommentID string `json:"parent_comment_id"`
 		}
-		// Clear the task so we can test the reply independently.
-		clearTasks(t, issueID)
-		// Reply in the thread WITHOUT mentioning the agent.
-		postComment(t, issueID, "Here is more context for you", strPtr(threadID))
-		if n := countPendingTasks(t, issueID); n != 1 {
-			t.Errorf("expected 1 pending task from root mention owner, got %d", n)
+		if err := json.Unmarshal(event.Payload, &payload); err != nil || payload.ParentCommentID != root {
+			t.Fatalf("thread event lost its actual parent: %+v, %v", payload, err)
 		}
-	})
-
-	t.Run("plain reply to multi-agent root routes only first mention", func(t *testing.T) {
-		clearTasks(t, issueID)
-		agentB := createSecondAgent(t)
-		content := fmt.Sprintf(
-			"[@AgentA](mention://agent/%s) [@AgentB](mention://agent/%s) can you both review this?",
-			agentID,
-			agentB,
-		)
-		threadID := postComment(t, issueID, content, nil)
-		if n := countPendingTasksForAgent(t, issueID, agentID); n != 1 {
-			t.Fatalf("expected 1 pending root task for first agent, got %d", n)
-		}
-		if n := countPendingTasksForAgent(t, issueID, agentB); n != 1 {
-			t.Fatalf("expected 1 pending root task for second agent, got %d", n)
-		}
-		clearTasks(t, issueID)
-
-		postComment(t, issueID, "Here is more context for you both", strPtr(threadID))
-		if n := countPendingTasksForAgent(t, issueID, agentID); n != 1 {
-			t.Errorf("expected 1 pending reply task for first agent, got %d", n)
-		}
-		if n := countPendingTasksForAgent(t, issueID, agentB); n != 0 {
-			t.Errorf("expected 0 pending reply tasks for second agent, got %d", n)
-		}
-		if n := countPendingTasks(t, issueID); n != 1 {
-			t.Errorf("expected exactly 1 pending task after multi-agent root reply, got %d", n)
-		}
-	})
-
-	t.Run("reply does not double-trigger when re-mentioning same agent", func(t *testing.T) {
-		clearTasks(t, issueID)
-		// Top-level comment @mentions the agent.
-		content := fmt.Sprintf("[@Agent](mention://agent/%s) help", agentID)
-		threadID := postComment(t, issueID, content, nil)
-		clearTasks(t, issueID)
-		// Reply also @mentions the same agent — should still be just 1 task.
-		reply := fmt.Sprintf("[@Agent](mention://agent/%s) any update?", agentID)
-		postComment(t, issueID, reply, strPtr(threadID))
-		if n := countPendingTasks(t, issueID); n != 1 {
-			t.Errorf("expected 1 pending task (no duplicate), got %d", n)
-		}
-	})
-
-	t.Run("reply mentioning only a member does not inherit agent mention", func(t *testing.T) {
-		clearTasks(t, issueID)
-		// Top-level comment @mentions the agent.
-		content := fmt.Sprintf("[@Agent](mention://agent/%s) can you help?", agentID)
-		threadID := postComment(t, issueID, content, nil)
-		clearTasks(t, issueID)
-		// Reply mentions only a member — should NOT inherit parent's agent mention.
-		reply := fmt.Sprintf("cc [@Someone](mention://member/%s)", testUserID)
-		postComment(t, issueID, reply, strPtr(threadID))
-		if n := countPendingTasks(t, issueID); n != 0 {
-			t.Errorf("expected 0 pending tasks (member-only reply should not inherit agent mention), got %d", n)
-		}
-	})
-
-	t.Run("reply mentioning a different agent does not inherit parent agent", func(t *testing.T) {
-		clearTasks(t, issueID)
-		agentB := createSecondAgent(t)
-		// Top-level comment @mentions agent A.
-		content := fmt.Sprintf("[@AgentA](mention://agent/%s) please review", agentID)
-		threadID := postComment(t, issueID, content, nil)
-		clearTasks(t, issueID)
-		// Reply @mentions agent B — should trigger ONLY agent B, not agent A.
-		reply := fmt.Sprintf("[@AgentB](mention://agent/%s) can you also look?", agentB)
-		postComment(t, issueID, reply, strPtr(threadID))
-		if n := countPendingTasks(t, issueID); n != 1 {
-			t.Errorf("expected 1 pending task (only agent B), got %d", n)
-		}
-	})
-
-	t.Run("reply mentioning same agent and member triggers via explicit mention", func(t *testing.T) {
-		clearTasks(t, issueID)
-		// Top-level comment @mentions the agent.
-		content := fmt.Sprintf("[@Agent](mention://agent/%s) review this", agentID)
-		threadID := postComment(t, issueID, content, nil)
-		clearTasks(t, issueID)
-		// Reply re-mentions the same agent along with a member — triggers via the reply's own mention.
-		reply := fmt.Sprintf("[@Agent](mention://agent/%s) and cc [@Someone](mention://member/%s)", agentID, testUserID)
-		postComment(t, issueID, reply, strPtr(threadID))
-		if n := countPendingTasks(t, issueID); n != 1 {
-			t.Errorf("expected 1 pending task (reply mentions agent explicitly), got %d", n)
-		}
-	})
+	}
+	otherIssueID := createIssue(t, "Foreign parent issue")
+	fixture := testutil.New(testPool, testWorkspaceID, testUserID)
+	fixture.Cleanup(t, "DELETE FROM issue WHERE id=$1", otherIssueID)
+	foreignParent := postComment(t, otherIssueID, "A separate issue's thread", nil)
+	resp := authRequest(t, http.MethodPost, "/api/issues/"+issueID+"/comments", map[string]any{"content": "Must remain on this issue", "parent_id": foreignParent})
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("cross-issue parent: expected 400, got %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+	if after := readHTTPCommentSession(t, issueID); len(after.Events) != len(session.Events) {
+		t.Fatal("a rejected cross-issue reply appended an inbox event")
+	}
 }
 
-// TestDeleteCommentCancelsTriggeredTasks verifies that deleting a comment
-// also cancels any active tasks that were triggered by it. Without this,
-// the daemon would still claim the queued task after the FK SET NULL
-// nullified its trigger_comment_id, and the agent would either run with a
-// stale prompt (race during claim) or with a generic "you are assigned"
-// prompt that has no record of the now-deleted user request — both of
-// which manifest as "the agent still sees the deleted comment".
-func TestDeleteCommentCancelsTriggeredTasks(t *testing.T) {
-	agentID := getAgentID(t)
-	issueID := createIssueAssignedToAgent(t, "Delete-comment cancels task test", agentID)
-	t.Cleanup(func() {
-		clearTasks(t, issueID)
-		resp := authRequest(t, "DELETE", "/api/issues/"+issueID, nil)
-		resp.Body.Close()
-	})
-
-	t.Run("deleting trigger comment cancels its queued task", func(t *testing.T) {
-		clearTasks(t, issueID)
-		commentID := postComment(t, issueID, "Please fix this bug", nil)
-		if n := countPendingTasks(t, issueID); n != 1 {
-			t.Fatalf("expected 1 pending task before delete, got %d", n)
+func TestHTTPCommentEditAndDeletionAppendOrderedEventsWithoutCancellingTheOwner(t *testing.T) {
+	issueID, _ := newHTTPCommentOwner(t, "Comment lifecycle in one inbox")
+	initial := readHTTPCommentSession(t, issueID)
+	commentID := postComment(t, issueID, "Original instruction", nil)
+	replyID := postComment(t, issueID, "Keep the reply thread", &commentID)
+	resp := authRequest(t, http.MethodPut, "/api/comments/"+commentID, map[string]any{"content": "Corrected instruction", "expected_revision": 1})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("edit comment: expected 200, got %d", resp.StatusCode)
+	}
+	var updated handler.CommentResponse
+	readJSON(t, resp, &updated)
+	resp = authRequest(t, http.MethodDelete, "/api/comments/"+commentID, nil)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("delete comment: expected 204, got %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+	session := readHTTPCommentSession(t, issueID)
+	if initial.ActiveTaskID == nil || session.ActiveTaskID == nil || *initial.ActiveTaskID != *session.ActiveTaskID || len(session.Events) != 5 || countPendingTasks(t, issueID) != 1 {
+		t.Fatalf("comment lifecycle cancelled or replaced the owner: %+v", session)
+	}
+	kinds := []string{"assigned", "comment.created", "comment.created", "comment.updated", "comment.deleted"}
+	for i, kind := range kinds {
+		if session.Events[i].Kind != kind || session.Events[i].Sequence != int64(i+1) {
+			t.Fatalf("event %d = %+v, want %s in order", i, session.Events[i], kind)
 		}
-
-		resp := authRequest(t, "DELETE", "/api/comments/"+commentID, nil)
-		resp.Body.Close()
-		if resp.StatusCode != http.StatusNoContent {
-			t.Fatalf("DeleteComment: expected 204, got %d", resp.StatusCode)
+	}
+	if updated.Revision <= session.Events[1].SourceRevision || session.Events[3].SourceRevision != updated.Revision || session.Events[4].SourceRevision <= updated.Revision {
+		t.Fatalf("source revisions did not advance across edit and tombstone: %+v", session.Events)
+	}
+	resp = authRequest(t, http.MethodGet, "/api/issues/"+issueID+"/comments", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("list comments: %d", resp.StatusCode)
+	}
+	var comments []handler.CommentResponse
+	readJSON(t, resp, &comments)
+	var foundRoot, foundReply bool
+	for _, comment := range comments {
+		if comment.ID == commentID {
+			foundRoot = comment.DeletedAt != nil && comment.Content == ""
 		}
-
-		if n := countPendingTasks(t, issueID); n != 0 {
-			t.Errorf("expected 0 pending tasks after deleting trigger comment, got %d", n)
+		if comment.ID == replyID {
+			foundReply = comment.ParentID != nil && *comment.ParentID == commentID
 		}
-	})
+	}
+	if !foundRoot || !foundReply {
+		t.Fatalf("deletion lost the tombstone or reply parent: %+v", comments)
+	}
 }
 
-// TestCommentThreadsQueueSeparatelyFromAssignment verifies that each root
-// comment queues independently of other threads and the assignment task.
-func TestCommentThreadsQueueSeparatelyFromAssignment(t *testing.T) {
-	agentID := getAgentID(t)
-	issueID := createIssueAssignedToAgent(t, "Coalescing test", agentID)
-	t.Cleanup(func() {
-		clearTasks(t, issueID)
-		resp := authRequest(t, "DELETE", "/api/issues/"+issueID, nil)
-		resp.Body.Close()
-	})
-
-	// Distinct root comments must not merge with each other or the assignment.
+func TestHTTPCommentThreadsShareTheirIssueSession(t *testing.T) {
+	issueID, ownerID := newHTTPCommentOwner(t, "Independent comment threads in one session")
+	initial := readHTTPCommentSession(t, issueID)
 	first := postComment(t, issueID, "First comment", nil)
 	second := postComment(t, issueID, "Second comment", nil)
-
-	if n := countPendingTasks(t, issueID); n != 3 {
-		t.Fatalf("expected assignment plus two independent thread tasks, got %d", n)
+	reply := postComment(t, issueID, "Follow-up to the first", &first)
+	session := readHTTPCommentSession(t, issueID)
+	if session.ID != initial.ID || len(session.Events) != 4 || countPendingTasks(t, issueID) != 1 {
+		t.Fatalf("comment threads started separate executions: %+v", session)
 	}
-	for _, id := range []string{first, second} {
-		var count int
-		if err := testPool.QueryRow(context.Background(), `SELECT count(*) FROM agent_task_queue WHERE issue_id=$1 AND agent_id=$2 AND trigger_comment_id=$3 AND cardinality(coalesced_comment_ids)=0`, issueID, agentID, id).Scan(&count); err != nil {
-			t.Fatal(err)
+	for i, id := range []string{first, second, reply} {
+		event := session.Events[i+1]
+		if event.SourceID == nil || *event.SourceID != id || event.Sequence != int64(i+2) {
+			t.Fatalf("thread event order = %+v", event)
 		}
-		if count != 1 {
-			t.Errorf("comment %s should own exactly one unmerged task, got %d", id, count)
-		}
+	}
+	var commentTasks int
+	if err := testPool.QueryRow(context.Background(), "SELECT count(*) FROM agent_task_queue WHERE issue_id=$1 AND (trigger_comment_id IS NOT NULL OR cardinality(coalesced_comment_ids)>0)", issueID).Scan(&commentTasks); err != nil || commentTasks != 0 {
+		t.Fatalf("owner session created old per-comment tasks: %d, %v", commentTasks, err)
+	}
+	otherIssueID := createIssueAssignedToAgent(t, "Same agent, independent issue", ownerID)
+	fixture := testutil.New(testPool, testWorkspaceID, testUserID)
+	fixture.Cleanup(t, "DELETE FROM issue WHERE id=$1", otherIssueID)
+	fixture.Cleanup(t, "DELETE FROM agent_task_queue WHERE issue_id=$1", otherIssueID)
+	postComment(t, otherIssueID, "A different issue can receive input concurrently", nil)
+	other := readHTTPCommentSession(t, otherIssueID)
+	if other.ID == session.ID || other.ActiveTaskID == nil || session.ActiveTaskID == nil || *other.ActiveTaskID == *session.ActiveTaskID || other.AgentID != ownerID || countPendingTasks(t, otherIssueID) != 1 {
+		t.Fatalf("the same agent configuration serialized two issues into one session: %+v / %+v", session, other)
 	}
 }
 
-// TestCommentTriggerMentionAssigneeDoneIssue verifies that @mentioning the
-// assigned agent on a done issue still triggers execution. Previously the
-// assignee was unconditionally skipped in the mention path (assuming
-// on_comment handled it), but on_comment is suppressed for terminal statuses.
-func TestCommentTriggerMentionAssigneeDoneIssue(t *testing.T) {
-	agentID := getAgentID(t)
-
-	// Create an issue assigned to the agent, then mark it done.
-	issueID := createIssueAssignedToAgent(t, "Mention-assignee-done test", agentID)
-	clearTasks(t, issueID) // clear any tasks from assignment
-	resp := authRequest(t, "PUT", "/api/issues/"+issueID, map[string]any{
-		"status": "done",
-	})
+func TestHTTPOwnerInboxAcceptsPlainAndMentionedFollowupsAfterDone(t *testing.T) {
+	issueID, ownerID := newHTTPCommentOwner(t, "Done owner session follow-ups")
+	initial := readHTTPCommentSession(t, issueID)
+	resp := authRequest(t, http.MethodPut, "/api/issues/"+issueID, map[string]any{"status": "done"})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("mark done: %d", resp.StatusCode)
+	}
 	resp.Body.Close()
-
-	t.Cleanup(func() {
-		clearTasks(t, issueID)
-		resp := authRequest(t, "DELETE", "/api/issues/"+issueID, nil)
-		resp.Body.Close()
-	})
-
-	// @mention the assigned agent on the done issue — should trigger.
-	content := fmt.Sprintf("[@Agent](mention://agent/%s) reopen this please", agentID)
-	postComment(t, issueID, content, nil)
-
-	if n := countPendingTasks(t, issueID); n != 1 {
-		t.Errorf("expected 1 pending task after @mention of assignee on done issue, got %d", n)
+	plain := postComment(t, issueID, "A follow-up after completion", nil)
+	mentioned := postComment(t, issueID, fmt.Sprintf("[@Owner](mention://agent/%s) another detail", ownerID), nil)
+	session := readHTTPCommentSession(t, issueID)
+	if session.ID != initial.ID || session.ActiveTaskID == nil || initial.ActiveTaskID == nil || *session.ActiveTaskID != *initial.ActiveTaskID || countPendingTasks(t, issueID) != 1 || len(session.Events) != 4 {
+		t.Fatalf("done status changed the owner routing: %+v", session)
+	}
+	for i, id := range []string{plain, mentioned} {
+		event := session.Events[i+2]
+		if event.Kind != "comment.created" || event.SourceID == nil || *event.SourceID != id || event.Status != "pending" {
+			t.Fatalf("done follow-up was not delivered to the owner inbox: %+v", event)
+		}
 	}
 }

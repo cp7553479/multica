@@ -113,10 +113,8 @@ func seedAllowListedAgent(t *testing.T, name, ownerUserID, mode string, memberTa
 // failure this fix repairs is entry-point wiring: the gate and the enqueue used to
 // resolve the chain from different places, and only the wired path shows that.
 
-// agentComments posts a comment as the agent, speaking from taskID — the only way
-// an agent's lineage reaches the comment row. A comment-triggered run must reply
-// under its own trigger, so replyUnder carries that parent; it is empty for a run
-// with no trigger comment to answer.
+// agentComments posts an explicit top-level comment or reply as the agent.
+// taskID is the authenticated source of the event's human authorization.
 func agentComments(t *testing.T, agentID, taskID, issueID, content, replyUnder string) *testutil.Response {
 	t.Helper()
 	body := map[string]any{"content": content}
@@ -207,180 +205,161 @@ func lastCommentOn(t *testing.T, issueID string) string {
 	return commentID
 }
 
-// triggerCommentOf returns the comment a task was woken by, which is the only
-// parent its replies may use (taskCoversReplyParent).
-func triggerCommentOf(t *testing.T, taskID string) string {
-	t.Helper()
-	var triggerCommentID pgtype.UUID
-	dbfx.QueryRow(t, `SELECT trigger_comment_id FROM agent_task_queue WHERE id = $1`, taskID).Scan(&triggerCommentID)
-	return uuidToString(triggerCommentID)
-}
-
 func runTo(t *testing.T, taskID string) {
 	t.Helper()
-	dbfx.Exec(t, `UPDATE agent_task_queue SET status = 'running' WHERE id = $1`, taskID)
+	dbfx.Exec(t, `UPDATE agent_task_queue SET status='running',started_at=COALESCE(started_at,now()) WHERE id=$1`, taskID)
 }
 
 func mention(agentID string) string {
 	return "[@Worker](mention://agent/" + agentID + ") please take this"
 }
 
-// TestCrossIssueDelegation_OriginatorChainSurvivesTheHop is the reported bug, end
-// to end over HTTP: the delegation that works on the coordinator's own issue must
-// keep working when the coordinator delegates on another issue, and the woken run
-// must carry the SAME human — that inherited originator is what every later
-// mention / assign / sub-issue in it is judged by.
+// The same human authorization must reach an explicitly assigned owner whether
+// the author writes on its source issue or on another issue.
 func TestCrossIssueDelegation_OriginatorChainSurvivesTheHop(t *testing.T) {
-	if testHandler == nil || testPool == nil {
-		t.Skip("database not available")
-	}
-	// bohan owns the coordinator and is the only member on the worker's allow-list.
 	bohan := testUserID
 	worker := seedAllowListedAgent(t, "MUL-6490 worker", bohan, "public_to", bohan)
-
 	for _, tc := range []struct {
 		name  string
 		cross bool
-	}{
-		{"same issue (already worked)", false},
-		{"cross issue (the regression)", true},
-	} {
+	}{{"same issue", false}, {"cross issue", true}} {
 		t.Run(tc.name, func(t *testing.T) {
 			chain := newCrossIssueChain(t, bohan, bohan)
 			target := chain.IssueX
 			if tc.cross {
 				target = chain.IssueY
 			}
-
-			agentComments(t, chain.CoordinatorID, chain.TaskA, target, mention(worker), "").
-				Want(http.StatusCreated)
-
-			// The comment must record the run that wrote it. This is the carrier;
-			// a NULL here is the break the report saw.
-			if got := commentSourceTaskOf(t, lastCommentOn(t, target)); uuidToString(got) != chain.TaskA {
-				t.Fatalf("comment.source_task_id = %q, want the authoring run %q", uuidToString(got), chain.TaskA)
+			// The issue chooses the owner. The mention is ordinary content;
+			// this unattributed fixture assignment cannot authorize an execution.
+			dbfx.Exec(t, `UPDATE issue SET assignee_type='agent',assignee_id=$2 WHERE id=$1`, target, worker)
+			var posted CommentResponse
+			agentComments(t, chain.CoordinatorID, chain.TaskA, target, mention(worker), "").Want(http.StatusCreated).JSON(&posted)
+			if got := commentSourceTaskOf(t, posted.ID); uuidToString(got) != chain.TaskA {
+				t.Fatalf("comment source=%s, want the cross-issue authoring task %s", uuidToString(got), chain.TaskA)
 			}
-
+			var capturedHuman, capturedTask, eventOwner string
+			dbfx.QueryRow(t, `SELECT e.originator_user_id,e.source_task_id,s.agent_id FROM issue_agent_event e JOIN issue_agent_session s ON s.id=e.session_id WHERE e.source_id=$1 AND e.kind='comment.created'`, posted.ID).Scan(&capturedHuman, &capturedTask, &eventOwner)
+			if capturedHuman != bohan || capturedTask != chain.TaskA || eventOwner != worker {
+				t.Fatalf("captured chain human=%s task=%s owner=%s", capturedHuman, capturedTask, eventOwner)
+			}
 			taskID, originator, ok := queuedTaskFor(t, target, worker)
-			if !ok {
-				t.Fatal("the allow-listed worker was not enqueued: the delegation was refused")
+			if !ok || uuidToString(originator) != bohan {
+				t.Fatalf("owner execution lost the authorized human: task=%s originator=%s present=%t", taskID, uuidToString(originator), ok)
 			}
-			if uuidToString(originator) != bohan {
-				t.Fatalf("woken run originator = %q (valid=%v), want %q — the chain lost its human across the hop",
-					uuidToString(originator), originator.Valid, bohan)
+			runTo(t, taskID)
+			second := seedAllowListedAgent(t, "MUL-6490 second worker", bohan, "public_to", bohan)
+			nextIssue := seedChainIssue(t, "MUL-6490 next coordinated issue", worker)
+			dbfx.Exec(t, `UPDATE issue SET assignee_type='agent',assignee_id=$2 WHERE id=$1`, nextIssue, second)
+			var followup CommentResponse
+			agentComments(t, worker, taskID, nextIssue, mention(second), "").Want(http.StatusCreated).JSON(&followup)
+			if got := commentSourceTaskOf(t, followup.ID); uuidToString(got) != taskID {
+				t.Fatalf("next event lost its active source task: %s", uuidToString(got))
 			}
-
-			// A third hop proves the chain keeps travelling rather than surviving
-			// exactly one boundary. Entry-point coverage is in the sibling test.
-			t.Run("the chain continues past the woken run", func(t *testing.T) {
-				runTo(t, taskID)
-				second := seedAllowListedAgent(t, "MUL-6490 second worker", bohan, "public_to", bohan)
-
-				agentComments(t, worker, taskID, target, mention(second), triggerCommentOf(t, taskID)).
-					Want(http.StatusCreated)
-				if _, _, ok := queuedTaskFor(t, target, second); !ok {
-					t.Fatal("@mention from inside the woken run was refused (invocation_not_allowed)")
-				}
-			})
+			if _, human, ok := queuedTaskFor(t, nextIssue, second); !ok || uuidToString(human) != bohan {
+				t.Fatalf("next owner execution lost the same human: present=%t originator=%s", ok, uuidToString(human))
+			}
 		})
 	}
 }
 
-// TestCrossIssueDelegation_EveryEntryPointJudgesTheSameHuman is the matrix that
-// matters for this fix: {mention, assign, sub-issue} × {bohan's chain, alice's
-// chain, no chain}, all from inside a run woken across an issue boundary.
-//
-// Two things are pinned at once. The chain must be CARRIED — all three entry
-// points recover for the human who started it. And it must never be REPLACED:
-// alice triggers a coordinator that BOHAN owns, so the owner-inheritance fallback
-// the report proposed would silently upgrade alice's flow to bohan's authority.
-// Every entry point resolves the acting human through its own wiring, so a fix
-// that repairs one and not the others is a real outcome this catches.
 func TestCrossIssueDelegation_EveryEntryPointJudgesTheSameHuman(t *testing.T) {
-	if testHandler == nil || testPool == nil {
-		t.Skip("database not available")
-	}
 	bohan := testUserID
 	_, _, alice := privateAgentTestFixture(t)
-
-	// firstHop admits both members, so every case reaches the second hop and the
-	// difference isolates to whose authority the chain carries. secondHop admits
-	// ONLY bohan — it is the agent an owner fallback would wrongly unlock.
 	firstHop := seedAllowListedAgent(t, "MUL-6490 shared worker", bohan, "public_to", bohan, alice)
 	secondHop := seedAllowListedAgent(t, "MUL-6490 bohan-only worker", bohan, "public_to", bohan)
-
 	for _, tc := range []struct {
-		name    string
-		chainOf any
-		admit   bool
+		name, chainOf string
+		admit         bool
 	}{
 		{"bohan's chain reaches a bohan-only agent", bohan, true},
 		{"alice's chain does not become bohan's", alice, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			// The coordinator is owned by BOHAN in every case: only the human at
-			// the top of the chain may vary the outcome.
 			chain := newCrossIssueChain(t, bohan, tc.chainOf)
-			agentComments(t, chain.CoordinatorID, chain.TaskA, chain.IssueY, mention(firstHop), "").
-				Want(http.StatusCreated)
-
+			dbfx.Exec(t, `UPDATE issue SET assignee_type='agent',assignee_id=$2 WHERE id=$1`, chain.IssueY, firstHop)
+			agentComments(t, chain.CoordinatorID, chain.TaskA, chain.IssueY, mention(firstHop), "").Want(http.StatusCreated)
 			firstTaskID, originator, ok := queuedTaskFor(t, chain.IssueY, firstHop)
-			if !ok {
-				t.Fatal("first hop was refused although both members are allow-listed")
-			}
-			if uuidToString(originator) != tc.chainOf {
-				t.Fatalf("first hop originator = %q, want %q", uuidToString(originator), tc.chainOf)
+			if !ok || uuidToString(originator) != tc.chainOf {
+				t.Fatalf("first owner borrowed another human: task=%s originator=%s present=%t", firstTaskID, uuidToString(originator), ok)
 			}
 			runTo(t, firstTaskID)
-
-			t.Run("mention", func(t *testing.T) {
-				agentComments(t, firstHop, firstTaskID, chain.IssueY, mention(secondHop),
-					triggerCommentOf(t, firstTaskID)).Want(http.StatusCreated)
-				// A blocked mention is reported in trigger_outcomes, not as an
-				// error status, so the enqueue is what says yes or no.
-				if _, _, got := queuedTaskFor(t, chain.IssueY, secondHop); got != tc.admit {
-					t.Fatalf("mention admitted = %v, want %v", got, tc.admit)
+			t.Run("comment to assigned owner", func(t *testing.T) {
+				target := seedChainIssue(t, "Explicit second comment owner", firstHop)
+				dbfx.Exec(t, `UPDATE issue SET assignee_type='agent',assignee_id=$2 WHERE id=$1`, target, secondHop)
+				var posted CommentResponse
+				agentComments(t, firstHop, firstTaskID, target, mention(secondHop), "").Want(http.StatusCreated).JSON(&posted)
+				if _, _, got := queuedTaskFor(t, target, secondHop); got != tc.admit {
+					t.Fatalf("assigned owner admitted=%t, want %t", got, tc.admit)
+				}
+				var human, status string
+				dbfx.QueryRow(t, `SELECT originator_user_id,status FROM issue_agent_event WHERE source_id=$1 AND kind='comment.created'`, posted.ID).Scan(&human, &status)
+				if human != tc.chainOf || (!tc.admit && status != "ignored") {
+					t.Fatalf("event substituted authority: human=%s status=%s", human, status)
 				}
 			})
-
 			t.Run("assign", func(t *testing.T) {
 				want := http.StatusForbidden
 				if tc.admit {
 					want = http.StatusOK
 				}
-				resp := agentAssigns(t, firstHop, firstTaskID, chain.IssueY, secondHop).Want(want)
+				response := agentAssigns(t, firstHop, firstTaskID, chain.IssueY, secondHop).Want(want)
 				if !tc.admit {
-					assertDenialReason(t, resp, "you do not have permission to assign work to this agent")
+					assertDenialReason(t, response, "you do not have permission to assign work to this agent")
+				}
+				if _, human, ok := queuedTaskFor(t, chain.IssueY, secondHop); ok != tc.admit || (ok && uuidToString(human) != tc.chainOf) {
+					t.Fatalf("assignment substituted authority: present=%t human=%s", ok, uuidToString(human))
 				}
 			})
-
 			t.Run("sub-issue", func(t *testing.T) {
 				want := http.StatusForbidden
 				if tc.admit {
 					want = http.StatusCreated
 				}
-				resp := agentCreatesSubIssue(t, firstHop, firstTaskID, chain.IssueY, secondHop).Want(want)
+				response := agentCreatesSubIssue(t, firstHop, firstTaskID, chain.IssueY, secondHop).Want(want)
 				if !tc.admit {
-					assertDenialReason(t, resp, "you do not have permission to assign work to this agent")
+					assertDenialReason(t, response, "you do not have permission to assign work to this agent")
+					return
+				}
+				var created struct {
+					ID string `json:"id"`
+				}
+				response.JSON(&created)
+				if _, human, ok := queuedTaskFor(t, created.ID, secondHop); !ok || uuidToString(human) != tc.chainOf {
+					t.Fatalf("sub-issue substituted authority: present=%t human=%s", ok, uuidToString(human))
 				}
 			})
 		})
 	}
-
-	// A chain with no human at its top grants nothing anywhere, which is the
-	// fail-closed side of the same rule: propagation carries a human, it never
-	// invents one. The first hop already stops here, so there is no second hop to
-	// drive — a member-scoped allow-list has nobody to match.
-	t.Run("an unattributed chain grants nothing", func(t *testing.T) {
-		chain := newCrossIssueChain(t, bohan, nil)
-		agentComments(t, chain.CoordinatorID, chain.TaskA, chain.IssueY, mention(firstHop), "").
-			Want(http.StatusCreated)
-		if _, _, ok := queuedTaskFor(t, chain.IssueY, firstHop); ok {
-			t.Fatal("an unattributed chain must not satisfy a member-scoped allow-list")
-		}
-		agentAssigns(t, chain.CoordinatorID, chain.TaskA, chain.IssueY, firstHop).Want(http.StatusForbidden)
-		agentCreatesSubIssue(t, chain.CoordinatorID, chain.TaskA, chain.IssueY, firstHop).Want(http.StatusForbidden)
-	})
+	for _, tc := range []struct {
+		name     string
+		terminal bool
+	}{{"unattributed source", false}, {"terminal source cannot borrow its former human", true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			var human any
+			if tc.terminal {
+				human = bohan
+			}
+			chain := newCrossIssueChain(t, bohan, human)
+			if tc.terminal {
+				dbfx.Exec(t, `UPDATE agent_task_queue SET status='completed',completed_at=now() WHERE id=$1`, chain.TaskA)
+			}
+			target := seedChainIssue(t, "Refused source comment owner", chain.CoordinatorID)
+			dbfx.Exec(t, `UPDATE issue SET assignee_type='agent',assignee_id=$2 WHERE id=$1`, target, firstHop)
+			var posted CommentResponse
+			agentComments(t, chain.CoordinatorID, chain.TaskA, target, mention(firstHop), "").Want(http.StatusCreated).JSON(&posted)
+			if _, _, ok := queuedTaskFor(t, target, firstHop); ok {
+				t.Fatal("unattributed or terminal source acquired member-scoped authority")
+			}
+			var originator pgtype.UUID
+			var status, reason string
+			dbfx.QueryRow(t, `SELECT originator_user_id,status,failure_reason FROM issue_agent_event WHERE source_id=$1 AND kind='comment.created'`, posted.ID).Scan(&originator, &status, &reason)
+			if originator.Valid || status != "ignored" || reason != "invocation_not_allowed" {
+				t.Fatalf("invalid source lent authority: originator=%s status=%s reason=%s", uuidToString(originator), status, reason)
+			}
+			agentAssigns(t, chain.CoordinatorID, chain.TaskA, chain.IssueY, firstHop).Want(http.StatusForbidden)
+			agentCreatesSubIssue(t, chain.CoordinatorID, chain.TaskA, chain.IssueY, firstHop).Want(http.StatusForbidden)
+		})
+	}
 }
 
 // TestCrossIssueDelegation_GateAndStampAgreeOnTheHuman closes the split-brain the

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/multica-ai/multica/server/internal/testutil"
@@ -15,7 +16,7 @@ import (
 func TestIssueWakeupLargeSingleFactPreservesReferences(t *testing.T) {
 	payload, _ := json.Marshal(map[string]any{"comment_id": "source-comment", "changed_fields": strings.Repeat("字段", 20000)})
 	w := db.IssueWakeup{Instruction: strings.Repeat("指", 4000)}
-	note, _ := mergeWakeupEvidence(w, db.AgentTaskQueue{}, []db.IssueWakeupReceipt{{EventType: "comment.updated", Payload: payload}})
+	note, _ := buildWakeupEvidence(w, []db.IssueWakeupReceipt{{EventType: "comment.updated", Payload: payload}})
 	if len(note) > wakeupNoteLimit || !utf8.ValidString(note) || !strings.Contains(note, w.Instruction) || !strings.Contains(note, "source-comment") || !strings.Contains(note, wakeupOmittedEvidence) {
 		t.Fatalf("oversized fact not safely condensed: %d bytes", len(note))
 	}
@@ -45,69 +46,80 @@ func TestIssueWakeupRegistrationRunDoesNotTriggerItself(t *testing.T) {
 func TestIssueWakeupOversizedPendingEvidenceStillConsumesInputs(t *testing.T) {
 	f, s, issue, agent := wakeFixture(t)
 	w := wakeCreate(t, f, s, issue, WakeupInput{AgentID: agent, Kind: "event", Mode: "continuous", EventTypes: []string{"comment.created"}, Instruction: "Keep this instruction"})
-	f.Comment(t, util.UUIDToString(issue), "first")
+	first := f.Comment(t, util.UUIDToString(issue), "first")
+	// Real receipt payloads may contain large changed-field sets. Bound the
+	// rendered event while retaining its source reference and raw receipt.
+	f.Exec(t, "UPDATE issue_wakeup_receipt SET payload=payload||jsonb_build_object('changed_fields',$2::text) WHERE wakeup_id=$1 AND processed_at IS NULL", w.ID, strings.Repeat("字段", 20000))
 	wakeDispatch(t, s, w)
-	task, err := f.q.FindPendingWakeupTask(context.Background(), util.UUIDToString(w.ID))
-	if err != nil {
-		t.Fatal(err)
-	}
-	f.Exec(t, "UPDATE agent_task_queue SET handoff_note=$2 WHERE id=$1", task.ID, strings.Repeat("旧", 20000))
+	task := wakeupSessionTask(t, f, issue, agent)
 	latest := f.Comment(t, util.UUIDToString(issue), "latest")
 	wakeDispatch(t, s, w)
-	got, err := f.q.GetAgentTask(context.Background(), task.ID)
-	if err != nil {
-		t.Fatal(err)
+	inputs := wakeupInbox(t, f, w.ID)
+	if len(inputs) != 2 {
+		t.Fatalf("durable rule inputs = %+v, want both", inputs)
 	}
-	if !utf8.ValidString(got.HandoffNote.String) || len(got.HandoffNote.String) > 40000 || !strings.Contains(got.HandoffNote.String, latest) || !strings.Contains(got.HandoffNote.String, w.Instruction) {
-		t.Fatalf("evidence not bounded with instruction/latest reference: %d bytes", len(got.HandoffNote.String))
+	for i, want := range []string{first, latest} {
+		var payload wakeupSessionPayload
+		if err := json.Unmarshal(inputs[i].Payload, &payload); err != nil {
+			t.Fatal(err)
+		}
+		if !utf8.ValidString(payload.Note) || len(payload.Note) > wakeupNoteLimit || !strings.Contains(payload.Note, want) || !strings.Contains(payload.Note, w.Instruction) || len(payload.ReceiptIDs) != 1 {
+			t.Fatalf("input %d lost bounded instruction/source/evidence: %s", i, inputs[i].Payload)
+		}
+		if i == 0 && !strings.Contains(payload.Note, wakeupOmittedEvidence) {
+			t.Fatalf("oversized input lacked current-state instruction: %s", inputs[i].Payload)
+		}
 	}
 	if n := f.Count(t, "SELECT count(*) FROM issue_wakeup_receipt WHERE wakeup_id=$1 AND processed_at IS NULL", w.ID); n != 0 {
 		t.Fatalf("%d inputs stalled", n)
 	}
-	if n := f.Count(t, "SELECT count(*) FROM issue_wakeup_receipt WHERE wakeup_id=$1 AND task_id=$2", w.ID, task.ID); n != 2 {
-		t.Fatalf("lost durable evidence: %d", n)
+	if n := f.Count(t, "SELECT count(*) FROM issue_wakeup_receipt r JOIN issue_agent_event e ON e.source_id=r.id WHERE r.wakeup_id=$1 AND e.kind='wakeup.fired'", w.ID); n != 2 {
+		t.Fatalf("lost durable receipt references: %d", n)
 	}
-	if n := f.Count(t, "SELECT count(*) FROM agent_task_queue WHERE context->>'wakeup_id'=$1", util.UUIDToString(w.ID)); n != 1 {
-		t.Fatalf("duplicate task: %d", n)
+	if claimed := wakeupClaimEvents(t, f, s, task, 32); len(claimed) != 2 {
+		t.Fatalf("bounded inputs not deliverable: %+v", claimed)
+	}
+	if n := f.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id=$1", issue); n != 1 {
+		t.Fatalf("duplicate consumers: %d", n)
 	}
 }
 
-func TestIssueWakeupDispatchedWaitIsObservableAndResumes(t *testing.T) {
+func TestIssueWakeupDispatchedSessionKeepsNewInputsUntilRunningDelivery(t *testing.T) {
 	f, s, issue, agent := wakeFixture(t)
 	w := wakeCreate(t, f, s, issue, WakeupInput{AgentID: agent, Kind: "event", Mode: "continuous", EventTypes: []string{"comment.created"}, Instruction: "Wait for input"})
-	f.Comment(t, util.UUIDToString(issue), "first")
+	first := f.Comment(t, util.UUIDToString(issue), "first")
 	wakeDispatch(t, s, w)
-	task, err := f.q.FindPendingWakeupTask(context.Background(), util.UUIDToString(w.ID))
-	if err != nil {
-		t.Fatal(err)
+	task := wakeupSessionTask(t, f, issue, agent)
+	initial := wakeupClaimEvents(t, f, s, task, 32)
+	if len(initial) != 1 || !strings.Contains(string(initial[0].Payload), first) {
+		t.Fatalf("initial delivery = %+v", initial)
 	}
-	f.Exec(t, "UPDATE agent_task_queue SET status='dispatched',dispatched_at=now()-interval '10 minutes',prepare_lease_expires_at=now()-interval '1 minute' WHERE id=$1", task.ID)
-	f.Comment(t, util.UUIDToString(issue), "next")
+	f.Exec(t, "UPDATE agent_task_queue SET dispatched_at=now()-interval '10 minutes',prepare_lease_expires_at=now()-interval '1 minute' WHERE id=$1", task.ID)
+	task.Status = "dispatched"
+	latest := f.Comment(t, util.UUIDToString(issue), "next")
 	wakeDispatch(t, s, w)
-	got, err := f.q.GetIssueWakeup(context.Background(), db.GetIssueWakeupParams{ID: w.ID, WorkspaceID: w.WorkspaceID})
-	if err != nil {
-		t.Fatal(err)
+	inputs := wakeupInbox(t, f, w.ID)
+	if len(inputs) != 2 || inputs[0].Status != "delivering" || inputs[1].Status != "pending" {
+		t.Fatalf("preparation wait lost claimed or pending input: %+v", inputs)
 	}
-	if !got.LastError.Valid {
-		t.Fatal("stale dispatched wait is invisible")
+	if replay := wakeupClaimEvents(t, f, s, task, 32); len(replay) != 1 || replay[0].ID != initial[0].ID || string(replay[0].Payload) != string(initial[0].Payload) {
+		t.Fatalf("preparation replay changed its claimed input: %+v", replay)
 	}
-	unchanged, _ := f.q.GetAgentTask(context.Background(), task.ID)
-	if unchanged.HandoffNote != task.HandoffNote {
-		t.Fatal("changed claimed prompt")
+	current := wakeupSessionTask(t, f, issue, agent)
+	if current.ID != task.ID || !current.PrepareLeaseExpiresAt.Valid || !current.PrepareLeaseExpiresAt.Time.Before(time.Now()) {
+		t.Fatalf("stale preparation was hidden or replaced: %+v", current)
 	}
-	if n := f.Count(t, "SELECT count(*) FROM issue_wakeup_receipt WHERE wakeup_id=$1 AND processed_at IS NULL", w.ID); n != 1 {
-		t.Fatalf("pending input lost: %d", n)
-	}
+	wakeupAckEvents(t, s, task, initial)
 	f.Exec(t, "UPDATE agent_task_queue SET status='running',started_at=now() WHERE id=$1", task.ID)
-	wakeDispatch(t, s, w)
-	got, err = f.q.GetIssueWakeup(context.Background(), db.GetIssueWakeupParams{ID: w.ID, WorkspaceID: w.WorkspaceID})
-	if err != nil {
-		t.Fatal(err)
+	task.Status = "running"
+	next := wakeupClaimEvents(t, f, s, task, 32)
+	if len(next) != 1 || next[0].ID != inputs[1].ID || !strings.Contains(string(next[0].Payload), latest) {
+		t.Fatalf("running safe boundary did not deliver next input: %+v", next)
 	}
-	if got.LastError.Valid || got.LastTaskID == task.ID {
-		t.Fatal("did not resume/clear error after start")
+	if n := f.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id=$1", issue); n != 1 {
+		t.Fatalf("preparation wait created %d consumers", n)
 	}
 	if n := f.Count(t, "SELECT count(*) FROM issue_wakeup_receipt WHERE wakeup_id=$1 AND processed_at IS NULL", w.ID); n != 0 {
-		t.Fatalf("pending input stalled: %d", n)
+		t.Fatalf("session transfer left %d stalled receipts", n)
 	}
 }

@@ -589,7 +589,7 @@ func (r *Router) processClaimed(ctx context.Context, set ResolverSet, msg channe
 		res.ChannelRouteRevision = started.RouteRevision
 	}
 	var mediaIssue db.Issue
-	var deferredIssueTaskID pgtype.UUID
+	var deferredIssueSessionID pgtype.UUID
 
 	// 7. /issue command, if present. chat_message is already durable; all
 	//    error returns from here signal finalizeNone (or the defensive Mark).
@@ -616,9 +616,9 @@ func (r *Router) processClaimed(ctx context.Context, set ResolverSet, msg channe
 		prefix, workspaceSlug := r.issueWorkspaceIdentity(ctx, inst.WorkspaceID)
 		var assignedRunFireAt time.Time
 		if resolveMedia {
-			// The generic deferred-task sweeper is the crash fallback. Leave room
-			// after the media deadline for the bounded attachment finalizer so it
-			// cannot race an issue agent reading the newly-created issue.
+			// The session wake deadline recovers a crashed media finalizer. Leave
+			// room after media resolution for attachment binding before the issue
+			// session is allowed to consume its assignment event.
 			assignedRunFireAt = localMediaDeadline.Add(mediaFinalizeTimeout)
 		}
 		issueRes, err := r.createIssue(ctx, inst, set.OriginType, identity.UserID, sessionID, *appendRes.IssueCommand, prefix, assignedRunFireAt)
@@ -645,21 +645,21 @@ func (r *Router) processClaimed(ctx context.Context, set ResolverSet, msg channe
 		}
 		res.IssueID = issueRes.Issue.ID
 		mediaIssue = issueRes.Issue
-		deferredIssueTaskID = issueRes.AssignedTaskID
+		deferredIssueSessionID = issueRes.AssignedSessionID
 		res.IssueNumber = issueRes.Issue.Number
 		res.IssueTitle = issueRes.Issue.Title
 		// Same renderer the broadcast payload uses, so a degraded prefix can't
 		// show the chat "#42" while the realtime list shows "-42".
 		res.IssueIdentifier = service.IssueIdentifier(prefix, issueRes.Issue.Number)
 		res.IssueWorkspaceSlug = workspaceSlug
-		// IssueService.Create already enqueues the assigned agent's issue task.
+		// IssueService.Create already records the assigned agent's issue session.
 		// Scheduling the command as a chat run too makes the agent execute the
 		// same /issue input again. A synchronous issue command is terminal.
 		if resolveMedia {
 			r.enqueueMedia(set, inst, identity, appendRes.MessageID, msg, sessionID, mediaIssue, pgtype.Text{
 				String: appendRes.IssueCommand.Description,
 				Valid:  true,
-			}, msg.CommandText, deferredIssueTaskID, localMediaDeadline)
+			}, msg.CommandText, deferredIssueSessionID, localMediaDeadline)
 		}
 		return res, postAppendFinalize, nil
 	}
@@ -707,7 +707,7 @@ func (r *Router) processClaimed(ctx context.Context, set ResolverSet, msg channe
 	}
 	res.runScheduled = !msg.SkipAgentRun && (startTaskCommitted || !startChat)
 	if resolveMedia {
-		r.enqueueMedia(set, inst, identity, appendRes.MessageID, msg, sessionID, mediaIssue, pgtype.Text{}, "", deferredIssueTaskID, localMediaDeadline)
+		r.enqueueMedia(set, inst, identity, appendRes.MessageID, msg, sessionID, mediaIssue, pgtype.Text{}, "", deferredIssueSessionID, localMediaDeadline)
 	}
 	if appendRes.BecameVisible && !startChat {
 		r.notifyChatCreated(
@@ -745,8 +745,8 @@ func (r *Router) notifyChatCreated(inst ResolvedInstallation, creatorID pgtype.U
 // order within a chat session. Run scheduling is independent and durable: the
 // task service defers a task to the persisted media deadline, then media
 // completion promotes it early.
-func (r *Router) enqueueMedia(set ResolverSet, inst ResolvedInstallation, identity ResolvedIdentity, chatMessageID pgtype.UUID, msg channel.InboundMessage, sessionID pgtype.UUID, issue db.Issue, issueDescriptionBase pgtype.Text, issueCommandText string, issueTaskID pgtype.UUID, deadline time.Time) {
-	r.enqueueMediaJob(set, inst, identity, chatMessageID, msg, sessionID, issue, issueDescriptionBase, issueCommandText, issueTaskID, true, deadline)
+func (r *Router) enqueueMedia(set ResolverSet, inst ResolvedInstallation, identity ResolvedIdentity, chatMessageID pgtype.UUID, msg channel.InboundMessage, sessionID pgtype.UUID, issue db.Issue, issueDescriptionBase pgtype.Text, issueCommandText string, issueSessionID pgtype.UUID, deadline time.Time) {
+	r.enqueueMediaJob(set, inst, identity, chatMessageID, msg, sessionID, issue, issueDescriptionBase, issueCommandText, issueSessionID, true, deadline)
 }
 
 // enqueueMediaFinalization clears the durable media-pending marker without
@@ -771,7 +771,7 @@ func (r *Router) enqueueMediaFinalization(set ResolverSet, inst ResolvedInstalla
 	}()
 }
 
-func (r *Router) enqueueMediaJob(set ResolverSet, inst ResolvedInstallation, identity ResolvedIdentity, chatMessageID pgtype.UUID, msg channel.InboundMessage, sessionID pgtype.UUID, issue db.Issue, issueDescriptionBase pgtype.Text, issueCommandText string, issueTaskID pgtype.UUID, resolveRemote bool, deadline time.Time) {
+func (r *Router) enqueueMediaJob(set ResolverSet, inst ResolvedInstallation, identity ResolvedIdentity, chatMessageID pgtype.UUID, msg channel.InboundMessage, sessionID pgtype.UUID, issue db.Issue, issueDescriptionBase pgtype.Text, issueCommandText string, issueSessionID pgtype.UUID, resolveRemote bool, deadline time.Time) {
 	key := keyForSession(sessionID)
 	done := make(chan struct{})
 
@@ -826,7 +826,7 @@ func (r *Router) enqueueMediaJob(set ResolverSet, inst ResolvedInstallation, ide
 				// sees the dead deadline and runs only the empty finalize.
 			}
 		}
-		r.resolveAndBindMedia(set, inst, identity, chatMessageID, msg, sessionID, issue, issueDescriptionBase, issueCommandText, issueTaskID, resolveRemote, deadline)
+		r.resolveAndBindMedia(set, inst, identity, chatMessageID, msg, sessionID, issue, issueDescriptionBase, issueCommandText, issueSessionID, resolveRemote, deadline)
 	}()
 }
 
@@ -839,7 +839,7 @@ const mediaFinalizeTimeout = 5 * time.Second
 // acknowledgement.
 const mediaAbandonNoticeTimeout = 15 * time.Second
 
-func (r *Router) resolveAndBindMedia(set ResolverSet, inst ResolvedInstallation, identity ResolvedIdentity, chatMessageID pgtype.UUID, msg channel.InboundMessage, sessionID pgtype.UUID, issue db.Issue, issueDescriptionBase pgtype.Text, issueCommandText string, issueTaskID pgtype.UUID, resolveRemote bool, deadline time.Time) {
+func (r *Router) resolveAndBindMedia(set ResolverSet, inst ResolvedInstallation, identity ResolvedIdentity, chatMessageID pgtype.UUID, msg channel.InboundMessage, sessionID pgtype.UUID, issue db.Issue, issueDescriptionBase pgtype.Text, issueCommandText string, issueSessionID pgtype.UUID, resolveRemote bool, deadline time.Time) {
 	ctx, cancel := context.WithDeadline(r.mediaCtx, deadline)
 	defer cancel()
 
@@ -912,13 +912,13 @@ func (r *Router) resolveAndBindMedia(set ResolverSet, inst ResolvedInstallation,
 	if bindErr == nil && issue.ID.Valid && len(resolved.MediaRefs) > 0 {
 		r.issues.PublishAttachmentsChanged(finalizeCtx, issue, identity.UserID)
 	}
-	if issueTaskID.Valid {
-		if err := r.tasks.PromoteDeferredChannelIssueTask(finalizeCtx, issueTaskID); err != nil {
-			r.logger.Warn("channel router: media-ready issue task promotion failed",
+	if issueSessionID.Valid {
+		if err := r.tasks.ReleaseIssueAgentSession(finalizeCtx, issueSessionID); err != nil {
+			r.logger.Warn("channel router: media-ready issue session release failed",
 				"channel_type", string(msg.Source.ChannelType),
 				"event_id", msg.EventID,
 				"message_id", msg.MessageID,
-				"task_id", util.UUIDToString(issueTaskID),
+				"issue_agent_session_id", util.UUIDToString(issueSessionID),
 				"err", err)
 		}
 	}

@@ -129,16 +129,15 @@ func (s *IssueWakeupService) Delete(ctx context.Context, issueID, id, member pgt
 		return err
 	}
 	for _, task := range tasks {
-		s.Tasks.broadcastTaskEvent(ctx, protocol.EventTaskCancelled, task)
+		s.Tasks.broadcastTaskEvent(ctx, protocol.EventTaskCancelled, db.AgentTaskQueue(task))
 	}
+	s.wakeWithdrawnIssueSessions(ctx, issueID)
 	return nil
 }
 
-// CheckIn lets a run of a scheduled check end without a comment when it found
-// nothing new. The note is kept on the run and shown with the rule; the run
-// completion then skips the synthesized fallback comment. This is the only
-// exception to "every run leaves a comment": it needs a run the rule itself
-// started, and only an every/cron rule.
+// CheckIn records an explicit audit note for a scheduled rule whose input this
+// execution received. Notes belong to the rule; final output stays in the run
+// transcript and comments are published only through explicit issue tools.
 func (s *IssueWakeupService) CheckIn(ctx context.Context, issueID, id, taskID pgtype.UUID, agentID string, note string) error {
 	note = strings.TrimSpace(note)
 	if note == "" || utf8.RuneCountInString(note) > maxWakeupCheckinRunes {
@@ -150,13 +149,13 @@ func (s *IssueWakeupService) CheckIn(ctx context.Context, issueID, id, taskID pg
 	}
 	defer tx.Rollback(ctx)
 	q := s.Tasks.Queries.WithTx(tx)
-	var status, wakeupID string
+	var status string
 	var taskIssue, taskAgent pgtype.UUID
-	err = tx.QueryRow(ctx, "SELECT status,issue_id,agent_id,COALESCE(context->>'wakeup_id','') FROM agent_task_queue WHERE id=$1 FOR UPDATE", taskID).Scan(&status, &taskIssue, &taskAgent, &wakeupID)
+	err = tx.QueryRow(ctx, "SELECT status,issue_id,agent_id FROM agent_task_queue WHERE id=$1 FOR UPDATE", taskID).Scan(&status, &taskIssue, &taskAgent)
 	if err != nil {
 		return ErrWakeupForbidden
 	}
-	if taskIssue != issueID || wakeupID != util.UUIDToString(id) || util.UUIDToString(taskAgent) != agentID {
+	if taskIssue != issueID || util.UUIDToString(taskAgent) != agentID {
 		return ErrWakeupForbidden
 	}
 	if status != "running" {
@@ -166,6 +165,15 @@ func (s *IssueWakeupService) CheckIn(ctx context.Context, issueID, id, taskID pg
 	if err != nil {
 		return err
 	}
+	var received bool
+	if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM issue_agent_event e JOIN issue_agent_session s ON s.id=e.session_id
+	 WHERE e.delivery_task_id=$1 AND e.kind='wakeup.fired' AND e.payload->>'wakeup_id'=$2
+	 AND e.status IN ('delivering','delivered') AND s.issue_id=$3 AND s.agent_id=$4)`, taskID, util.UUIDToString(id), issueID, taskAgent).Scan(&received); err != nil {
+		return err
+	}
+	if !received {
+		return ErrWakeupForbidden
+	}
 	if w.Kind != "every" && w.Kind != "cron" {
 		return fmt.Errorf("%w: check-ins are for scheduled checks; post a comment instead", ErrWakeupInput)
 	}
@@ -174,7 +182,7 @@ func (s *IssueWakeupService) CheckIn(ctx context.Context, issueID, id, taskID pg
 		return err
 	}
 	checkin, _ := json.Marshal(map[string]any{"note": note, "at": now.UTC().Format(time.RFC3339)})
-	if _, err = tx.Exec(ctx, "UPDATE agent_task_queue SET context=COALESCE(context,'{}'::jsonb)||jsonb_build_object('wakeup_checkin',$2::jsonb) WHERE id=$1", taskID, checkin); err != nil {
+	if _, err = tx.Exec(ctx, "UPDATE agent_task_queue SET context=COALESCE(context,'{}'::jsonb)||jsonb_build_object('wakeup_checkins',COALESCE(context->'wakeup_checkins','{}'::jsonb)||jsonb_build_object($3::text,$2::jsonb)) WHERE id=$1", taskID, checkin, util.UUIDToString(id)); err != nil {
 		return err
 	}
 	activity, err := recordWakeupActivity(ctx, q, w, wakeupActivityCheckin, "agent", taskAgent, map[string]any{"note": note, "task_id": util.UUIDToString(taskID)})
@@ -186,17 +194,4 @@ func (s *IssueWakeupService) CheckIn(ctx context.Context, issueID, id, taskID pg
 	}
 	s.publishWakeupActivities(activity)
 	return nil
-}
-
-// HasWakeupCheckin reports whether a completed run ended with a check-in, in
-// which case its completion posts no fallback comment.
-func HasWakeupCheckin(task db.AgentTaskQueue) bool {
-	var ctx struct {
-		WakeupID string          `json:"wakeup_id"`
-		Checkin  json.RawMessage `json:"wakeup_checkin"`
-	}
-	if json.Unmarshal(task.Context, &ctx) != nil {
-		return false
-	}
-	return ctx.WakeupID != "" && len(ctx.Checkin) > 0 && string(ctx.Checkin) != "null"
 }

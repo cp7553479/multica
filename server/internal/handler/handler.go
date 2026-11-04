@@ -544,6 +544,13 @@ func New(queries *db.Queries, txStarter txStarter, hub *realtime.Hub, bus *event
 		LLM: llmClient,
 		cfg: cfg,
 	}
+	if daemonHub != nil {
+		h.DaemonTaskSupplement = daemonHub
+		taskSvc.IssueSessionWakeup = daemonHub
+	}
+	taskSvc.IssueSessionCanInvoke = func(ctx context.Context, agent db.Agent, event db.IssueAgentEvent) bool {
+		return h.canInvokeAgent(ctx, agent, event.ActorType, uuidToString(event.ActorID), uuidToString(event.OriginatorUserID), uuidToString(event.WorkspaceID))
+	}
 	h.WebhookDeliveryWorker = NewWebhookDeliveryWorker(h)
 	// The default passthrough scheduler reports sweeper-race recoveries so the
 	// daemon:register refresh fires even without the production batched wiring.

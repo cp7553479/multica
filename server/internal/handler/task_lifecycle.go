@@ -69,7 +69,8 @@ type PinTaskSessionRequest struct {
 
 func (h *Handler) PinTaskSession(w http.ResponseWriter, r *http.Request) {
 	taskID := chi.URLParam(r, "taskId")
-	if _, ok := h.requireDaemonTaskAccess(w, r, taskID); !ok {
+	task, ok := h.requireDaemonTaskAccess(w, r, taskID)
+	if !ok {
 		return
 	}
 
@@ -80,6 +81,23 @@ func (h *Handler) PinTaskSession(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.SessionID == "" && req.WorkDir == "" {
 		writeError(w, http.StatusBadRequest, "session_id or work_dir required")
+		return
+	}
+
+	if service.IsIssueAgentSessionTask(task) {
+		if req.SessionID == "" || req.WorkDir == "" {
+			writeError(w, http.StatusBadRequest, "issue session pin requires both session_id and work_dir")
+			return
+		}
+		if err := h.TaskService.PinIssueAgentSession(r.Context(), task.ID, req.SessionID, req.WorkDir); err != nil {
+			if errors.Is(err, service.ErrIssueAgentSessionPinConflict) {
+				writeErrorCode(w, http.StatusConflict, "issue_session_pin_conflict", "the issue session pin conflicts with its recorded identity or runtime")
+			} else {
+				writeError(w, http.StatusServiceUnavailable, "issue session pin could not be persisted; retry this pin")
+			}
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 
@@ -152,8 +170,8 @@ type RerunIssueRequest struct {
 	TaskID string `json:"task_id,omitempty"`
 }
 
-// RerunIssue preserves the issue-scoped API used by installed clients. A
-// task_id repeats that run; an empty body targets the current assignee.
+// RerunIssue preserves the issue-scoped API for auxiliary and squad runs.
+// Persistent issue sessions require an event rather than a separate rerun.
 func (h *Handler) RerunIssue(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	issue, ok := h.loadIssueForUser(w, r, id)
@@ -244,6 +262,10 @@ func (h *Handler) rerunIssue(w http.ResponseWriter, r *http.Request, issue db.Is
 	}
 
 	task, err := h.TaskService.RerunIssue(r.Context(), issue.ID, sourceTaskID, pgtype.UUID{}, actorUserID, fresh, canInvoke)
+	if errors.Is(err, service.ErrIssueSessionRerunRequiresEvent) {
+		writeErrorCode(w, http.StatusConflict, "issue_session_event_required", "retry the existing session event or add a comment to continue this issue session")
+		return
+	}
 	if errors.Is(err, service.ErrRerunInvokeNotAllowed) {
 		h.writeDispatchBlocked(w, http.StatusForbidden, ReasonInvocationNotAllowed)
 		return

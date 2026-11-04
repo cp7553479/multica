@@ -1,12 +1,10 @@
 package service
 
 import (
-	"context"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/util"
-	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
 func TestIssueWakeupSquadLeaderAttribution(t *testing.T) {
@@ -55,15 +53,13 @@ func TestIssueWakeupSquadLeaderAttribution(t *testing.T) {
 			}
 			f.Exec(t, "UPDATE issue_wakeup SET next_fire_at=now()-interval '1 second' WHERE id=$1", w.ID)
 			wakeDispatch(t, s, w)
-			current, err := f.q.GetIssueWakeup(context.Background(), db.GetIssueWakeupParams{
-				ID: w.ID, WorkspaceID: w.WorkspaceID,
-			})
-			if err != nil {
-				t.Fatal(err)
+			events := wakeupInbox(t, f, w.ID)
+			if len(events) != 1 || events[0].Status != "pending" {
+				t.Fatalf("explicit rule input missing: %+v", events)
 			}
-			task, err := f.q.GetAgentTask(context.Background(), current.LastTaskID)
-			if err != nil {
-				t.Fatal(err)
+			task := wakeupSessionTask(t, f, issue, agent)
+			if task.OriginatorUserID != parseTestUUID(t, f.UserID) {
+				t.Fatal("squad execution did not retain the rule creator's invocation rights")
 			}
 			if task.IsLeaderTask != tc.wantLeader {
 				t.Fatalf("is_leader_task=%v, want %v", task.IsLeaderTask, tc.wantLeader)

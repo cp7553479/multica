@@ -24,10 +24,8 @@ import (
 // Contract highlights:
 //   - Running one is NOT a new dispatch path. It renders the prompt, posts an
 //     ordinary comment carrying optional target mention markup (marked with
-//     quick_action_id), and hands off to triggerTasksForComment. Permission, attribution, squad routing,
-//     the execution log, and pending-task coalescing are inherited from the
-//     comment path rather than reimplemented — the MUL-3375 lesson about four
-//     drifting copies of one trigger decision.
+//     quick_action_id), and delivers it to the issue's assigned agent session.
+//     Mentions describe recipients but never select an execution owner.
 //   - PERMISSION IS CHECKED IN EXACTLY ONE PLACE: RunQuickAction. The list
 //     endpoint does no permission work and hides nothing beyond `private`
 //     ownership. Filtering the sidebar by invoke permission was tried and
@@ -814,8 +812,8 @@ func (h *Handler) RenderQuickAction(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// RunQuickAction renders the action and posts it as a quick_action comment,
-// then hands off to the standard comment trigger path.
+// RunQuickAction renders the action as an ordinary inbox comment, preserving
+// the authenticated writer's delegation lineage in the mutation transaction.
 //
 // This is the ONLY place invoke permission is checked. The list endpoint hides
 // nothing beyond `private` ownership, so a member may well click an action
@@ -823,10 +821,9 @@ func (h *Handler) RenderQuickAction(w http.ResponseWriter, r *http.Request) {
 // dialog, which is more informative than a button that silently was not there.
 //
 // The success response is a CommentResponse carrying trigger_outcomes,
-// identical in shape to POST /comments — so the client reuses one result
-// handler and gets `coalesced` (merged into the target's pending task),
-// `deferred` (runtime offline), and `blocked` for free.
+// identical in shape to POST /comments. Routing follows the assigned session.
 func (h *Handler) RunQuickAction(w http.ResponseWriter, r *http.Request) {
+	r = h.withWakeupActor(r)
 	issue, ok := h.loadIssueForUser(w, r, chi.URLParam(r, "id"))
 	if !ok {
 		return
@@ -879,19 +876,26 @@ func (h *Handler) RunQuickAction(w http.ResponseWriter, r *http.Request) {
 
 	body := sanitizeNullBytes(buildQuickActionBody(qa, target))
 
-	created, err := h.Queries.CreateComment(r.Context(), db.CreateCommentParams{
-		ID:          dbid.NewV7(),
-		IssueID:     issue.ID,
-		WorkspaceID: issue.WorkspaceID,
-		AuthorType:  actorType,
-		AuthorID:    parseUUID(actorID),
-		Content:     body,
-		// Deliberately an ordinary comment. The collapsed card is driven by
-		// quick_action_id, which no client can set — `type` is client-supplied
-		// on the generic comment endpoint, so a dedicated type value would be
-		// forgeable and would also have cost a CHECK rebuild on a hot table.
-		Type:          "comment",
-		QuickActionID: qa.ID,
+	var sourceTaskID pgtype.UUID
+	if actorType == "agent" {
+		sourceTaskID = h.commentSourceTaskID(r)
+	}
+	created, err := wakeupWrite(h, r, func(q *db.Queries) (db.CreateCommentRow, error) {
+		return q.CreateComment(r.Context(), db.CreateCommentParams{
+			ID:           dbid.NewV7(),
+			IssueID:      issue.ID,
+			WorkspaceID:  issue.WorkspaceID,
+			AuthorType:   actorType,
+			AuthorID:     parseUUID(actorID),
+			SourceTaskID: sourceTaskID,
+			Content:      body,
+			// Deliberately an ordinary comment. The collapsed card is driven by
+			// quick_action_id, which no client can set — `type` is client-supplied
+			// on the generic comment endpoint, so a dedicated type value would be
+			// forgeable and would also have cost a CHECK rebuild on a hot table.
+			Type:          "comment",
+			QuickActionID: qa.ID,
+		})
 	})
 	if err != nil {
 		slog.Warn("quick action comment create failed", append(logger.RequestAttrs(r), "error", err, "quick_action_id", uuidToString(qa.ID))...)
@@ -911,7 +915,7 @@ func (h *Handler) RunQuickAction(w http.ResponseWriter, r *http.Request) {
 		"issue_revision":      created.IssueRevision,
 	})
 
-	resp.TriggerOutcomes = h.triggerTasksForComment(r.Context(), issue, comment, nil, actorType, actorID, originatorUserID, nil, commentSteerRequest{})
+	resp.TriggerOutcomes = h.commentSessionOutcomes(r.Context(), issue, actorType, actorID, originatorUserID)
 
 	// Usage telemetry is best-effort and deliberately outside the run's
 	// success path: a failed counter must never cost the user the run.

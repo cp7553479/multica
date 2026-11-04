@@ -1222,6 +1222,12 @@ func TestRerunIssueAttributesToRerunningMember(t *testing.T) {
 		t.Fatalf("EnqueueTaskForIssue (original): %v", err)
 	}
 
+	// The source is auxiliary work on an unassigned issue. Agent-owned issues
+	// continue through their persistent event inbox.
+	if _, err := pool.Exec(ctx, `UPDATE issue SET assignee_type=NULL,assignee_id=NULL WHERE id=$1`, issueID); err != nil {
+		t.Fatalf("prepare auxiliary issue: %v", err)
+	}
+
 	// The rerun, performed by a different member.
 	task, err := svc.RerunIssue(ctx, util.MustParseUUID(issueID), orig.ID, pgtype.UUID{}, util.MustParseUUID(rerunnerID), false, nil)
 	if err != nil {

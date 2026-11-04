@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-func TestUpdateComment_RequeuesDelegatedFailureRecoverySurvivor(t *testing.T) {
+func TestUpdateComment_DelegatedFailureRecoveryStaysInSessionInbox(t *testing.T) {
 	if testHandler == nil || testPool == nil {
 		t.Skip("database not available")
 	}
@@ -105,8 +105,8 @@ func TestUpdateComment_RequeuesDelegatedFailureRecoverySurvivor(t *testing.T) {
 	if err := testPool.QueryRow(ctx, `SELECT status FROM agent_task_queue WHERE id = $1`, cancelledTaskID).Scan(&cancelledStatus); err != nil {
 		t.Fatalf("read cancelled task: %v", err)
 	}
-	if cancelledStatus != "cancelled" {
-		t.Fatalf("original batch status = %q, want cancelled", cancelledStatus)
+	if cancelledStatus != "queued" {
+		t.Fatalf("historical batch status = %q, want unchanged queued status", cancelledStatus)
 	}
 	var activeTasks int
 	var recoveryCovered bool
@@ -114,12 +114,27 @@ func TestUpdateComment_RequeuesDelegatedFailureRecoverySurvivor(t *testing.T) {
 		SELECT count(*), COALESCE(bool_or(trigger_comment_id = $3::uuid OR $3::uuid = ANY(coalesced_comment_ids)), false)
 		FROM agent_task_queue
 		WHERE agent_id = $1 AND issue_id = $2
+		  AND trigger_comment_id IS NOT NULL
 		  AND status IN ('queued', 'dispatched', 'running', 'waiting_local_directory')`, coordinatorID, sourceIssueID, recoveryCommentID).
 		Scan(&activeTasks, &recoveryCovered); err != nil {
 		t.Fatalf("read rebuilt coordinator task: %v", err)
 	}
-	// Rebuilding an old cross-thread batch preserves both independent runs.
-	if activeTasks != 2 || !recoveryCovered {
-		t.Fatalf("rebuilt active tasks/recovery coverage = %d/%v, want 2/true", activeTasks, recoveryCovered)
+	if activeTasks != 1 || !recoveryCovered {
+		t.Fatalf("historical task/recovery coverage = %d/%v, want the unchanged task and its stored source", activeTasks, recoveryCovered)
+	}
+	var sessionID string
+	if err := testPool.QueryRow(ctx, `SELECT id FROM issue_agent_session WHERE issue_id=$1 AND agent_id=$2`, sourceIssueID, coordinatorID).Scan(&sessionID); err != nil {
+		t.Fatal(err)
+	}
+	if n := dbfx.Count(t, `SELECT count(*) FROM issue_agent_event WHERE session_id=$1 AND source_id=$2 AND kind='comment.updated' AND actor_type='member' AND actor_id=$3 AND payload->>'content'='edited instruction'`, sessionID, humanCommentID, testUserID); n != 1 {
+		t.Fatalf("authenticated edit produced %d coordinator-session input(s), want one", n)
+	}
+	// A stored system notice retains provenance without inheriting authority
+	// from a finished worker task. Only the new member edit grants new input.
+	if n := dbfx.Count(t, `SELECT count(*) FROM issue_agent_event WHERE session_id=$1 AND source_id=$2 AND kind='comment.created' AND source_task_id=$3 AND actor_type='system' AND originator_user_id IS NULL`, sessionID, recoveryCommentID, failedTaskID); n != 1 {
+		t.Fatalf("historical recovery source was lost or treated as fresh human authority: %d matching events", n)
+	}
+	if n := dbfx.Count(t, `SELECT count(*) FROM agent_task_queue WHERE id=$1 AND delegated_from_task_id=$2 AND originator_user_id=$3 AND accountable_user_id=$3`, failedTaskID, sourceTaskID, testUserID); n != 1 {
+		t.Fatalf("edit changed the delegated source chain: %d matching tasks", n)
 	}
 }
