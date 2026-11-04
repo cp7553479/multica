@@ -278,3 +278,25 @@ WITH removed_events AS (
     )
 )
 DELETE FROM issue_agent_session s WHERE s.issue_id = @issue_id AND s.workspace_id = @workspace_id;
+
+-- name: GetAutopilotIssueAgentAssignment :one
+SELECT * FROM issue_agent_event WHERE session_id= @session_id AND sequence=1 AND kind='assigned';
+
+-- name: BindAutopilotIssueAgentAssignment :one
+UPDATE issue_agent_event SET actor_type='system',actor_id=NULL,
+ originator_user_id=sqlc.narg(originator_user_id),
+ payload=payload||jsonb_build_object('autopilot_dispatch', @dispatch::jsonb),
+ status='pending',failure_reason=NULL,updated_at=now()
+WHERE session_id= @session_id AND sequence=1 AND kind='assigned'
+ AND status IN ('pending','ignored') AND NOT payload ? 'autopilot_dispatch'
+RETURNING *;
+
+-- name: FindLegacyAutopilotIssueDispatch :one
+-- Read-only cutover evidence; never manufacture another legacy execution.
+SELECT id FROM agent_task_queue
+WHERE issue_id= @issue_id AND agent_id= @agent_id
+ AND context->>'type' IS DISTINCT FROM 'issue_session'
+ AND trigger_comment_id IS NULL AND comment_thread_id IS NULL
+ AND retry_of_task_id IS NULL AND rerun_of_task_id IS NULL
+ AND autopilot_run_id IS NULL
+ORDER BY created_at,id LIMIT 1;

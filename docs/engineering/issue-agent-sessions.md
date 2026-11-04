@@ -59,6 +59,20 @@ The session row serializes sequence allocation. Rollback also rolls back the
 event and sequence increment. Comment bodies are immutable event snapshots;
 subsequent edits are new facts, not replacement execution plans.
 
+Autopilot `create_issue` assignments to an agent use this same initial input.
+The issue/run transaction binds its dispatch ID and the existing manual or
+trigger-owner attribution snapshot to the assignment event before commit.
+Creating the first session consumer links `autopilot_run.task_id` in the same
+transaction; its task remains an issue execution rather than a `run_only` task.
+Wake and claim recheck the captured principal's current membership and invocation
+rights. Later comments do not replace the Autopilot's first dispatch link.
+
+A failed post-commit wake leaves the durable input available to runtime polling
+and the existing webhook repair path. Repair respects the original issue target
+and never overwrites a human reassignment or replays terminal/previously dispatched
+history. Historical task identification is read-only; no ordinary issue task is
+created as a fallback.
+
 The event states are `pending`, `delivering`, `delivered`, `failed`, and
 `ignored`. A failed or unconfirmed head prevents later events from overtaking
 it. The UI retains the true first unsettled event as well as recent history,

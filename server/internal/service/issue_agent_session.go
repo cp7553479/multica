@@ -278,7 +278,9 @@ func (s *TaskService) WakeIssueAgentSession(ctx context.Context, sessionID pgtyp
 			}
 		}
 		attr := attribution.Unattributed(attribution.EvidenceIssueAssignment, issue.ID)
-		if event.Kind == "wakeup.fired" {
+		if input, ok := decodeAutopilotIssueSessionInput(event); ok {
+			attr = input.Attribution
+		} else if event.Kind == "wakeup.fired" {
 			attr = wakeupEventAttribution(event)
 		} else if event.ActorType == "member" {
 			attr = attribution.DirectHumanRun(event.ActorID, attribution.EvidenceIssueAssignment, issue.ID)
@@ -326,6 +328,11 @@ func (s *TaskService) WakeIssueAgentSession(ctx context.Context, sessionID pgtyp
 		}
 		if _, err := q.SetIssueAgentSessionActiveTask(ctx, db.SetIssueAgentSessionActiveTaskParams{ID: session.ID, TaskID: task.ID}); err != nil {
 			return err
+		}
+		if input, ok := decodeAutopilotIssueSessionInput(event); ok {
+			if _, err := q.SetAutopilotRunDispatchTask(ctx, db.SetAutopilotRunDispatchTaskParams{ID: input.RunID, TaskID: task.ID}); err != nil {
+				return err
+			}
 		}
 		created = &task
 		return nil

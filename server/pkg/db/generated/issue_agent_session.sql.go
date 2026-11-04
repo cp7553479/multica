@@ -99,6 +99,50 @@ func (q *Queries) AckIssueAgentEventFailed(ctx context.Context, arg AckIssueAgen
 	return i, err
 }
 
+const bindAutopilotIssueAgentAssignment = `-- name: BindAutopilotIssueAgentAssignment :one
+UPDATE issue_agent_event SET actor_type='system',actor_id=NULL,
+ originator_user_id=$1,
+ payload=payload||jsonb_build_object('autopilot_dispatch', $2::jsonb),
+ status='pending',failure_reason=NULL,updated_at=now()
+WHERE session_id= $3 AND sequence=1 AND kind='assigned'
+ AND status IN ('pending','ignored') AND NOT payload ? 'autopilot_dispatch'
+RETURNING id, workspace_id, session_id, sequence, event_key, kind, source_id, source_revision, actor_type, actor_id, originator_user_id, source_task_id, payload, status, delivery_task_id, attempt_count, failure_reason, delivered_at, created_at, updated_at
+`
+
+type BindAutopilotIssueAgentAssignmentParams struct {
+	OriginatorUserID pgtype.UUID `json:"originator_user_id"`
+	Dispatch         []byte      `json:"dispatch"`
+	SessionID        pgtype.UUID `json:"session_id"`
+}
+
+func (q *Queries) BindAutopilotIssueAgentAssignment(ctx context.Context, arg BindAutopilotIssueAgentAssignmentParams) (IssueAgentEvent, error) {
+	row := q.db.QueryRow(ctx, bindAutopilotIssueAgentAssignment, arg.OriginatorUserID, arg.Dispatch, arg.SessionID)
+	var i IssueAgentEvent
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.SessionID,
+		&i.Sequence,
+		&i.EventKey,
+		&i.Kind,
+		&i.SourceID,
+		&i.SourceRevision,
+		&i.ActorType,
+		&i.ActorID,
+		&i.OriginatorUserID,
+		&i.SourceTaskID,
+		&i.Payload,
+		&i.Status,
+		&i.DeliveryTaskID,
+		&i.AttemptCount,
+		&i.FailureReason,
+		&i.DeliveredAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const bindUnstartedIssueAgentSessionRuntime = `-- name: BindUnstartedIssueAgentSessionRuntime :one
 UPDATE issue_agent_session
 SET runtime_id = $1, state = 'ready', failure_reason = NULL, updated_at = now()
@@ -564,6 +608,29 @@ func (q *Queries) FailUnacknowledgedIssueAgentEvents(ctx context.Context, taskID
 	return err
 }
 
+const findLegacyAutopilotIssueDispatch = `-- name: FindLegacyAutopilotIssueDispatch :one
+SELECT id FROM agent_task_queue
+WHERE issue_id= $1 AND agent_id= $2
+ AND context->>'type' IS DISTINCT FROM 'issue_session'
+ AND trigger_comment_id IS NULL AND comment_thread_id IS NULL
+ AND retry_of_task_id IS NULL AND rerun_of_task_id IS NULL
+ AND autopilot_run_id IS NULL
+ORDER BY created_at,id LIMIT 1
+`
+
+type FindLegacyAutopilotIssueDispatchParams struct {
+	IssueID pgtype.UUID `json:"issue_id"`
+	AgentID pgtype.UUID `json:"agent_id"`
+}
+
+// Read-only cutover evidence; never manufacture another legacy execution.
+func (q *Queries) FindLegacyAutopilotIssueDispatch(ctx context.Context, arg FindLegacyAutopilotIssueDispatchParams) (pgtype.UUID, error) {
+	row := q.db.QueryRow(ctx, findLegacyAutopilotIssueDispatch, arg.IssueID, arg.AgentID)
+	var id pgtype.UUID
+	err := row.Scan(&id)
+	return id, err
+}
+
 const finishIssueAgentSessionTask = `-- name: FinishIssueAgentSessionTask :one
 UPDATE issue_agent_session
 SET active_task_id = NULL,
@@ -608,6 +675,38 @@ func (q *Queries) FinishIssueAgentSessionTask(ctx context.Context, arg FinishIss
 		&i.State,
 		&i.FailureReason,
 		&i.NextSequence,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const getAutopilotIssueAgentAssignment = `-- name: GetAutopilotIssueAgentAssignment :one
+SELECT id, workspace_id, session_id, sequence, event_key, kind, source_id, source_revision, actor_type, actor_id, originator_user_id, source_task_id, payload, status, delivery_task_id, attempt_count, failure_reason, delivered_at, created_at, updated_at FROM issue_agent_event WHERE session_id= $1 AND sequence=1 AND kind='assigned'
+`
+
+func (q *Queries) GetAutopilotIssueAgentAssignment(ctx context.Context, sessionID pgtype.UUID) (IssueAgentEvent, error) {
+	row := q.db.QueryRow(ctx, getAutopilotIssueAgentAssignment, sessionID)
+	var i IssueAgentEvent
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.SessionID,
+		&i.Sequence,
+		&i.EventKey,
+		&i.Kind,
+		&i.SourceID,
+		&i.SourceRevision,
+		&i.ActorType,
+		&i.ActorID,
+		&i.OriginatorUserID,
+		&i.SourceTaskID,
+		&i.Payload,
+		&i.Status,
+		&i.DeliveryTaskID,
+		&i.AttemptCount,
+		&i.FailureReason,
+		&i.DeliveredAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 	)

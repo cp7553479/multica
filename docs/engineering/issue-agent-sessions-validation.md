@@ -79,6 +79,38 @@ the new routing model.
 - Historical receipts, revision CAS, stale claims, token rollback and concurrent
   retry atomicity remain tested after removing the obsolete routing contracts.
 
+## Autopilot routing follow-up
+
+Independent review identified an additional producer: Autopilot `create_issue`
+created both the captured assignment input and an ordinary queued issue task.
+The latter could conflict with the session consumer's pending-thread uniqueness
+constraint during runtime wake. This is a queue/claim blockage, not evidence of
+two simultaneous executions on the same issue and agent.
+
+A temporary Go overlay of the old producer reproduced the ordinary queued task.
+The current regression proves schedule/manual × single-then-batch/batch-then-single
+claim combinations can dispatch the Autopilot issue and another issue on the same
+runtime with capacity two. Initial input, run linkage, invocation attribution,
+provider ID and retained directory remain associated with the same logical session.
+
+Real database regressions also cover departed-member refusal, human reassignment,
+terminal history, unrecorded historical dispatch links, post-commit wake failure,
+webhook delivery idempotency and explicit same-event retry. The original failed
+Autopilot run keeps its recorded dispatch outcome when a later session recovery
+executes; a comment continuation cannot become that run's dispatch.
+
+- Complete service suite: passed, 8.648 s.
+- Autopilot and issue-session race regressions: passed, 2.172 s.
+- Autopilot repair regressions: five cases passed, 0.582 s.
+- HTTP listener regressions: 17 cases passed, 0.805 s.
+- Webhook crash-window and adjacent regressions: four cases passed, 0.768 s.
+- Complete handler suite: passed, 53.751 s.
+- Complete server HTTP/listener suite: passed, 4.072 s.
+- `go vet ./...`, regenerated sqlc and `git diff --check`: passed.
+
+No new migration, frontend change or generic recovery infrastructure is required
+for this producer fix. Existing squad and `run_only` dispatch retain their scope.
+
 ## Browser checks and limits
 
 The real session panel and application styles were checked with synthetic API

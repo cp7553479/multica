@@ -316,22 +316,21 @@ func (s *AutopilotService) DispatchAutopilotForWebhookDelivery(
 	return dispatched, err
 }
 
-// ensureWebhookCreateIssueTask repairs the create_issue crash window after the
-// issue/run transaction commits but before the ordinary task enqueue commits.
-// Any existing issue task is sufficient evidence that ownership has already
-// moved downstream; otherwise enqueue exactly the same assignee path used by
-// the original dispatch.
+// ensureWebhookCreateIssueTask repairs the committed create_issue input's
+// wake hint. Terminal/linked runs remain idempotent, and a human reassignment
+// never lends the new owner's session to the old Autopilot dispatch.
 func (s *AutopilotService) ensureWebhookCreateIssueTask(ctx context.Context, autopilot db.Autopilot, run db.AutopilotRun) error {
-	hasTasks, err := s.Queries.HasTaskForIssue(ctx, run.IssueID)
-	if err != nil {
-		return fmt.Errorf("dispatch for webhook delivery: inspect issue tasks: %w", err)
-	}
-	if hasTasks {
+	if run.Status != "issue_created" || run.TaskID.Valid {
 		return nil
 	}
 	issue, err := s.Queries.GetIssue(ctx, run.IssueID)
 	if err != nil {
 		return fmt.Errorf("dispatch for webhook delivery: load linked issue: %w", err)
+	}
+	// A replay cannot replace the issue's original dispatch target with a
+	// subsequently edited Autopilot target or a human's new assignee.
+	if autopilot.AssigneeType != issue.AssigneeType.String || autopilot.AssigneeID != issue.AssigneeID {
+		return nil
 	}
 	// Repair only work that is still waiting to be picked up. Decided on
 	// lifecycle plus the two exact keys whose behavior does not generalize,
@@ -362,6 +361,15 @@ func (s *AutopilotService) ensureWebhookCreateIssueTask(ctx context.Context, aut
 	if !runnable {
 		return nil
 	}
+	if issue.AssigneeType.String != "agent" {
+		hasTasks, err := s.Queries.HasTaskForIssue(ctx, run.IssueID)
+		if err != nil {
+			return fmt.Errorf("dispatch for webhook delivery: inspect issue tasks: %w", err)
+		}
+		if hasTasks {
+			return nil
+		}
+	}
 	if autopilot.AssigneeType == "squad" {
 		leader, _, err := s.resolveAutopilotLeader(ctx, autopilot)
 		if err != nil {
@@ -374,11 +382,43 @@ func (s *AutopilotService) ensureWebhookCreateIssueTask(ctx context.Context, aut
 		s.linkDispatchTask(ctx, &run, task)
 		return nil
 	}
-	task, err := s.TaskSvc.EnqueueTaskForIssue(ctx, issue)
-	if err != nil {
-		return fmt.Errorf("dispatch for webhook delivery: repair issue task: %w", err)
+	if issue.AssigneeType.String != "agent" || issue.CreatorType != "agent" || issue.AssigneeID != issue.CreatorID {
+		return nil
 	}
-	s.linkDispatchTask(ctx, &run, task)
+	session, err := s.Queries.GetIssueAgentSessionForPair(ctx, db.GetIssueAgentSessionForPairParams{WorkspaceID: issue.WorkspaceID, IssueID: issue.ID, AgentID: issue.AssigneeID})
+	if err != nil {
+		return err
+	}
+	initial, err := s.Queries.GetAutopilotIssueAgentAssignment(ctx, session.ID)
+	if err != nil {
+		return err
+	}
+	if _, bound := decodeAutopilotIssueSessionInput(initial); !bound {
+		historical, historyErr := s.Queries.FindLegacyAutopilotIssueDispatch(ctx, db.FindLegacyAutopilotIssueDispatchParams{IssueID: issue.ID, AgentID: issue.CreatorID})
+		if historyErr == nil {
+			// Older committed dispatches are read-only recovery evidence,
+			// not permission to replay their assignment into a fresh consumer.
+			_, err = s.Queries.SetAutopilotRunDispatchTask(ctx, db.SetAutopilotRunDispatchTaskParams{ID: run.ID, TaskID: historical})
+			return err
+		}
+		if !errors.Is(historyErr, pgx.ErrNoRows) {
+			return historyErr
+		}
+	}
+	tx, err := s.TxStarter.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if _, _, err = s.bindAutopilotIssueSessionInput(ctx, s.Queries.WithTx(tx), issue, run, pgtype.UUID{}); err != nil {
+		return fmt.Errorf("repair autopilot session input: %w", err)
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return err
+	}
+	if err = s.wakeAutopilotIssueSession(ctx, issue, &run); err != nil {
+		return fmt.Errorf("wake repaired autopilot session: %w", err)
+	}
 	return nil
 }
 
@@ -672,7 +712,7 @@ func dispatchFailReasonCode(err error) dispatch.ReasonCode {
 	return dispatch.ReasonInternalError
 }
 
-// dispatchCreateIssue creates an issue and enqueues a task for the agent.
+// dispatchCreateIssue creates an issue and commits its initial session input.
 //
 // When the autopilot is assigned to a squad (Path A from MUL-2429), the
 // created issue inherits assignee_type='squad' + assignee_id=squad. The
@@ -797,6 +837,12 @@ func (s *AutopilotService) dispatchCreateIssue(ctx context.Context, ap db.Autopi
 		return fmt.Errorf("link run to issue: %w", err)
 	}
 	*run = updatedRun
+	var sessionAttr attribution.Result
+	if ap.AssigneeType == "agent" {
+		if _, sessionAttr, err = s.bindAutopilotIssueSessionInput(ctx, qtx, issue, *run, actorUserID); err != nil {
+			return fmt.Errorf("bind autopilot issue session: %w", err)
+		}
+	}
 	if _, err := settleAutopilotQuota(ctx, qtx, run.QuotaReservationID, true); err != nil {
 		return fmt.Errorf("consume quota reservation: %w", err)
 	}
@@ -832,16 +878,8 @@ func (s *AutopilotService) dispatchCreateIssue(ctx context.Context, ap db.Autopi
 	// roll back the issue itself.
 	s.notifyAutopilotSubscribersOnCreate(ctx, ap, issue, leader.ID, templateSubs)
 
-	// Enqueue agent task via the existing flow. Squad-assigned autopilots
-	// route to the resolved leader as the executing agent (Path A from
-	// MUL-2429); agent-assigned autopilots go through the standard issue
-	// path. Both code paths land in agent_task_queue with agent_id = leader.
-	// A MANUAL trigger (valid actorUserID) is a direct human action: enqueue via the
-	// actor-carrying entry points so attribution resolves direct_human to the
-	// triggering member (originator == accountable == actor, MUL-4302 §4). Schedule /
-	// webhook dispatch has no actor and takes the plain entry points, where the
-	// autopilot-origin issue resolves to the trigger's created_by principal
-	// (MUL-6951). The *ByActor variants are the actor-carrying enqueue methods.
+	// The initial agent input and its authorization snapshot have committed.
+	// Wake that inbox; squad dispatch retains its existing leader path.
 	var dispatchTask db.AgentTaskQueue
 	if ap.AssigneeType == "squad" {
 		// Fail-closed invocation gate: verify the admission principal (manual
@@ -858,12 +896,13 @@ func (s *AutopilotService) dispatchCreateIssue(ctx context.Context, ap db.Autopi
 		} else if dispatchTask, err = s.TaskSvc.EnqueueTaskForSquadLeader(ctx, issue, leader.ID, ap.AssigneeID, pgtype.UUID{}, OriginDerived); err != nil {
 			return fmt.Errorf("enqueue squad leader task: %w", err)
 		}
-	} else if actorUserID.Valid {
-		if dispatchTask, err = s.TaskSvc.EnqueueTaskForIssueByActor(ctx, issue, actorUserID); err != nil {
-			return fmt.Errorf("enqueue task for issue: %w", err)
+	} else {
+		s.TaskSvc.RecordHumanDelegation(ctx, sessionAttr)
+		if err = s.wakeAutopilotIssueSession(ctx, issue, run); err != nil {
+			// The issue and ordered input have committed. Runtime polling and
+			// webhook repair retry the wake without replaying issue creation.
+			slog.Warn("autopilot issue session wake deferred", "run_id", run.ID, "issue_id", issue.ID, "error", err)
 		}
-	} else if dispatchTask, err = s.TaskSvc.EnqueueTaskForIssue(ctx, issue); err != nil {
-		return fmt.Errorf("enqueue task for issue: %w", err)
 	}
 	s.linkDispatchTask(ctx, run, dispatchTask)
 
@@ -1413,10 +1452,28 @@ func (s *AutopilotService) loadDispatchChain(ctx context.Context, run db.Autopil
 		if err != nil {
 			return autopilotDispatchChain{}, err
 		}
+		if issue.CreatorType == "agent" {
+			session, sessionErr := s.Queries.GetIssueAgentSessionForPair(ctx, db.GetIssueAgentSessionForPairParams{WorkspaceID: issue.WorkspaceID, IssueID: issue.ID, AgentID: issue.CreatorID})
+			if sessionErr == nil {
+				initial, inputErr := s.Queries.GetAutopilotIssueAgentAssignment(ctx, session.ID)
+				if inputErr == nil {
+					if input, ok := decodeAutopilotIssueSessionInput(initial); ok && input.RunID == run.ID {
+						// New dispatches link atomically. With no link/delivery,
+						// a later ordinary comment is not the Autopilot run.
+						if !initial.DeliveryTaskID.Valid {
+							return autopilotDispatchChain{}, nil
+						}
+						rootID = initial.DeliveryTaskID
+					}
+				}
+			}
+		}
 		// ListTasksByIssue is newest first; the last match is the oldest.
-		for _, t := range tasks {
-			if !t.RetryOfTaskID.Valid && issue.CreatorType == "agent" && t.AgentID == issue.CreatorID {
-				rootID = t.ID
+		if !rootID.Valid {
+			for _, t := range tasks {
+				if !t.RetryOfTaskID.Valid && issue.CreatorType == "agent" && t.AgentID == issue.CreatorID {
+					rootID = t.ID
+				}
 			}
 		}
 		if !rootID.Valid {

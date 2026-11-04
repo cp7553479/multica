@@ -58,6 +58,12 @@ func (s *TaskService) issueAgentEventCanInvoke(ctx context.Context, q *db.Querie
 	if err != nil || issue.AssigneeType.String != "agent" || issue.AssigneeID != agent.ID {
 		return false
 	}
+	if input, ok := decodeAutopilotIssueSessionInput(event); ok {
+		return autopilotIssueSessionInputAllowed(ctx, q, issue, agent, event, input)
+	}
+	if event.Kind == "assigned" && event.Sequence == 1 && issue.OriginType.String == "autopilot" {
+		return false
+	}
 	return s.IssueSessionCanInvoke != nil && s.IssueSessionCanInvoke(ctx, agent, event)
 }
 
