@@ -160,6 +160,56 @@ provider input APIs remain in use. Existing scheduler, lifecycle, attribution,
 query/schema and UI component mechanisms are reused. This review adds no new
 framework, queue service, provider wrapper or generic recovery subsystem.
 
+## Delivery avatar follow-up
+
+The delivery UI reads durable ACK records rather than task creation, completion
+or the bounded session history. It shows only a 16 px receiving-agent avatar at
+the bottom left of the current issue description or comment, with an accessible
+"Delivered to" tooltip. Pending and failed state remain in the existing session
+panel. No placeholder turn or automatic comment is added.
+
+Real database regressions cover pending-to-delivered, duplicate ACK, retry,
+handler recreation, exact comment versions, historical records beyond 199,
+multiple same-version receivers, private-agent VIEW permissions, cross-issue and
+workspace isolation, global latest issue snapshots and request bounds. ACK hint
+regressions observe committed rows from another connection, suppress rollback
+and duplicate notifications, and cover retry before a subsequent wake failure.
+
+| Scope | Result |
+| --- | --- |
+| Complete service, handler, migration and HTTP server suites | Passed, 11.618 / 54.148 / 0.568 / 3.935 s |
+| Delivery projection handler regressions | Eight groups passed, 0.768 s |
+| ACK/retry publication with race detector | Four groups passed, 1.428 s |
+| Complete core suite | 209 files, 2713 tests passed |
+| Complete shared views suite | 565 files, 7218 tests passed |
+| Core/views, web and both desktop typechecks; changed-file ESLint; Go vet | Passed |
+| Concurrent index migration registration checks | Passed, 0.533 s |
+| Migration 619 down/up on separate test database | Valid and ready index; EXPLAIN uses the source-version index |
+
+Core and view regressions also cover cancelled stale reads, five-second polling,
+reconnect, batched timelines beyond 2000 IDs, per-agent deduplication, canonical
+comment revisions and hiding old receipts across components during optimistic
+edits. Issue draft and overlapping-save checks guard the same current-content
+boundary. The existing update wrappers use each native mutation Promise for
+completion callbacks. True overlapping saves test forward and reverse responses,
+including an older conflict after the newer save succeeded; current canonical
+cache state determines avatar eligibility. The final five focused suites passed
+231 tests; independent review also passed eight component, four native observer
+and four canonical-comment checks. The general comment revision also changes for some non-body edits;
+an earlier avatar may conservatively disappear in that case. This change does
+not invent a second content-version system.
+
+Chrome checked the actual delivery-avatar component and core polling hook with
+synthetic API records. It verified no avatar before ACK or for failure, arrival
+after ACK, duplicate/multiple receivers, reload persistence, exact 16 px size,
+bottom-left alignment, keyboard tooltip and 390 px Chinese dark layout. No page
+errors or horizontal overflow occurred. The surrounding page is a component
+fixture, not a complete live issue screen or a real-provider round trip.
+
+- [Before ACK](../assets/issue-agent-sessions/delivery-avatars-pending.png)
+- [After ACK, desktop light](../assets/issue-agent-sessions/delivery-avatars-desktop-light.png)
+- [After ACK, 390px Chinese dark](../assets/issue-agent-sessions/delivery-avatars-mobile-dark-zh.png)
+
 ## Browser checks and limits
 
 The real session panel and application styles were checked with synthetic API

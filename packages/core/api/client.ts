@@ -1,5 +1,7 @@
 import type { IssueAgentSession } from "../types/issue-agent-session";
+import type { IssueAgentDeliveries } from "../types/issue-agent-deliveries";
 import { IssueAgentSessionsSchema, RetryIssueAgentSessionEventSchema } from "./issue-agent-session-schema";
+import { IssueAgentDeliveriesSchema } from "./issue-agent-deliveries-schema";
 import type { ZodType } from "zod";
 import { AgentRuntimeSchema, EMPTY_RUNTIME } from "../runtimes/schema";
 import type { IssueWakeup, IssueWakeupInput, IssueWakeupSummaryRow, PausedWakeup, SystemWakeup, WakeupRun, WorkspaceSystemWakeup } from "../types/issue-wakeup";
@@ -1695,6 +1697,22 @@ export class ApiClient {
     const sessions = parseWithFallback<IssueAgentSession[] | null>(raw, IssueAgentSessionsSchema, null, { endpoint });
     if (sessions === null) throw new Error("Invalid agent session response");
     return sessions;
+  }
+
+  async getIssueAgentDeliveries(
+    issueId: string,
+    commentIds: readonly string[],
+    options?: { signal?: AbortSignal },
+  ): Promise<IssueAgentDeliveries> {
+    const endpoint = `/api/issues/${issueId}/agent-deliveries`;
+    const raw = await this.fetch<unknown>(endpoint, {
+      method: "POST",
+      body: JSON.stringify({ comment_ids: commentIds }),
+      signal: options?.signal,
+    });
+    const deliveries = parseWithFallback<IssueAgentDeliveries | null>(raw, IssueAgentDeliveriesSchema, null, { endpoint });
+    if (deliveries === null) throw new Error("Invalid agent delivery response");
+    return deliveries;
   }
 
   async retryIssueAgentSessionEvent(issueId: string, sessionId: string, eventId: string): Promise<void> {

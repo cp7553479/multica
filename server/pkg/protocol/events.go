@@ -8,6 +8,8 @@ const (
 	EventIssueDeleted            = "issue:deleted"
 	EventIssueMetadataChanged    = "issue_metadata:changed"
 	EventIssueAttachmentsChanged = "issue_attachments:changed"
+	// Content-free hint: clients re-read authorized delivery receipts for this issue.
+	EventIssueAgentDeliveryUpdated = "issue:agent_delivery_updated"
 	// Personal: one member's unread mark on an issue changed (MUL-8438).
 	EventIssueUnreadChanged = "issue_unread:changed"
 

@@ -2,7 +2,8 @@ import { forwardRef, useEffect, useRef, useState, useImperativeHandle } from "re
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import type { AgentTask, Attachment, Issue, IssueStatusEntry, Label, TimelineEntry } from "@multica/core/types";
+import type { AgentTask, Attachment, Issue, IssueStatusEntry, Label, TimelineEntry, IssueAgentDeliveries, IssueDeliveryReceipt } from "@multica/core/types";
+import { issueAgentDeliveryKeys } from "@multica/core/issues/agent-deliveries";
 import { issueKeys } from "@multica/core/issues/queries";
 import { issueStatusKeys } from "@multica/core/issue-statuses";
 import { I18nProvider } from "@multica/core/i18n/react";
@@ -35,6 +36,7 @@ const contentEditorMounts = vi.hoisted(() => ({ count: 0 }));
 // through it, so this counts card renders without reaching into the card.
 const readonlyContentRenders = vi.hoisted(() => [] as string[]);
 const descriptionSelectionAction = vi.hoisted(() => ({ current: undefined as { label: string; onSelect: () => void } | undefined }));
+const descriptionUpdates = vi.hoisted(() => ({ defer: false, flush: undefined as (() => void) | undefined }));
 // Stable empty-attachments reference: the real store returns a shared constant
 // so the `useCommentDraftStore(s => s.getAttachments(key))` selector keeps a
 // stable identity. A fresh `[]` per call would loop useSyncExternalStore.
@@ -261,7 +263,12 @@ vi.mock("../../editor", async () => ({
           valueRef.current = e.target.value;
           dirtyRef.current = true;
           setEditorValue(e.target.value);
-          onUpdate?.(e.target.value, baseRef.current);
+          const markdown = e.target.value;
+          if (syncedValue !== undefined && descriptionUpdates.defer) {
+            descriptionUpdates.flush = () => onUpdate?.(markdown, baseRef.current);
+          } else {
+            onUpdate?.(markdown, baseRef.current);
+          }
         }}
         placeholder={placeholder}
         data-testid="rich-text-editor"
@@ -317,6 +324,7 @@ vi.mock("../../projects/components/project-picker", () => ({
 const mockApiObj = vi.hoisted(() => ({
   getIssue: vi.fn(),
   listTimeline: vi.fn().mockResolvedValue([]),
+  getIssueAgentDeliveries: vi.fn(),
   listComments: vi.fn().mockResolvedValue([]),
   createComment: vi.fn(),
   updateComment: vi.fn(),
@@ -550,6 +558,10 @@ vi.mock("@multica/core/realtime", () => ({
   WSProvider: ({ children }: { children: React.ReactNode }) => children,
   useRealtimeSync: () => {},
 }));
+vi.mock("../../../core/realtime/hooks", () => ({
+  useWSEvent: vi.fn(),
+  useWSReconnect: vi.fn(),
+}));
 
 // Mock sonner
 vi.mock("sonner", () => ({
@@ -645,13 +657,14 @@ function createTestQueryClient() {
 
 function renderIssueDetail(issueId = "issue-1") {
   const queryClient = createTestQueryClient();
-  return render(
+  const view = render(
     <I18nProvider locale="en" resources={TEST_RESOURCES}>
       <QueryClientProvider client={queryClient}>
         <IssueDetail issueId={issueId} />
       </QueryClientProvider>
     </I18nProvider>,
   );
+  return { ...view, queryClient };
 }
 
 /**
@@ -725,11 +738,18 @@ describe("IssueDetail (shared)", () => {
     contentEditorMounts.count = 0;
     readonlyContentRenders.length = 0;
     descriptionSelectionAction.current = undefined;
+    descriptionUpdates.defer = false;
+    descriptionUpdates.flush = undefined;
     mockViewport.isMobile = false;
     // Default: issue loads successfully
     mockApiObj.getIssue.mockResolvedValue(mockIssue);
     // /timeline returns the entries flat in chronological order (oldest first).
     mockApiObj.listTimeline.mockResolvedValue(mockTimeline);
+    mockApiObj.getIssueAgentDeliveries.mockResolvedValue({
+      issue: { source_revision: null, title: mockIssue.title, description: mockIssue.description, status: mockIssue.status,
+        stage: mockIssue.stage, assignee_id: mockIssue.assignee_id, receipts: [] },
+      comments: [],
+    });
     mockApiObj.listIssueReactions.mockResolvedValue([]);
     mockApiObj.listIssueSubscribers.mockResolvedValue([]);
     mockApiObj.listChildIssues.mockResolvedValue({ issues: [] });
@@ -1870,6 +1890,289 @@ describe("IssueDetail (shared)", () => {
     fireEvent.click(screen.getByText("Details"));
 
     expect(cardRenders()).toBe(before);
+  });
+
+  it("loads delivery receipts once for the issue, root comments and replies, and shows avatars only after acknowledgement", async () => {
+    const issue = { ...mockIssue, assignee_type: "agent" as const, assignee_id: "agent-1" };
+    const root = { ...mockTimeline[0]!, revision: 3 };
+    const reply = { ...mockTimeline[1]!, id: "reply-1", parent_id: root.id, revision: 2 };
+    const acknowledged = (source_id: string, source_revision: number): IssueDeliveryReceipt => ({
+      event_id: `event-${source_id}`, session_id: "session-1", agent_id: "agent-1", source_id, source_revision,
+      status: "delivered", delivered_at: "2026-11-04T00:00:00Z",
+    });
+    const projection: IssueAgentDeliveries = {
+      issue: { source_revision: issue.revision!, title: issue.title, description: issue.description,
+        status: issue.status, stage: issue.stage, assignee_id: issue.assignee_id,
+        receipts: [acknowledged(issue.id, issue.revision!)] },
+      comments: [
+        { comment_id: root.id, source_revision: root.revision, receipts: [acknowledged(root.id, root.revision)] },
+        { comment_id: reply.id, source_revision: reply.revision,
+          receipts: [{ ...acknowledged(reply.id, reply.revision), status: "pending", delivered_at: null }] },
+      ],
+    };
+    mockApiObj.getIssue.mockResolvedValue(issue);
+    mockApiObj.listTimeline.mockResolvedValue([root, reply]);
+    mockApiObj.getIssueAgentDeliveries.mockResolvedValue(projection);
+    const { queryClient } = renderIssueDetail();
+
+    await waitFor(() => expect(screen.getAllByRole("img", { name: "Delivered to Claude Agent" })).toHaveLength(2));
+    expect(mockApiObj.getIssueAgentDeliveries).toHaveBeenCalledTimes(1);
+    expect(mockApiObj.getIssueAgentDeliveries).toHaveBeenCalledWith("issue-1", [root.id, reply.id], expect.objectContaining({ signal: expect.anything() }));
+    const replyBlock = document.querySelector(`[data-comment-content="${reply.id}"]`)!.closest("[data-comment-block]") as HTMLElement;
+    expect(within(replyBlock).queryByRole("img", { name: "Delivered to Claude Agent" })).not.toBeInTheDocument();
+
+    mockApiObj.getIssueAgentDeliveries.mockResolvedValue({
+      ...projection,
+      comments: [projection.comments[0], { ...projection.comments[1], receipts: [acknowledged(reply.id, reply.revision)] }],
+    });
+    await act(async () => { await queryClient.invalidateQueries({ queryKey: issueAgentDeliveryKeys.all("ws-1", "issue-1") }); });
+    await waitFor(() => expect(within(replyBlock).getByRole("img", { name: "Delivered to Claude Agent" })).toBeInTheDocument());
+    expect(screen.getAllByRole("img", { name: "Delivered to Claude Agent" })).toHaveLength(3);
+  });
+
+  it("does not re-render another thread's markdown when one delivery receipt changes", async () => {
+    const comments = mockTimeline.map((entry) => ({ ...entry, revision: 1 }));
+    const projection: IssueAgentDeliveries = {
+      issue: { source_revision: null, title: mockIssue.title, description: mockIssue.description, status: mockIssue.status,
+        stage: mockIssue.stage, assignee_id: mockIssue.assignee_id, receipts: [] },
+      comments: comments.map((entry) => ({ comment_id: entry.id, source_revision: 1, receipts: [] })),
+    };
+    mockApiObj.listTimeline.mockResolvedValue(comments);
+    mockApiObj.getIssueAgentDeliveries.mockResolvedValue(projection);
+    const { queryClient } = renderIssueDetail();
+    await screen.findByText(comments[1]!.content!);
+    await waitFor(() => expect(mockApiObj.getIssueAgentDeliveries).toHaveBeenCalledTimes(1));
+    const otherBody = comments[1]!.content!;
+    const before = readonlyContentRenders.filter((body) => body === otherBody).length;
+    mockApiObj.getIssueAgentDeliveries.mockResolvedValue({
+      ...projection,
+      comments: [{ ...projection.comments[0], receipts: [{
+        event_id: "event-1", session_id: "session-1", agent_id: "agent-1", source_id: comments[0]!.id, source_revision: 1,
+        status: "delivered", delivered_at: "2026-11-04T00:00:00Z",
+      }] }, projection.comments[1]],
+    });
+    await act(async () => { await queryClient.invalidateQueries({ queryKey: issueAgentDeliveryKeys.all("ws-1", "issue-1") }); });
+    await screen.findByRole("img", { name: "Delivered to Claude Agent" });
+    expect(readonlyContentRenders.filter((body) => body === otherBody)).toHaveLength(before);
+  });
+
+  it("hides the issue acknowledgement during a local draft, queued saves and the wait for a new acknowledgement", async () => {
+    const initial = { ...mockIssue, assignee_type: "agent" as const, assignee_id: "agent-1" };
+    const firstSaved = { ...initial, description: "First local draft", revision: 4 };
+    const secondSaved = { ...initial, description: "Second local draft", revision: 5 };
+    const projection = (value: Issue, delivered: boolean): IssueAgentDeliveries => ({
+      issue: { source_revision: value.revision!, title: value.title, description: value.description,
+        status: value.status, stage: value.stage, assignee_id: value.assignee_id,
+        receipts: delivered ? [{ event_id: `event-${value.revision}`, session_id: "session-1", agent_id: "agent-1",
+          source_id: value.id, source_revision: value.revision!, status: "delivered", delivered_at: "2026-11-04T00:00:00Z" }] : [] },
+      comments: [],
+    });
+    let finishFirst!: (issue: Issue) => void;
+    let finishSecond!: (issue: Issue) => void;
+    mockApiObj.updateIssue.mockReset()
+      .mockReturnValueOnce(new Promise<Issue>((resolve) => { finishFirst = resolve; }))
+      .mockReturnValueOnce(new Promise<Issue>((resolve) => { finishSecond = resolve; }));
+    mockApiObj.getIssue.mockResolvedValue(initial);
+    mockApiObj.listTimeline.mockResolvedValue([]);
+    mockApiObj.getIssueAgentDeliveries.mockResolvedValue(projection(initial, true));
+    descriptionUpdates.defer = true;
+    const { queryClient } = renderIssueDetail();
+    const avatar = await screen.findByRole("img", { name: "Delivered to Claude Agent" });
+    const editor = screen.getByPlaceholderText("Add description...");
+    editor.setAttribute("contenteditable", "true");
+    fireEvent.focus(avatar);
+    expect(screen.getByRole("img", { name: "Delivered to Claude Agent" })).toBeInTheDocument();
+    fireEvent.blur(avatar, { relatedTarget: editor });
+    fireEvent.focus(editor);
+    fireEvent.change(editor, { target: { value: firstSaved.description } });
+    expect(screen.queryByRole("img", { name: "Delivered to Claude Agent" })).not.toBeInTheDocument();
+    expect(mockApiObj.updateIssue).not.toHaveBeenCalled();
+
+    const toolbar = screen.getByRole("button", { name: "Add reaction" });
+    const otherEditor = document.createElement("div");
+    otherEditor.setAttribute("contenteditable", "true");
+    fireEvent.blur(editor, { relatedTarget: otherEditor });
+    expect(screen.queryByRole("img", { name: "Delivered to Claude Agent" })).not.toBeInTheDocument();
+    await act(async () => descriptionUpdates.flush?.());
+    await waitFor(() => expect(mockApiObj.updateIssue).toHaveBeenCalledTimes(1));
+    fireEvent.focus(editor);
+    fireEvent.change(editor, { target: { value: secondSaved.description } });
+    await act(async () => descriptionUpdates.flush?.());
+    fireEvent.blur(editor, { relatedTarget: toolbar });
+
+    mockApiObj.getIssue.mockResolvedValue(firstSaved);
+    mockApiObj.getIssueAgentDeliveries.mockResolvedValue(projection(firstSaved, false));
+    await act(async () => finishFirst(firstSaved));
+    await waitFor(() => expect(mockApiObj.updateIssue).toHaveBeenCalledTimes(2));
+    expect(screen.queryByRole("img", { name: "Delivered to Claude Agent" })).not.toBeInTheDocument();
+
+    mockApiObj.getIssue.mockResolvedValue(secondSaved);
+    mockApiObj.getIssueAgentDeliveries.mockResolvedValue(projection(secondSaved, false));
+    await act(async () => finishSecond(secondSaved));
+    await waitFor(() => expect(queryClient.getQueryData<Issue>(issueKeys.detail("ws-1", "issue-1"))?.revision).toBe(5));
+    fireEvent.blur(editor, { relatedTarget: toolbar });
+    expect(screen.queryByRole("img", { name: "Delivered to Claude Agent" })).not.toBeInTheDocument();
+
+    mockApiObj.getIssueAgentDeliveries.mockResolvedValue(projection(secondSaved, true));
+    await act(async () => { await queryClient.invalidateQueries({ queryKey: issueAgentDeliveryKeys.all("ws-1", "issue-1") }); });
+    await screen.findByRole("img", { name: "Delivered to Claude Agent" });
+  });
+
+  it("hides the issue acknowledgement for an unblurred title draft and waits for its saved version to be acknowledged", async () => {
+    const initial = { ...mockIssue, assignee_type: "agent" as const, assignee_id: "agent-1" };
+    const saved = { ...initial, title: "Updated title", revision: 4 };
+    const projection = (value: Issue, delivered: boolean): IssueAgentDeliveries => ({
+      issue: { source_revision: value.revision!, title: value.title, description: value.description,
+        status: value.status, stage: value.stage, assignee_id: value.assignee_id,
+        receipts: delivered ? [{ event_id: `event-${value.revision}`, session_id: "session-1", agent_id: "agent-1",
+          source_id: value.id, source_revision: value.revision!, status: "delivered", delivered_at: "2026-11-04T00:00:00Z" }] : [] },
+      comments: [],
+    });
+    let finishSave!: (issue: Issue) => void;
+    mockApiObj.updateIssue.mockReset().mockReturnValueOnce(new Promise<Issue>((resolve) => { finishSave = resolve; }));
+    mockApiObj.getIssue.mockResolvedValue(initial);
+    mockApiObj.listTimeline.mockResolvedValue([]);
+    mockApiObj.getIssueAgentDeliveries.mockResolvedValue(projection(initial, true));
+    const { queryClient } = renderIssueDetail();
+    await screen.findByRole("img", { name: "Delivered to Claude Agent" });
+    fireEvent.click(screen.getByRole("button", { name: initial.title }));
+    const editor = await screen.findByTestId("title-editor");
+    fireEvent.change(editor, { target: { value: saved.title } });
+    expect(mockApiObj.updateIssue).not.toHaveBeenCalled();
+    expect(screen.queryByRole("img", { name: "Delivered to Claude Agent" })).not.toBeInTheDocument();
+    fireEvent.blur(editor);
+    await waitFor(() => expect(mockApiObj.updateIssue).toHaveBeenCalledTimes(1));
+    mockApiObj.getIssue.mockResolvedValue(saved);
+    mockApiObj.getIssueAgentDeliveries.mockResolvedValue(projection(saved, false));
+    await act(async () => finishSave(saved));
+    await waitFor(() => expect(queryClient.getQueryData<Issue>(issueKeys.detail("ws-1", "issue-1"))?.title).toBe(saved.title));
+    expect(screen.queryByRole("img", { name: "Delivered to Claude Agent" })).not.toBeInTheDocument();
+    mockApiObj.getIssueAgentDeliveries.mockResolvedValue(projection(saved, true));
+    await act(async () => { await queryClient.invalidateQueries({ queryKey: issueAgentDeliveryKeys.all("ws-1", "issue-1") }); });
+    await screen.findByRole("img", { name: "Delivered to Claude Agent" });
+  });
+
+  it("keeps title and description draft suppression independent when either save succeeds", async () => {
+    const initial = { ...mockIssue, assignee_type: "agent" as const, assignee_id: "agent-1" };
+    const descriptionSaved = { ...initial, description: "Saved description", revision: 4 };
+    const titleSaved = { ...descriptionSaved, title: "Saved title", revision: 5 };
+    const projection = (value: Issue): IssueAgentDeliveries => ({
+      issue: { source_revision: value.revision!, title: value.title, description: value.description,
+        status: value.status, stage: value.stage, assignee_id: value.assignee_id,
+        receipts: [{ event_id: `event-${value.revision}`, session_id: "session-1", agent_id: "agent-1",
+          source_id: value.id, source_revision: value.revision!, status: "delivered", delivered_at: "2026-11-04T00:00:00Z" }] },
+      comments: [],
+    });
+    let finishDescription!: (issue: Issue) => void;
+    let finishTitle!: (issue: Issue) => void;
+    mockApiObj.updateIssue.mockReset()
+      .mockReturnValueOnce(new Promise<Issue>((resolve) => { finishDescription = resolve; }))
+      .mockReturnValueOnce(new Promise<Issue>((resolve) => { finishTitle = resolve; }));
+    mockApiObj.getIssue.mockResolvedValue(initial);
+    mockApiObj.listTimeline.mockResolvedValue([]);
+    mockApiObj.getIssueAgentDeliveries.mockResolvedValue(projection(initial));
+    const { queryClient } = renderIssueDetail();
+    await screen.findByRole("img", { name: "Delivered to Claude Agent" });
+    const description = screen.getByPlaceholderText("Add description...");
+    description.setAttribute("contenteditable", "true");
+    fireEvent.focus(description);
+    fireEvent.change(description, { target: { value: descriptionSaved.description } });
+    await waitFor(() => expect(mockApiObj.updateIssue).toHaveBeenCalledTimes(1));
+    fireEvent.click(screen.getByRole("button", { name: initial.title }));
+    const title = await screen.findByTestId("title-editor");
+    fireEvent.blur(description, { relatedTarget: title });
+    fireEvent.change(title, { target: { value: titleSaved.title } });
+    mockApiObj.getIssue.mockResolvedValue(descriptionSaved);
+    mockApiObj.getIssueAgentDeliveries.mockResolvedValue(projection(descriptionSaved));
+    await act(async () => finishDescription(descriptionSaved));
+    await act(async () => { await queryClient.invalidateQueries({ queryKey: issueAgentDeliveryKeys.all("ws-1", "issue-1") }); });
+    expect(screen.queryByRole("img", { name: "Delivered to Claude Agent" })).not.toBeInTheDocument();
+
+    fireEvent.blur(title);
+    await waitFor(() => expect(mockApiObj.updateIssue).toHaveBeenCalledTimes(2));
+    descriptionUpdates.defer = true;
+    fireEvent.focus(description);
+    fireEvent.change(description, { target: { value: "Another unsubmitted description" } });
+    fireEvent.blur(description, { relatedTarget: screen.getByRole("button", { name: "Add reaction" }) });
+    mockApiObj.getIssue.mockResolvedValue(titleSaved);
+    mockApiObj.getIssueAgentDeliveries.mockResolvedValue(projection(titleSaved));
+    await act(async () => finishTitle(titleSaved));
+    await act(async () => { await queryClient.invalidateQueries({ queryKey: issueAgentDeliveryKeys.all("ws-1", "issue-1") }); });
+    expect(screen.queryByRole("img", { name: "Delivered to Claude Agent" })).not.toBeInTheDocument();
+
+    fireEvent.change(description, { target: { value: titleSaved.description } });
+    fireEvent.blur(description, { relatedTarget: screen.getByRole("button", { name: "Add reaction" }) });
+    await screen.findByRole("img", { name: "Delivered to Claude Agent" });
+    expect(mockApiObj.updateIssue).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([["title", false, false], ["description", false, false], ["title", true, false], ["description", true, false], ["title", true, true]] as const)("settles genuinely overlapping %s and title saves (reverse=%s, older failure=%s) before showing the latest acknowledgement", async (firstField, reverse, firstFails) => {
+    const initial = { ...mockIssue, assignee_type: "agent" as const, assignee_id: "agent-1" };
+    const firstSaved = { ...initial, [firstField]: "First saved value", revision: 4 };
+    const latest = { ...firstSaved, title: "Latest saved title", revision: 5 };
+    const projection = (value: Issue, delivered: boolean): IssueAgentDeliveries => ({
+      issue: { source_revision: value.revision!, title: value.title, description: value.description,
+        status: value.status, stage: value.stage, assignee_id: value.assignee_id,
+        receipts: delivered ? [{ event_id: `event-${value.revision}`, session_id: "session-1", agent_id: "agent-1",
+          source_id: value.id, source_revision: value.revision!, status: "delivered", delivered_at: "2026-11-04T00:00:00Z" }] : [] },
+      comments: [],
+    });
+    let finishFirst!: (issue: Issue) => void;
+    let rejectFirst!: (error: Error) => void;
+    let finishSecond!: (issue: Issue) => void;
+    mockApiObj.updateIssue.mockReset()
+      .mockReturnValueOnce(new Promise<Issue>((resolve, reject) => { finishFirst = resolve; rejectFirst = reject; }))
+      .mockReturnValueOnce(new Promise<Issue>((resolve) => { finishSecond = resolve; }));
+    mockApiObj.getIssue.mockResolvedValue(initial);
+    mockApiObj.listTimeline.mockResolvedValue([]);
+    mockApiObj.getIssueAgentDeliveries.mockResolvedValue(projection(initial, true));
+    const { queryClient } = renderIssueDetail();
+    await screen.findByRole("img", { name: "Delivered to Claude Agent" });
+    fireEvent.click(screen.getByRole("button", { name: initial.title }));
+    const title = await screen.findByTestId("title-editor");
+    if (firstField === "title") {
+      fireEvent.change(title, { target: { value: firstSaved.title } });
+      fireEvent.blur(title);
+    } else {
+      const description = screen.getByPlaceholderText("Add description...");
+      description.setAttribute("contenteditable", "true");
+      fireEvent.focus(description);
+      fireEvent.change(description, { target: { value: firstSaved.description } });
+      fireEvent.blur(description, { relatedTarget: title });
+    }
+    await waitFor(() => expect(mockApiObj.updateIssue).toHaveBeenCalledTimes(1));
+    fireEvent.change(title, { target: { value: latest.title } });
+    fireEvent.blur(title);
+    await waitFor(() => expect(mockApiObj.updateIssue).toHaveBeenCalledTimes(2));
+    expect(queryClient.getMutationCache().getAll().filter((mutation) => mutation.state.status === "pending")).toHaveLength(2);
+
+    if (reverse) {
+      mockApiObj.getIssue.mockResolvedValue(latest);
+      mockApiObj.getIssueAgentDeliveries.mockResolvedValue(projection(latest, false));
+      await act(async () => finishSecond(latest));
+      await waitFor(() => expect(queryClient.getMutationCache().getAll().filter((mutation) => mutation.state.status === "pending")).toHaveLength(1));
+      expect(screen.queryByRole("img", { name: "Delivered to Claude Agent" })).not.toBeInTheDocument();
+      await act(async () => {
+        if (firstFails) rejectFirst(Object.assign(new Error("Revision conflict"), { body: { code: "revision_conflict" } }));
+        else finishFirst(firstSaved);
+      });
+    } else {
+      mockApiObj.getIssue.mockResolvedValue(firstSaved);
+      mockApiObj.getIssueAgentDeliveries.mockResolvedValue(projection(firstSaved, false));
+      await act(async () => finishFirst(firstSaved));
+      await waitFor(() => expect(queryClient.getMutationCache().getAll().filter((mutation) => mutation.state.status === "pending")).toHaveLength(1));
+      expect(screen.queryByRole("img", { name: "Delivered to Claude Agent" })).not.toBeInTheDocument();
+      mockApiObj.getIssue.mockResolvedValue(latest);
+      mockApiObj.getIssueAgentDeliveries.mockResolvedValue(projection(latest, false));
+      await act(async () => finishSecond(latest));
+    }
+    await waitFor(() => expect(queryClient.getMutationCache().getAll().some((mutation) => mutation.state.status === "pending")).toBe(false));
+    expect(queryClient.getQueryData<Issue>(issueKeys.detail("ws-1", "issue-1"))).toMatchObject({ title: latest.title, revision: 5 });
+    if (firstFails) expect(screen.queryByText("The title was changed concurrently. Compare both versions.")).not.toBeInTheDocument();
+    expect(screen.queryByRole("img", { name: "Delivered to Claude Agent" })).not.toBeInTheDocument();
+    mockApiObj.getIssueAgentDeliveries.mockResolvedValue(projection(latest, true));
+    await act(async () => { await queryClient.invalidateQueries({ queryKey: issueAgentDeliveryKeys.all("ws-1", "issue-1") }); });
+    await screen.findByRole("img", { name: "Delivered to Claude Agent" });
   });
 
   it("prefers timeline identity when the actor is absent from the member directory", async () => {

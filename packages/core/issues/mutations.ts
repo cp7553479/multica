@@ -68,6 +68,14 @@ export type ToggleCommentReactionVars = {
   existing: Reaction | undefined;
 };
 
+export type UpdateCommentVars = {
+  commentId: string;
+  content: string;
+  attachmentIds: string[];
+  contentBase?: string;
+  expectedRevision?: number;
+};
+
 export type ToggleIssueReactionVars = {
   emoji: string;
   existing: IssueReaction | undefined;
@@ -871,6 +879,7 @@ export function useCreateComment(issueId: string) {
         attachments: comment.attachments ?? [],
         created_at: comment.created_at,
         updated_at: comment.updated_at,
+        revision: comment.revision,
         supplements: comment.supplements,
       };
       const steered = !!comment.supplements?.length;
@@ -908,19 +917,14 @@ export function useUpdateComment(issueId: string) {
   const qc = useQueryClient();
   const wsId = useWorkspaceId();
   return useMutation({
+    mutationKey: issueKeys.commentUpdate(wsId, issueId),
     mutationFn: ({
       commentId,
       content,
       attachmentIds,
       contentBase,
       expectedRevision,
-    }: {
-      commentId: string;
-      content: string;
-      attachmentIds: string[];
-      contentBase?: string;
-      expectedRevision?: number;
-    }) => api.updateComment(commentId, content, attachmentIds, contentBase, expectedRevision),
+    }: UpdateCommentVars) => api.updateComment(commentId, content, attachmentIds, contentBase, expectedRevision),
     onMutate: async ({ commentId, content, attachmentIds }) => {
       await qc.cancelQueries({ queryKey: issueKeys.timeline(issueId) });
       const prev = qc.getQueryData<TimelineCache>(issueKeys.timeline(issueId));
@@ -940,6 +944,13 @@ export function useUpdateComment(issueId: string) {
       }
     },
     onSuccess: (comment) => {
+      // The authoritative version must replace the optimistic row's old
+      // revision even if the timeline re-read subsequently fails.
+      qc.setQueryData<TimelineCache>(issueKeys.timeline(issueId), (old) => old?.map((entry) => {
+        if (entry.id !== comment.id) return entry;
+        if (comment.revision !== undefined && entry.revision !== undefined && comment.revision < entry.revision) return entry;
+        return { ...entry, content: comment.content, attachments: comment.attachments, revision: comment.revision };
+      }));
       if (comment.issue_revision) {
         onIssueAuxiliaryRevision(qc, wsId, issueId, comment.issue_revision);
       } else {
@@ -949,9 +960,7 @@ export function useUpdateComment(issueId: string) {
       }
       invalidateLastActivitySortedIssueLists(qc, wsId);
     },
-    onSettled: () => {
-      qc.invalidateQueries({ queryKey: issueKeys.timeline(issueId) });
-    },
+    onSettled: () => qc.invalidateQueries({ queryKey: issueKeys.timeline(issueId) }),
   });
 }
 

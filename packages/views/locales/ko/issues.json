@@ -1802,5 +1802,8 @@
     "detached": "재할당됨 / 비활성",
     "resume_unavailable": "이 세션을 재개할 수 없습니다. 원래 런타임과 세션 데이터를 복원한 후 재시도하세요.",
     "retry_original_session": "이 이벤트를 재시도하여 원래 세션을 다시 확인하고 재개하세요."
+  },
+  "delivery_receipts": {
+    "delivered_to": "{{name}}에게 전달됨"
   }
 }

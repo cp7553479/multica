@@ -58,22 +58,22 @@ export function useIssueSurfaceActions({
       updates: Partial<UpdateIssueRequest>,
       options?: IssueSurfaceMutationOptions,
     ) => {
-      updateIssueMutation.mutate(
-        { id: issueId, ...updates },
-        {
-          onSuccess: (issue) => options?.onSuccess?.(issue),
-          onError: (err) => {
-            toast.error(
-              errorCode(err) === "revision_conflict"
-                ? tIssues(($) => $.revision.conflict)
-                : err instanceof Error && err.message
-                ? err.message
-                : (options?.errorMessage ??
-                    t(($) => $.detail.toast_move_issue_failed)),
-            );
-            options?.onError?.(err);
-          },
-          onSettled: () => options?.onSettled?.(),
+      void updateIssueMutation.mutateAsync({ id: issueId, ...updates }).then(
+        (issue) => {
+          options?.onSuccess?.(issue);
+          options?.onSettled?.();
+        },
+        (err) => {
+          toast.error(
+            errorCode(err) === "revision_conflict"
+              ? tIssues(($) => $.revision.conflict)
+              : err instanceof Error && err.message
+              ? err.message
+              : (options?.errorMessage ??
+                  t(($) => $.detail.toast_move_issue_failed)),
+          );
+          options?.onError?.(err);
+          options?.onSettled?.();
         },
       );
     },

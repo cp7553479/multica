@@ -1871,5 +1871,8 @@
     "detached": "Reasignado / inactivo",
     "resume_unavailable": "Esta sesión no se puede reanudar. Restaura el entorno y los datos originales antes de reintentar.",
     "retry_original_session": "Reintenta este evento para comprobar y reanudar la sesión original."
+  },
+  "delivery_receipts": {
+    "delivered_to": "Entregado a {{name}}"
   }
 }

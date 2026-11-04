@@ -131,7 +131,42 @@ already claimed inputs and other messages in the same session.
 Committed mutation capture is durable and event ingestion is idempotent for a
 source version. Delivery acknowledgements are durable and idempotent for the
 bound execution and event. `delivered` means the provider accepted the input; it
-does not mean the requested work succeeded or that an external write occurred.
+does not mean the agent read or understood it, completed the requested work, or
+performed an external write.
+
+### Delivery avatars
+
+The existing issue and comment UI shows one 16 px avatar per acknowledged agent
+at the bottom left of the description or comment. Multiple receivers retain
+their own delivery state, with repeated receipts for the same agent shown once.
+Only a `delivered` receipt with a recorded acknowledgement time earns an avatar;
+pending, delivering, failed and ignored inputs do not. The tooltip says
+"Delivered to", rather than claiming a read receipt or completed work.
+
+The avatars use a read-only projection of durable capture events for the version
+currently displayed. Issue receipts match the latest captured title, description,
+status, stage and assignee snapshot; unrelated issue revision increments do not
+invalidate an otherwise matching snapshot. Comment receipts require the exact
+current comment ID and revision. The general comment revision can also advance
+for a non-body change, so this conservative check may hide an earlier delivery
+avatar even when the body is unchanged. Editing drafts and unsettled saves hide
+the affected avatars until the saved version is known.
+
+The server selects the current source version before applying receiver access
+filters, and returns only sessions the viewer may inspect, including the existing
+private-agent policy. An older visible receipt cannot stand in for a newer
+version whose receiver is private. These projections query source versions
+directly, rather than depending on the session panel's bounded recent history.
+They preserve transactional capture and the native issue/comment components.
+
+Committed ACK state changes and explicit retries publish
+`issue:agent_delivery_updated` through the existing Bus and WebSocket transport.
+Its payload contains only `issue_id`; it
+carries no receiver, session, comment content or receipt details. Clients use it
+to re-read the issue's authorized projection. Repeated idempotent ACKs do not
+publish another hint, and rolled-back ACKs publish none. The scoped query also
+refreshes every five seconds, on window focus and after reconnection, so missed
+hints and process restarts recover from durable state.
 
 A process can fail after provider acceptance but before its acknowledgement is
 recorded. This is `delivery_unconfirmed`, not a promise that the input was never
@@ -207,6 +242,14 @@ reply, or uses `multica issue update` for an allowed issue edit.
 New authenticated endpoints:
 
 - `GET /api/issues/{id}/agent-sessions`: authorized session and event receipts.
+- `POST /api/issues/{id}/agent-deliveries`: read-only batch projection of the
+  current issue snapshot and requested comments' delivery receipts. The required
+  JSON body is `{"comment_ids":["<comment-uuid>"]}` with at most 2,000 UUIDs;
+  an empty array requests only the issue snapshot. POST bounds this read input
+  and does not create events, executions or acknowledgements. The response has
+  `issue` and `comments` projections, source revisions, and permitted receivers'
+  receipt status and delivery time. Missing, deleted or other-issue comments
+  are omitted. Loaded timelines exceeding the bound are read in batches.
 - `POST /api/issues/{id}/agent-sessions/{sessionId}/events/{eventId}/retry`:
   explicit retry of the same event, subject to current invocation permission.
 - `POST /api/daemon/tasks/{taskId}/issue-events/claim`: next ordered input.
@@ -222,8 +265,11 @@ before exposing their history.
 
 This is a breaking routing change. Stop the old daemon, drain or deliberately
 cancel its old queued/running issue tasks, back up the database, apply migrations
-614–618 with the repository migrator, complete the preflight below, and start
+614–619 with the repository migrator, complete the preflight below, and start
 the matching server and daemon.
+Migration 619 adds the partial source/version index for issue delivery
+projections with `CREATE INDEX CONCURRENTLY`; the migrator runs it outside an
+explicit transaction.
 Do not run an old daemon alongside the new one. Existing assigned issues create
 their logical session lazily on the next input; new assignments capture it in the
 assignment transaction. Historical execution records remain inspectable.

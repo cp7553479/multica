@@ -39,7 +39,8 @@ import { ReplyInput } from "./reply-input";
 import { CommentTriggerChips } from "./comment-trigger-chips";
 import { useCommentTriggerPreview } from "../hooks/use-comment-trigger-preview";
 import { SteerBadge, SteerReceipts } from "./steer-receipts";
-import type { TimelineEntry, Attachment } from "@multica/core/types";
+import { EMPTY_DELIVERY_RECEIPTS, SourceDeliveryAvatars } from "./source-delivery-avatars";
+import type { TimelineEntry, Attachment, IssueDeliveryReceipt } from "@multica/core/types";
 import { contentReferencesAttachment } from "@multica/core/types";
 import { isDeletedComment } from "@multica/core/issues/comment-deletion";
 import { commentSupplementReceipts, isSupplementInFlight } from "@multica/core/issues/run-steering";
@@ -111,6 +112,7 @@ function StickyHeaderShell({
 
 interface CommentCardProps {
   issueId: string;
+  deliveryReceipts?: readonly IssueDeliveryReceipt[];
   runs?: CommentRun[];
   runViewState?: InlineCommentRunState;
   enteringRunIds?: ReadonlySet<string>;
@@ -613,6 +615,7 @@ function CommentRow({
   replyTo,
   issueId,
   entry,
+  deliveryReceipts = EMPTY_DELIVERY_RECEIPTS,
   currentUserId,
   canModerate = false,
   isResolution = false,
@@ -630,6 +633,7 @@ function CommentRow({
   replyTo?: ReactNode;
   issueId: string;
   entry: TimelineEntry;
+  deliveryReceipts?: readonly IssueDeliveryReceipt[];
   currentUserId?: string;
   canModerate?: boolean;
   /** True when this reply is the thread's resolution (shows the green badge). */
@@ -893,6 +897,7 @@ function CommentRow({
           </div>
           <AttachmentList attachments={entry.attachments} content={entry.content} className="mt-1.5 pl-12 pr-4 max-md:pl-3 max-md:pr-3" />
           <div className="pl-12 pr-4 max-md:pl-3 max-md:pr-3">
+            <SourceDeliveryAvatars sourceId={entry.id} sourceRevision={entry.revision} receipts={deliveryReceipts} />
             <SteerReceipts issueId={issueId} entry={entry} />
           </div>
           {retryableAgentFailureComment(entry) && (
@@ -996,6 +1001,7 @@ export function AgentRunComment({ run, standalone = false, commentProps, enterin
 
 function CommentCardImpl({
   issueId,
+  deliveryReceipts = EMPTY_DELIVERY_RECEIPTS,
   runs = EMPTY_COMMENT_RUNS,
   runViewState,
   enteringRunIds,
@@ -1070,7 +1076,7 @@ function CommentCardImpl({
       highlightedId={highlightedCommentId}
       replyTo={row.replyTo && <ReplyToQuote entry={row.replyTo} onJump={onJumpToComment} />}
       commentProps={row.reply ? {
-        issueId, entry: row.reply, replies: [], currentUserId, canModerate, onReply, onEdit, onDelete,
+        issueId, deliveryReceipts, entry: row.reply, replies: [], currentUserId, canModerate, onReply, onEdit, onDelete,
         onToggleReaction, onCreateSubIssue, onResolveToggle, onCopyLink, highlightedCommentId, enteringRunIds,
       } : undefined} />
   ) : renderReply(row);
@@ -1089,6 +1095,7 @@ function CommentCardImpl({
         >
           <CommentRow
             issueId={issueId}
+            deliveryReceipts={deliveryReceipts}
             entry={reply}
             runHeader={renderRuns(reply.id, "header")}
             runMetadata={renderRuns(reply.id)}
@@ -1436,6 +1443,7 @@ function CommentCardImpl({
                 </div>
                 <AttachmentList attachments={entry.attachments} content={entry.content} className="mt-1.5 pl-8 max-md:pl-0" />
                 <div className="pl-8 max-md:pl-0">
+                  <SourceDeliveryAvatars sourceId={entry.id} sourceRevision={entry.revision} receipts={deliveryReceipts} />
                   <SteerReceipts issueId={issueId} entry={entry} />
                 </div>
                 {retryableAgentFailureComment(entry) && (

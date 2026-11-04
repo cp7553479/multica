@@ -1802,5 +1802,8 @@
     "detached": "再割り当て済み／無効",
     "resume_unavailable": "このセッションを再開できません。元のランタイムとセッションデータを復元してから再試行してください。",
     "retry_original_session": "このイベントを再試行して、元のセッションを再確認し、再開します。"
+  },
+  "delivery_receipts": {
+    "delivered_to": "{{name}} に配信済み"
   }
 }

@@ -2122,6 +2122,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					r.Get("/comments", h.ListComments)
 					r.Get("/timeline", h.ListTimeline)
 					r.Get("/agent-sessions", h.ListIssueAgentSessions)
+					r.Post("/agent-deliveries", h.ListIssueAgentDeliveries)
 					r.With(handler.RequireHumanActor).Post("/agent-sessions/{sessionId}/events/{eventId}/retry", h.RetryIssueAgentEvent)
 					r.Get("/workflow-handoff", h.PreviewWorkflowHandoff)
 					r.Get("/subscribers", h.ListIssueSubscribers)

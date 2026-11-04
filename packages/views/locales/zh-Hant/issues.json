@@ -1802,5 +1802,8 @@
     "detached": "已重新分配／停用",
     "resume_unavailable": "此對話無法恢復。請先恢復原執行階段和對話資料，再重試。",
     "retry_original_session": "可重試此事件，重新檢查並恢復原對話。"
+  },
+  "delivery_receipts": {
+    "delivered_to": "已送達 {{name}}"
   }
 }

@@ -1871,5 +1871,8 @@
     "detached": "Réaffecté / inactif",
     "resume_unavailable": "Cette session ne peut pas reprendre. Restaurez son environnement et ses données d’origine avant de réessayer.",
     "retry_original_session": "Réessayez cet événement pour vérifier et reprendre la session d’origine."
+  },
+  "delivery_receipts": {
+    "delivered_to": "Remis à {{name}}"
   }
 }

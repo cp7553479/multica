@@ -1082,6 +1082,8 @@ export function useRealtimeSync(
 
     // Event types handled by specific handlers below -- skip generic refresh
     const specificEvents = new Set([
+      // Delivery ACKs refresh only the open issue's bounded receipt query.
+      "issue:agent_delivery_updated",
       "workspace:updated",
       "issue:updated", "issue:created", "issue:deleted", "issue_attachments:changed", "issue_labels:changed", "issue_unread:changed", "issue_metadata:changed", "issue_properties:changed", "property:created", "property:updated", "inbox:new",
       "comment:created", "comment:updated", "comment:deleted",

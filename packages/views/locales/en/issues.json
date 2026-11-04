@@ -1871,5 +1871,8 @@
     "detached": "Reassigned / inactive",
     "resume_unavailable": "This session cannot be resumed. Restore its original runtime and session data before retrying.",
     "retry_original_session": "Retry this event to recheck and resume the original session."
+  },
+  "delivery_receipts": {
+    "delivered_to": "Delivered to {{name}}"
   }
 }

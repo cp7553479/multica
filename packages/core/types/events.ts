@@ -12,6 +12,7 @@ import type { Label } from "./label";
 export type WSEventType =
   | "issue:created"
   | "issue:updated"
+  | "issue:agent_delivery_updated"
   | "issue_attachments:changed"
   | "issue:deleted"
   | "comment:created"

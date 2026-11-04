@@ -73,12 +73,13 @@ import { ActionShortcutKeycaps } from "../../common/shortcut-keycaps";
 import { PropRow } from "../../common/prop-row";
 import { TimelineHandoff } from "../../workflows/timeline-handoff";
 import { PropertyIcon } from "../../common/property-icon";
-import type { Attachment, Issue, IssueProperty, IssueStatus, IssueStatusCategory, IssuePriority, TimelineEntry, UpdateIssueRequest } from "@multica/core/types";
+import type { Attachment, Issue, IssueProperty, IssueStatus, IssueStatusCategory, IssuePriority, TimelineEntry, UpdateIssueRequest, IssueDeliveryReceipt } from "@multica/core/types";
 import { contentReferencesAttachment } from "@multica/core/types";
 import { isBuiltInIssueStatus } from "@multica/core/issue-statuses";
 import { commentLandingTarget, isDeletedComment } from "@multica/core/issues/comment-deletion";
 import { formatDateOnly, isPastDateOnly } from "@multica/core/issues/date";
 import { useUpdateIssue } from "@multica/core/issues/mutations";
+import { useIssueAgentDeliveries } from "@multica/core/issues/agent-deliveries";
 import { toast } from "sonner";
 import { errorCode } from "@multica/core/api";
 import { StatusIcon } from "./status-icon";
@@ -95,6 +96,7 @@ import { Switch } from "@multica/ui/components/ui/switch";
 import { IssueActionsDropdown, useIssueActions, useArchivedInboxItemId, IssueActionsContextMenu, IssueContextMenuProvider } from "../actions";
 import { LabelChip } from "../../labels/label-chip";
 import { IssueAgentActivityIndicator } from "./issue-agent-activity-indicator";
+import { EMPTY_DELIVERY_RECEIPTS, SourceDeliveryAvatars } from "./source-delivery-avatars";
 import { SubIssuesAgentWorkingChip } from "./sub-issues-agent-working-chip";
 import { IssueProjectPicker } from "../../projects/components/issue-project-picker";
 import { IssuePropertyPills } from "./issue-property-pills";
@@ -129,7 +131,7 @@ import {
 } from "./deliverables/deliverable-details";
 import { collectDeliverableFiles } from "@multica/core/attachments/deliverables";
 import { AttachmentVersionsProvider } from "./deliverables/attachment-versions";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useAuthStore } from "@multica/core/auth";
 import { useWorkspacePaths } from "@multica/core/paths";
 import { useActorName } from "@multica/core/workspace/hooks";
@@ -140,7 +142,7 @@ import {
 import { useRecentContextStore } from "@multica/core/chat";
 import { useRegisterCommandBarContext } from "../../search/register-context";
 import { useModalStore } from "@multica/core/modals";
-import { issueListOptions, issueDetailOptions, childIssuesOptions, childIssueProgressOptions, issueAttachmentsOptions } from "@multica/core/issues/queries";
+import { issueKeys, issueListOptions, issueDetailOptions, childIssuesOptions, childIssueProgressOptions, issueAttachmentsOptions } from "@multica/core/issues/queries";
 import { projectDetailOptions } from "@multica/core/projects/queries";
 import { ProjectIcon } from "../../projects/components/project-icon";
 import { issueLabelsOptions } from "@multica/core/labels";
@@ -1340,6 +1342,7 @@ export function IssueDetail({ issueId, onDelete, onDone, defaultSidebarOpen = tr
 
   // Issue navigation — read from TQ list cache
   const wsId = useWorkspaceId();
+  const queryClient = useQueryClient();
   const { data: members = [] } = useQuery(memberListOptions(wsId));
   const { data: agents = [] } = useQuery(agentListOptions(wsId));
   // Workspace owners and admins moderate any comment authored by anyone
@@ -1650,6 +1653,11 @@ export function IssueDetail({ issueId, onDelete, onDone, defaultSidebarOpen = tr
     editComment, deleteComment, toggleResolveComment, toggleReaction: handleToggleReaction,
   } = useIssueTimeline(id, user?.id);
 
+  const deliveryComments = useMemo(() => timeline
+    .filter((entry) => entry.type === "comment")
+    .map(({ id, revision }) => ({ id, revision })), [timeline]);
+  const { data: agentDeliveries } = useIssueAgentDeliveries(wsId, id, timelineLoading ? undefined : issue ?? undefined, deliveryComments);
+
   const { data: commentTasks } = useQuery(issueTasksOptions(id));
   const enteringRunIds = useNewRunIds(id, commentTasks);
   const previousCommentRuns = useRef(new Map<string, CommentRun[]>());
@@ -1786,6 +1794,23 @@ export function IssueDetail({ issueId, onDelete, onDone, defaultSidebarOpen = tr
 
     return { threadReplies, groups };
   }, [displayTimeline, standaloneRuns]);
+
+  const previousThreadDeliveries = useRef(new Map<string, readonly IssueDeliveryReceipt[]>());
+  const threadDeliveries = useMemo(() => {
+    const bySource = new Map(agentDeliveries?.comments.map((source) => [source.comment_id, source.receipts]) ?? []);
+    const next = new Map<string, readonly IssueDeliveryReceipt[]>();
+    for (const [rootId, replies] of timelineView.threadReplies) {
+      const fresh = [rootId, ...replies.map((reply) => reply.id)]
+        .flatMap((sourceId) => bySource.get(sourceId) ?? EMPTY_DELIVERY_RECEIPTS);
+      const previous = previousThreadDeliveries.current.get(rootId);
+      // Unrelated receipts must not re-render every comment's markdown.
+      next.set(rootId, fresh.length === 0 ? EMPTY_DELIVERY_RECEIPTS
+        : previous?.length === fresh.length && fresh.every((receipt, index) => receipt === previous[index])
+          ? previous : fresh);
+    }
+    previousThreadDeliveries.current = next;
+    return next;
+  }, [agentDeliveries?.comments, timelineView.threadReplies]);
 
   // Flat array consumed by <Virtuoso>. Recomputed when timelineView.groups
   // changes (timeline events) or expandedResolved flips (user toggles a
@@ -2399,8 +2424,9 @@ export function IssueDetail({ issueId, onDelete, onDone, defaultSidebarOpen = tr
 
   const descEditorRef = useRef<ContentEditorRef>(null);
   const descriptionEditingRef = useRef(false);
+  const [suppressDescriptionDelivery, setSuppressDescriptionDelivery] = useState(false);
   const descriptionSaveInFlightRef = useRef(false);
-  const descriptionSaveIssueIdRef = useRef(id);
+  const editorSaveIssueIdRef = useRef(id);
   const pendingDescriptionSaveRef = useRef<{
     markdown: string;
     baseMarkdown: string;
@@ -2413,6 +2439,8 @@ export function IssueDetail({ issueId, onDelete, onDone, defaultSidebarOpen = tr
   // keeps this single eager editor affordable; title and composers stay lazy.
   const titleEditorRef = useRef<TitleEditorRef>(null);
   const titleBaseRef = useRef<string | undefined>(issue?.title);
+  const titleSavesInFlightRef = useRef(0);
+  const [suppressTitleDelivery, setSuppressTitleDelivery] = useState(false);
   const [titleConflictDraft, setTitleConflictDraft] = useState<string | null>(null);
   // Bumped when a conflicting title draft is discarded. TitleEditor reads its
   // text from `defaultValue` at mount and exposes no imperative setter, so
@@ -2420,9 +2448,13 @@ export function IssueDetail({ issueId, onDelete, onDone, defaultSidebarOpen = tr
   const [titleResetToken, setTitleResetToken] = useState(0);
   useEffect(() => {
     setTitleConflictDraft(null);
+    setSuppressTitleDelivery(false);
+    titleSavesInFlightRef.current = 0;
     titleBaseRef.current = undefined;
     descriptionSaveInFlightRef.current = false;
-    descriptionSaveIssueIdRef.current = id;
+    descriptionEditingRef.current = false;
+    setSuppressDescriptionDelivery(false);
+    editorSaveIssueIdRef.current = id;
     pendingDescriptionSaveRef.current = null;
   }, [id]);
   const titleLazy = useLazyEditor({ editorRef: titleEditorRef, resetKey: id });
@@ -2764,10 +2796,41 @@ export function IssueDetail({ issueId, onDelete, onDone, defaultSidebarOpen = tr
     return <IssueNotFound showBackLink={!onDelete} leading={leadingAction} trailing={trailingActions} />;
   }
 
+  const persistTitleSave = (title: string, base: string | undefined) => {
+    titleSavesInFlightRef.current += 1;
+    setSuppressTitleDelivery(true);
+    handleUpdateField({ title, title_base: base }, {
+      onSuccess: () => {
+        if (editorSaveIssueIdRef.current !== id) return;
+        titleSavesInFlightRef.current -= 1;
+        const canonical = queryClient.getQueryData<Issue>(issueKeys.detail(wsId, id));
+        const current = !!canonical && titleEditorRef.current?.getText().trim() === canonical.title;
+        setSuppressTitleDelivery(!current || titleSavesInFlightRef.current > 0);
+        if (current && titleSavesInFlightRef.current === 0) setTitleConflictDraft(null);
+        if (canonical) titleBaseRef.current = canonical.title;
+      },
+      onError: (error) => {
+        if (editorSaveIssueIdRef.current !== id) return;
+        titleSavesInFlightRef.current -= 1;
+        const canonical = queryClient.getQueryData<Issue>(issueKeys.detail(wsId, id));
+        const currentTitle = titleEditorRef.current?.getText().trim();
+        const accepted = !!canonical && currentTitle === canonical.title;
+        setSuppressTitleDelivery(!accepted || titleSavesInFlightRef.current > 0);
+        if (accepted && titleSavesInFlightRef.current === 0) {
+          setTitleConflictDraft(null);
+          titleBaseRef.current = canonical.title;
+        } else if (currentTitle === title && errorCode(error) === "revision_conflict") {
+          setTitleConflictDraft(title);
+        }
+      },
+    });
+  };
+
   const persistDescriptionSave = (
     draft: { markdown: string; baseMarkdown: string; attachmentIds: string[] },
   ) => {
     descriptionSaveInFlightRef.current = true;
+    setSuppressDescriptionDelivery(true);
     handleUpdateField(
       {
         description: draft.markdown,
@@ -2777,7 +2840,7 @@ export function IssueDetail({ issueId, onDelete, onDone, defaultSidebarOpen = tr
       },
       {
         onSuccess: (serverIssue) => {
-          if (descriptionSaveIssueIdRef.current !== id) return;
+          if (editorSaveIssueIdRef.current !== id) return;
           descriptionSaveInFlightRef.current = false;
           const pending = pendingDescriptionSaveRef.current;
           pendingDescriptionSaveRef.current = null;
@@ -2790,10 +2853,14 @@ export function IssueDetail({ issueId, onDelete, onDone, defaultSidebarOpen = tr
               ? serverIssue.description
               : draft.markdown;
             persistDescriptionSave({ ...pending, baseMarkdown: nextBase });
+          } else {
+            const canonical = queryClient.getQueryData<Issue>(issueKeys.detail(wsId, id));
+            setSuppressDescriptionDelivery(descriptionEditingRef.current
+              || !canonical || descEditorRef.current?.getMarkdown() !== (canonical.description ?? ""));
           }
         },
         onError: () => {
-          if (descriptionSaveIssueIdRef.current !== id) return;
+          if (editorSaveIssueIdRef.current !== id) return;
           descriptionSaveInFlightRef.current = false;
           pendingDescriptionSaveRef.current = null;
         },
@@ -3123,6 +3190,7 @@ export function IssueDetail({ issueId, onDelete, onDone, defaultSidebarOpen = tr
           highlightedId={highlightedId}
           commentProps={reply ? {
             issueId: id, entry: reply, replies: timelineView.threadReplies.get(reply.id) ?? EMPTY_REPLIES,
+            deliveryReceipts: threadDeliveries.get(reply.id) ?? EMPTY_DELIVERY_RECEIPTS,
             currentUserId: user?.id, canModerate: canModerateComments, onReply: submitReply,
             onReplyAccepted: scrollToTimelineBottom, onEdit: editComment, onDelete: deleteComment,
             onToggleReaction: handleToggleReaction, onCreateSubIssue: openCommentSubIssue,
@@ -3152,6 +3220,7 @@ export function IssueDetail({ issueId, onDelete, onDone, defaultSidebarOpen = tr
         <div className="pb-3" id={`comment-${item.id}`}>
           <CommentCard
             issueId={id}
+            deliveryReceipts={threadDeliveries.get(item.id) ?? EMPTY_DELIVERY_RECEIPTS}
             runs={commentRuns.get(item.id) ?? EMPTY_COMMENT_RUNS}
             enteringRunIds={enteringRunIds}
             entry={item.entry}
@@ -3395,23 +3464,14 @@ export function IssueDetail({ issueId, onDelete, onDone, defaultSidebarOpen = tr
                 placeholder={t(($) => $.detail.title_placeholder)}
                 className={cn("w-full leading-snug", titleSizeClass)}
                 onReady={titleLazy.onReady}
+                onChange={(value) => setSuppressTitleDelivery(value.trim() !== issue.title
+                  || titleSavesInFlightRef.current > 0 || titleConflictDraft !== null)}
                 onBlur={(value) => {
                   const trimmed = value.trim();
                   if (trimmed && trimmed !== issue.title) {
-                    handleUpdateField({
-                      title: trimmed,
-                      title_base: titleBaseRef.current,
-                    }, {
-                      onSuccess: (serverIssue) => {
-                        setTitleConflictDraft(null);
-                        titleBaseRef.current = serverIssue.title;
-                      },
-                      onError: (error) => {
-                        if (errorCode(error) === "revision_conflict") {
-                          setTitleConflictDraft(trimmed);
-                        }
-                      },
-                    });
+                    persistTitleSave(trimmed, titleBaseRef.current);
+                  } else {
+                    setSuppressTitleDelivery(trimmed !== issue.title || titleSavesInFlightRef.current > 0 || titleConflictDraft !== null);
                   }
                 }}
               />
@@ -3458,6 +3518,7 @@ export function IssueDetail({ issueId, onDelete, onDone, defaultSidebarOpen = tr
                     // discarding writes nothing. The remount is what puts it
                     // back into the editor (see titleResetToken).
                     setTitleConflictDraft(null);
+                    setSuppressTitleDelivery(titleSavesInFlightRef.current > 0);
                     titleBaseRef.current = issue.title;
                     setTitleResetToken((token) => token + 1);
                   }}
@@ -3473,15 +3534,7 @@ export function IssueDetail({ issueId, onDelete, onDone, defaultSidebarOpen = tr
                   onClick={() => {
                     const draft = titleConflictDraft.trim();
                     if (!draft) return;
-                    handleUpdateField(
-                      { title: draft, title_base: issue.title },
-                      {
-                        onSuccess: (serverIssue) => {
-                          setTitleConflictDraft(null);
-                          titleBaseRef.current = serverIssue.title;
-                        },
-                      },
-                    );
+                    persistTitleSave(draft, issue.title);
                   }}
                 >
                   {t(($) => $.revision.keep_local)}
@@ -3554,14 +3607,18 @@ export function IssueDetail({ issueId, onDelete, onDone, defaultSidebarOpen = tr
             {...descriptionAnnotations.captureProps}
             ref={descriptionAnnotations.cardRef}
             className="relative mt-5 rounded-lg"
-            onFocusCapture={() => {
-              if (!descriptionEditingRef.current) {
+            onFocusCapture={(event) => {
+              if (event.target instanceof HTMLElement && event.target.closest('[contenteditable="true"]')) {
                 descriptionEditingRef.current = true;
+                setSuppressDescriptionDelivery(true);
               }
             }}
             onBlurCapture={(event) => {
-              if (!event.currentTarget.contains(event.relatedTarget)) {
+              if (!(event.relatedTarget instanceof HTMLElement && event.currentTarget.contains(event.relatedTarget)
+                && event.relatedTarget.closest('[contenteditable="true"]'))) {
                 descriptionEditingRef.current = false;
+                setSuppressDescriptionDelivery(descEditorRef.current?.getMarkdown() !== (issue.description ?? "")
+                  || descriptionSaveInFlightRef.current || pendingDescriptionSaveRef.current !== null);
               }
             }}
           >
@@ -3612,6 +3669,8 @@ export function IssueDetail({ issueId, onDelete, onDone, defaultSidebarOpen = tr
             </div>
 
             <div className="flex items-center gap-1 mt-3">
+              {!suppressDescriptionDelivery && !suppressTitleDelivery && <SourceDeliveryAvatars sourceId={issue.id} sourceRevision={agentDeliveries?.issue.source_revision ?? undefined}
+                receipts={agentDeliveries?.issue.receipts} className="mt-0" />}
               <ReactionBar
                 reactions={issueReactions}
                 currentUserId={user?.id}

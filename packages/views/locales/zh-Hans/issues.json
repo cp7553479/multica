@@ -1802,5 +1802,8 @@
     "detached": "已重新分配／停用",
     "resume_unavailable": "此会话无法恢复。请先恢复原运行时和会话数据，再重试。",
     "retry_original_session": "可重试此事件，重新检查并恢复原会话。"
+  },
+  "delivery_receipts": {
+    "delivered_to": "已送达 {{name}}"
   }
 }

@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/attribution"
+	"github.com/multica-ai/multica/server/internal/events"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/dbid"
@@ -509,7 +510,9 @@ func (s *TaskService) ClaimIssueAgentEvent(ctx context.Context, taskID pgtype.UU
 }
 
 func (s *TaskService) AckIssueAgentEvent(ctx context.Context, taskID, eventID pgtype.UUID, delivered bool, failureReason string) error {
-	return s.runInTx(ctx, func(q *db.Queries) error {
+	var session db.IssueAgentSession
+	changed := false
+	err := s.runInTx(ctx, func(q *db.Queries) error {
 		task, err := q.LockIssueAgentEventDeliveryTask(ctx, db.LockIssueAgentEventDeliveryTaskParams{TaskID: taskID, EventID: eventID})
 		if err != nil {
 			return err
@@ -518,7 +521,7 @@ func (s *TaskService) AckIssueAgentEvent(ctx context.Context, taskID, eventID pg
 		if err != nil {
 			return err
 		}
-		session, err := q.GetIssueAgentSessionForUpdate(ctx, event.SessionID)
+		session, err = q.GetIssueAgentSessionForUpdate(ctx, event.SessionID)
 		if err != nil {
 			return err
 		}
@@ -526,23 +529,41 @@ func (s *TaskService) AckIssueAgentEvent(ctx context.Context, taskID, eventID pg
 			return errors.New("delivery task does not belong to this issue session")
 		}
 		if delivered {
-			if _, err = q.AckIssueAgentEventDelivered(ctx, db.AckIssueAgentEventDeliveredParams{EventID: eventID, TaskID: taskID}); err != nil {
+			acked, err := q.AckIssueAgentEventDelivered(ctx, db.AckIssueAgentEventDeliveredParams{EventID: eventID, TaskID: taskID})
+			if err != nil {
 				return err
 			}
+			changed = event.Status != acked.Status || event.FailureReason != acked.FailureReason
 			return advanceIssueSessionWorkflowStep(ctx, q, task, event)
 		}
 		failureReason = strings.TrimSpace(failureReason)
 		if failureReason == "" || len(failureReason) > 100 {
 			failureReason = "provider_rejected"
 		}
-		if _, err := q.AckIssueAgentEventFailed(ctx, db.AckIssueAgentEventFailedParams{EventID: eventID, TaskID: taskID, FailureReason: pgtype.Text{String: failureReason, Valid: true}}); err != nil {
+		acked, err := q.AckIssueAgentEventFailed(ctx, db.AckIssueAgentEventFailedParams{EventID: eventID, TaskID: taskID, FailureReason: pgtype.Text{String: failureReason, Valid: true}})
+		if err != nil {
 			return err
 		}
+		changed = event.Status != acked.Status || event.FailureReason != acked.FailureReason
 		if session.State == "detached" {
 			return nil
 		}
 		_, err = q.SetIssueAgentSessionState(ctx, db.SetIssueAgentSessionStateParams{ID: event.SessionID, State: "blocked", FailureReason: pgtype.Text{String: failureReason, Valid: true}})
 		return err
+	})
+	if err == nil && changed {
+		s.publishIssueAgentDeliveryUpdated(session)
+	}
+	return err
+}
+
+func (s *TaskService) publishIssueAgentDeliveryUpdated(session db.IssueAgentSession) {
+	if s.Bus == nil {
+		return
+	}
+	s.Bus.Publish(events.Event{
+		Type: protocol.EventIssueAgentDeliveryUpdated, WorkspaceID: util.UUIDToString(session.WorkspaceID),
+		ActorType: "system", Payload: map[string]any{"issue_id": util.UUIDToString(session.IssueID)},
 	})
 }
 
@@ -608,6 +629,7 @@ func canRetryIssueAgentSession(ctx context.Context, q *db.Queries, session db.Is
 }
 
 func (s *TaskService) RetryIssueAgentEvent(ctx context.Context, sessionID, eventID pgtype.UUID) error {
+	var session db.IssueAgentSession
 	if err := s.runInTx(ctx, func(q *db.Queries) error {
 		ownersExist, err := q.LockIssueAgentSessionOwners(ctx, sessionID)
 		if err != nil {
@@ -616,7 +638,7 @@ func (s *TaskService) RetryIssueAgentEvent(ctx context.Context, sessionID, event
 		if !ownersExist {
 			return ErrIssueAgentSessionResumeBlocked
 		}
-		session, err := q.GetIssueAgentSessionForUpdate(ctx, sessionID)
+		session, err = q.GetIssueAgentSessionForUpdate(ctx, sessionID)
 		if err != nil {
 			return err
 		}
@@ -635,6 +657,7 @@ func (s *TaskService) RetryIssueAgentEvent(ctx context.Context, sessionID, event
 	}); err != nil {
 		return err
 	}
+	s.publishIssueAgentDeliveryUpdated(session)
 	_, err := s.WakeIssueAgentSession(ctx, sessionID)
 	return err
 }

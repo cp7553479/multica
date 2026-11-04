@@ -81,13 +81,14 @@ vi.mock("@multica/core/pins", () => ({
   useDeletePin: () => ({ mutate: vi.fn() }),
 }));
 
-const { cancelRunMock, updateIssueMock } = vi.hoisted(() => ({
+const { cancelRunMock, updateIssueMock, updateIssueMutateAsyncMock } = vi.hoisted(() => ({
   cancelRunMock: vi.fn(),
   updateIssueMock: vi.fn(),
+  updateIssueMutateAsyncMock: vi.fn(),
 }));
 
 vi.mock("@multica/core/issues/mutations", () => ({
-  useUpdateIssue: () => ({ mutate: updateIssueMock }),
+  useUpdateIssue: () => ({ mutate: updateIssueMock, mutateAsync: updateIssueMutateAsyncMock }),
   useCancelIssueRun: () => ({ mutateAsync: cancelRunMock }),
 }));
 
@@ -223,6 +224,7 @@ beforeEach(() => {
   cancelRunMock.mockReset();
   cancelRunMock.mockResolvedValue(undefined);
   updateIssueMock.mockReset();
+  updateIssueMutateAsyncMock.mockReset().mockResolvedValue(mockIssue);
 });
 
 describe("IssueActionsDropdown", () => {
@@ -294,9 +296,8 @@ describe("IssueActionsDropdown", () => {
     expect(await screen.findByText("Members")).toBeInTheDocument();
     fireEvent.click(await screen.findByText("Test User"));
 
-    expect(updateIssueMock).toHaveBeenCalledWith(
+    expect(updateIssueMutateAsyncMock).toHaveBeenCalledWith(
       { id: "issue-1", assignee_type: "member", assignee_id: "user-1" },
-      expect.anything(),
     );
     await waitFor(() => expect(screen.queryByText("Status")).not.toBeInTheDocument());
   });
@@ -572,9 +573,8 @@ describe("IssueActionsContextMenu", () => {
     expect(search).toHaveValue("test");
     await user.keyboard("{Enter}");
 
-    expect(updateIssueMock).toHaveBeenCalledWith(
+    expect(updateIssueMutateAsyncMock).toHaveBeenCalledWith(
       { id: "issue-1", assignee_type: "member", assignee_id: "user-1" },
-      expect.anything(),
     );
     await waitFor(() => expect(screen.queryByText("Rename issue")).not.toBeInTheDocument());
   });
