@@ -222,10 +222,65 @@ before exposing their history.
 
 This is a breaking routing change. Stop the old daemon, drain or deliberately
 cancel its old queued/running issue tasks, back up the database, apply migrations
-614–618 with the repository migrator, and start the matching server and daemon.
+614–618 with the repository migrator, complete the preflight below, and start
+the matching server and daemon.
 Do not run an old daemon alongside the new one. Existing assigned issues create
 their logical session lazily on the next input; new assignments capture it in the
 assignment transaction. Historical execution records remain inspectable.
+
+### Preflight for an older Autopilot crash window
+
+An older `create_issue` dispatch may have committed its issue/run but not yet
+created any task, before persistent inbox capture existed. Migrations do not
+invent the missing assignment input or its authorizing identity. A manual
+trigger's original actor cannot be recovered reliably from that old run row.
+The existing webhook repair now reports a migration-required error with the run
+and issue IDs instead of returning an unexplained missing-row error or creating
+an ordinary task.
+
+After the migrations, while both old and new daemons are stopped, run the
+[read-only preflight query](issue-agent-sessions-preflight.sql) against the target
+database. It lists original agent assignments with no dispatch task and no
+session/initial assignment. Review the issue status and each result; parked or
+completed work needs a deliberate lifecycle decision. Do not start the new
+daemon with unresolved rows and expect automatic replay.
+
+For a row whose original input cannot be reconstructed, keep the linked issue
+and explicitly close the stranded run as a migration failure. The following is
+an operator example for **one reviewed run ID**, not an automatic migration.
+It refuses rows that gained an execution, changed owner, or now have a captured
+assignment. The issue's already-consumed quota reservation remains unchanged.
+
+```sql
+BEGIN;
+WITH stranded AS (
+    SELECT r.id
+    FROM autopilot_run r JOIN issue i ON i.id=r.issue_id
+    JOIN autopilot a ON a.id=r.autopilot_id AND a.execution_mode='create_issue'
+    WHERE r.id = '<reviewed-run-uuid>'::uuid
+      AND r.status='issue_created' AND r.task_id IS NULL
+      AND i.origin_type='autopilot' AND i.origin_id=a.id
+      AND i.creator_type='agent' AND i.assignee_type='agent' AND i.assignee_id=i.creator_id
+      AND NOT EXISTS (SELECT 1 FROM agent_task_queue t WHERE t.issue_id=i.id AND t.agent_id=i.creator_id)
+      AND NOT EXISTS (
+          SELECT 1 FROM issue_agent_session s JOIN issue_agent_event e ON e.session_id=s.id
+          WHERE s.issue_id=i.id AND s.agent_id=i.assignee_id AND s.workspace_id=i.workspace_id
+            AND e.sequence=1 AND e.kind='assigned')
+    FOR UPDATE OF r, i
+)
+UPDATE autopilot_run r SET status='failed', completed_at=clock_timestamp(),
+    failure_reason='Migration: original dispatch input was not captured; continue explicitly in the linked issue'
+FROM stranded WHERE r.id=stranded.id
+RETURNING r.id,r.issue_id,r.status;
+COMMIT;
+```
+
+Once the reviewed run is closed, an authorized member can continue in the same
+linked issue with a new explicit comment or assignment. That deliberate action
+uses normal transactional capture and the current member's invocation rights.
+It creates no hidden Autopilot input and does not reopen the historical run.
+Existing runs with recorded executions retain their history and the documented
+cutover/drain procedure; terminal runs are never replayed by this check.
 
 No production deployment or merge is part of this work. The draft review should
 include real database regressions for ordering, duplicate capture, rollback,

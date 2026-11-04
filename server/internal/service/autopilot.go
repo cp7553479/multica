@@ -386,12 +386,17 @@ func (s *AutopilotService) ensureWebhookCreateIssueTask(ctx context.Context, aut
 		return nil
 	}
 	session, err := s.Queries.GetIssueAgentSessionForPair(ctx, db.GetIssueAgentSessionForPairParams{WorkspaceID: issue.WorkspaceID, IssueID: issue.ID, AgentID: issue.AssigneeID})
-	if err != nil {
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return err
 	}
-	initial, err := s.Queries.GetAutopilotIssueAgentAssignment(ctx, session.ID)
-	if err != nil {
-		return err
+	missingInput := errors.Is(err, pgx.ErrNoRows)
+	var initial db.IssueAgentEvent
+	if !missingInput {
+		initial, err = s.Queries.GetAutopilotIssueAgentAssignment(ctx, session.ID)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
+		missingInput = errors.Is(err, pgx.ErrNoRows)
 	}
 	if _, bound := decodeAutopilotIssueSessionInput(initial); !bound {
 		historical, historyErr := s.Queries.FindLegacyAutopilotIssueDispatch(ctx, db.FindLegacyAutopilotIssueDispatchParams{IssueID: issue.ID, AgentID: issue.CreatorID})
@@ -405,12 +410,15 @@ func (s *AutopilotService) ensureWebhookCreateIssueTask(ctx context.Context, aut
 			return historyErr
 		}
 	}
+	if missingInput {
+		return fmt.Errorf("%w: run %s, issue %s has no captured persistent session assignment; follow docs/engineering/issue-agent-sessions.md before retrying", errAutopilotIssueSessionMigrationRequired, util.UUIDToString(run.ID), util.UUIDToString(issue.ID))
+	}
 	tx, err := s.TxStarter.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx)
-	if _, _, err = s.bindAutopilotIssueSessionInput(ctx, s.Queries.WithTx(tx), issue, run, pgtype.UUID{}); err != nil {
+	if _, err = s.bindAutopilotIssueSessionInput(ctx, s.Queries.WithTx(tx), issue, run, pgtype.UUID{}); err != nil {
 		return fmt.Errorf("repair autopilot session input: %w", err)
 	}
 	if err = tx.Commit(ctx); err != nil {
@@ -839,7 +847,7 @@ func (s *AutopilotService) dispatchCreateIssue(ctx context.Context, ap db.Autopi
 	*run = updatedRun
 	var sessionAttr attribution.Result
 	if ap.AssigneeType == "agent" {
-		if _, sessionAttr, err = s.bindAutopilotIssueSessionInput(ctx, qtx, issue, *run, actorUserID); err != nil {
+		if sessionAttr, err = s.bindAutopilotIssueSessionInput(ctx, qtx, issue, *run, actorUserID); err != nil {
 			return fmt.Errorf("bind autopilot issue session: %w", err)
 		}
 	}

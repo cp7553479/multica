@@ -111,6 +111,55 @@ executes; a comment continuation cannot become that run's dispatch.
 No new migration, frontend change or generic recovery infrastructure is required
 for this producer fix. Existing squad and `run_only` dispatch retain their scope.
 
+## Simplification and cutover review
+
+The completed routing change was reviewed for unused entry points, duplicated
+state and reuse of existing Multica machinery. This pass removes code with
+verified call-graph or constant-value evidence:
+
+| Change | Reason |
+| --- | --- |
+| Remove test-only `PublishIssueAgentEvent`, its unused execution result and an immediately invoked closure | Production already captures mutations transactionally or appends a rule event inside the existing transaction. The deduplication test now exercises that actual append operation. |
+| Remove unused cleanup/role queries, Handoff wrapper, mention-denial notice, parent-notice transaction and Squad self-trigger helper | All had zero production callers; actual deletion capture, runtime refusal notices, Squad dispatch and historical reads remain. |
+| Remove Held/reserved/claimed/waiting input classification and its pagination key | These values were constant false after rules moved to durable events. The existing oldest/rule-ID pagination and time budget are unchanged. |
+| Remove the write-only Handler notifier field and transport SessionID | Live notification uses the existing TaskService notifier; identity validation uses the task/provider/session binding. |
+| Narrow the Autopilot bind result and combine duplicate missing-ID checks | Both bind callers discarded the returned session; identical terminal predicates now have one branch. |
+| Use native Mutation error state and remove unused preview result | TanStack Query already resets errors between attempts. No consumer read preview.isCurrent; the effective query-key/debounce/placeholder safeguards remain. |
+
+The pass also records two explicit correctness boundaries rather than hiding
+them under a refactor:
+
+- A database predating inbox capture may have a committed Autopilot issue/run
+  without a session or initial assignment. Targeted missing/empty-session cases
+  now produce the migration-required diagnostic, leave all data untouched and
+  create no fallback task. The architecture document provides a read-only
+  preflight plus a guarded, per-reviewed-run disposition example. Only SELECT
+  and EXPLAIN were executed to validate those SQL examples; no operator UPDATE
+  or production migration was performed.
+- The prior Autopilot-origin guard also rejected an authorized human's first
+  reassignment to a different agent. A failing regression reproduced this;
+  normal member/delegation input policy now applies, and the unauthorized-member
+  refusal remains tested. The original unbound Autopilot assignment still fails
+  closed.
+
+Verification in this pass:
+
+- Complete service/handler/server suites: passed, 8.942 / 55.037 / 4.032 s.
+- Session, Autopilot and lock-order race regressions: passed, 2.306 s.
+- Existing wakeup/pagination and handler permission/receipt cases: 17 groups passed.
+- Fake daemon delivery, initial ACK, pin and SIGKILL cases: passed, 1.930 s.
+- Five frontend suites: 95 tests passed, including failed retry to pending/success
+  state transitions; views types and changed-file ESLint passed.
+- Regenerated sqlc, `go vet ./...` and `git diff --check`: passed.
+
+Necessary complexity is retained: logical sessions are distinct from provider
+threads and execution records; capture/ACK and identity pin protect different
+transaction/protocol boundaries; current invocation rights are checked at wake
+and delivery; and original worktree provenance, resource caps and native
+provider input APIs remain in use. Existing scheduler, lifecycle, attribution,
+query/schema and UI component mechanisms are reused. This review adds no new
+framework, queue service, provider wrapper or generic recovery subsystem.
+
 ## Browser checks and limits
 
 The real session panel and application styles were checked with synthetic API

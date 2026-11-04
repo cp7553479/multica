@@ -61,7 +61,10 @@ func (s *TaskService) issueAgentEventCanInvoke(ctx context.Context, q *db.Querie
 	if input, ok := decodeAutopilotIssueSessionInput(event); ok {
 		return autopilotIssueSessionInputAllowed(ctx, q, issue, agent, event, input)
 	}
-	if event.Kind == "assigned" && event.Sequence == 1 && issue.OriginType.String == "autopilot" {
+	// Only the original Autopilot creation needs its dispatch snapshot.
+	// Human reassignment and task-lineaged delegation use normal input policy.
+	if event.Kind == "assigned" && event.Sequence == 1 && issue.OriginType.String == "autopilot" &&
+		agent.ID == issue.CreatorID && event.ActorType == "agent" && event.ActorID == issue.CreatorID && !event.SourceTaskID.Valid {
 		return false
 	}
 	return s.IssueSessionCanInvoke != nil && s.IssueSessionCanInvoke(ctx, agent, event)

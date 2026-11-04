@@ -11,6 +11,8 @@ import (
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
+var errAutopilotIssueSessionMigrationRequired = errors.New("autopilot issue session migration preflight required")
+
 // create_issue retains its existing run linkage and attribution, while its
 // assignment is input to the issue's logical session rather than a second task.
 type autopilotIssueSessionInput struct {
@@ -30,24 +32,24 @@ func decodeAutopilotIssueSessionInput(event db.IssueAgentEvent) (*autopilotIssue
 
 // bindAutopilotIssueSessionInput runs before the issue/run transaction commits,
 // so runtime polling cannot claim an assignment without its dispatch identity.
-func (s *AutopilotService) bindAutopilotIssueSessionInput(ctx context.Context, q *db.Queries, issue db.Issue, run db.AutopilotRun, actor pgtype.UUID) (db.IssueAgentSession, attribution.Result, error) {
+func (s *AutopilotService) bindAutopilotIssueSessionInput(ctx context.Context, q *db.Queries, issue db.Issue, run db.AutopilotRun, actor pgtype.UUID) (attribution.Result, error) {
 	var attr attribution.Result
 	if issue.CreatorType != "agent" || issue.AssigneeID != issue.CreatorID || issue.AssigneeType.String != "agent" || issue.OriginType.String != "autopilot" || issue.OriginID != run.AutopilotID || run.IssueID != issue.ID {
-		return db.IssueAgentSession{}, attr, errors.New("autopilot issue session binding does not match its run")
+		return attr, errors.New("autopilot issue session binding does not match its run")
 	}
 	session, err := q.GetIssueAgentSessionForPair(ctx, db.GetIssueAgentSessionForPairParams{WorkspaceID: issue.WorkspaceID, IssueID: issue.ID, AgentID: issue.AssigneeID})
 	if err != nil {
-		return session, attr, err
+		return attr, err
 	}
 	initial, err := q.GetAutopilotIssueAgentAssignment(ctx, session.ID)
 	if err != nil {
-		return session, attr, fmt.Errorf("load autopilot assignment: %w", err)
+		return attr, fmt.Errorf("load autopilot assignment: %w", err)
 	}
 	if prior, ok := decodeAutopilotIssueSessionInput(initial); ok {
 		if prior.RunID != run.ID {
-			return session, attr, errors.New("autopilot assignment already belongs to another run")
+			return attr, errors.New("autopilot assignment already belongs to another run")
 		}
-		return session, prior.Attribution, nil
+		return prior.Attribution, nil
 	}
 	if actor.Valid {
 		attr = attribution.DirectHumanRun(actor, attribution.EvidenceIssueAssignment, issue.ID)
@@ -56,12 +58,12 @@ func (s *AutopilotService) bindAutopilotIssueSessionInput(ctx context.Context, q
 	}
 	payload, err := json.Marshal(autopilotIssueSessionInput{RunID: run.ID, Attribution: attr})
 	if err != nil {
-		return session, attr, err
+		return attr, err
 	}
 	if _, err = q.BindAutopilotIssueAgentAssignment(ctx, db.BindAutopilotIssueAgentAssignmentParams{SessionID: session.ID, OriginatorUserID: attr.UserID, Dispatch: payload}); err != nil {
-		return session, attr, err
+		return attr, err
 	}
-	return session, attr, nil
+	return attr, nil
 }
 
 // The captured principal is rechecked at Wake and Claim. A publisher or owner
